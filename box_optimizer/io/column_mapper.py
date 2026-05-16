@@ -23,6 +23,15 @@ _COLUMN_ALIASES = {
     "length": {"length", "lengthcm", "lengthin", "l"},
     "width": {"width", "widthcm", "widthin", "w"},
     "height": {"height", "heightcm", "heightin", "h", "depth", "depthcm", "depthin"},
+    "dimensions": {
+        "dimensions",
+        "dimension",
+        "size",
+        "productdimensions",
+        "dims",
+        "lxwxh",
+        "lwh",
+    },
     "weight": {
         "weight",
         "weightkg",
@@ -54,6 +63,44 @@ _COLUMN_ALIASES = {
         "shipstate",
         "shippingstate",
     },
+}
+
+METADATA_COLUMN_ALIASES = {
+    "orderid",
+    "ordernumber",
+    "orderno",
+    "backernumber",
+    "backer",
+    "backerid",
+    "backerkitid",
+    "name",
+    "firstname",
+    "lastname",
+    "email",
+    "phone",
+    "company",
+    "address",
+    "address1",
+    "address2",
+    "city",
+    "state",
+    "province",
+    "country",
+    "postal",
+    "zipcode",
+    "zip",
+    "shippingmethod",
+    "region",
+    "notes",
+    "pledge",
+    "reward",
+    "status",
+    "total",
+    "amount",
+    "currency",
+    "date",
+    "created",
+    "updated",
 }
 
 
@@ -107,3 +154,9 @@ def infer_dimension_unit(header: str | None, default: str = "cm") -> str:
     if normalized.endswith("ft"):
         return "ft"
     return default
+
+
+def is_metadata_column(header: str) -> bool:
+    """Return whether a header is likely order/customer metadata."""
+    normalized = normalize_column_name(header)
+    return normalized in METADATA_COLUMN_ALIASES

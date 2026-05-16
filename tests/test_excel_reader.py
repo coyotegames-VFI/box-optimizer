@@ -176,3 +176,113 @@ def test_read_xlsx_processes_all_useful_sheets(tmp_path):
 
     assert [item.canonical_sku for item in items] == ["A1", "B1"]
     assert {item.metadata["_source_sheet"] for item in items} == {"Products A", "Products B"}
+
+
+def test_combined_dimension_parsing_supports_three_dimension_formats(tmp_path):
+    path = tmp_path / "sku_master.csv"
+    _write_csv(
+        path,
+        [
+            {"SKU": "A", "Dimensions": "10 x 5 x 3 cm", "Weight kg": "1"},
+            {"SKU": "B", "Dimensions": "10×5×3", "Weight kg": "1"},
+        ],
+    )
+
+    items = read_sku_master(str(path))
+
+    assert [(item.length_cm, item.width_cm, item.height_cm, item.is_flat) for item in items] == [
+        (10, 5, 3, False),
+        (10, 5, 3, False),
+    ]
+
+
+def test_combined_dimension_parsing_treats_two_dimensions_as_flat(tmp_path):
+    path = tmp_path / "sku_master.csv"
+    _write_csv(
+        path,
+        [{"SKU": "Flat", "Dimensions": "10 x 5", "Weight kg": "1"}],
+    )
+
+    item = read_sku_master(str(path))[0]
+
+    assert (item.length_cm, item.width_cm, item.height_cm) == (10, 5, 1)
+    assert item.is_flat is True
+
+
+def test_wide_format_order_parsing_creates_order_lines(tmp_path):
+    path = tmp_path / "orders.csv"
+    _write_csv(
+        path,
+        [
+            {
+                "Order ID": "1001",
+                "Country": "US",
+                "Core Game": "1",
+                "Expansion A": "2",
+                "Add-on B": "",
+            }
+        ],
+    )
+
+    lines = read_orders(str(path))
+
+    assert [(line.raw_sku, line.quantity) for line in lines] == [
+        ("Core Game", 1),
+        ("Expansion A", 2),
+    ]
+    assert all(line.order_id == "1001" for line in lines)
+    assert all(line.country == "US" for line in lines)
+
+
+def test_wide_format_metadata_columns_are_not_product_columns(tmp_path):
+    path = tmp_path / "orders.csv"
+    _write_csv(
+        path,
+        [
+            {
+                "Order ID": "1001",
+                "Address": "1 Main St",
+                "Email": "person@example.com",
+                "Country": "US",
+                "State": "CA",
+                "Postal": "90001",
+                "Notes": "Leave at door",
+                "Core Game": "1",
+            }
+        ],
+    )
+
+    lines = read_orders(str(path))
+
+    assert len(lines) == 1
+    assert lines[0].raw_sku == "Core Game"
+    assert lines[0].metadata["Address"] == "1 Main St"
+    assert lines[0].metadata["Email"] == "person@example.com"
+
+
+def test_wide_format_product_header_matches_sku_master_product_name(tmp_path):
+    sku_path = tmp_path / "sku_master.csv"
+    order_path = tmp_path / "orders.csv"
+    _write_csv(
+        sku_path,
+        [{"SKU": "CG-001", "Product Name": "Core Game", "Dimensions": "10 x 5 x 3", "Weight kg": "1"}],
+    )
+    _write_csv(
+        order_path,
+        [{"Order ID": "1001", "Core Game": "1"}],
+    )
+
+    result = read_intake(str(sku_path), str(order_path))
+
+    assert len(result.matched_order_lines) == 1
+    assert result.matched_order_lines[0].canonical_sku == "CG-001"
+    assert result.unmatched_skus == []
+
+
+def test_real_example_files_parse_nonzero_skus_and_order_lines():
+    result = read_intake("examples/sku_master.xlsx", "examples/orders.xlsx")
+
+    assert result.debug["sku_items_parsed"] > 0
+    assert result.debug["order_lines_created"] > 0
+    assert result.debug["wide_product_columns_detected"] > 0
+    assert result.debug["matched"] > 0

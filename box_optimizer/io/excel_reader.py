@@ -3,7 +3,7 @@
 import csv
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -11,6 +11,7 @@ from box_optimizer.io.column_mapper import (
     infer_columns,
     infer_dimension_unit,
     infer_weight_unit,
+    is_metadata_column,
 )
 from box_optimizer.models import OrderLine, SKUItem, UnmatchedSKURecord
 from box_optimizer.normalize import normalize_dimensions, normalize_sku
@@ -33,6 +34,8 @@ class IntakeResult:
     order_lines: list[OrderLine]
     matched_order_lines: list[OrderLine]
     unmatched_skus: list[UnmatchedSKURecord]
+    column_mappings: list[dict] = field(default_factory=list)
+    debug: dict = field(default_factory=dict)
 
 
 _NS = {
@@ -51,9 +54,65 @@ def _parse_number(value: object, default: float = 0.0) -> float:
     return float(match.group(0))
 
 
+def _quantity_value(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"0", "0.0", "no", "n", "false"}:
+        return None
+    if lowered in {"yes", "y", "true"}:
+        return 1
+    match = re.fullmatch(r"(?:x\s*)?(\d+)(?:\s*x)?", lowered)
+    if match:
+        quantity = int(match.group(1))
+        return quantity if quantity > 0 else None
+    if re.fullmatch(r"\d+(?:\.0+)?", lowered):
+        quantity = int(float(lowered))
+        return quantity if quantity > 0 else None
+    return None
+
+
 def _parse_quantity(value: object) -> int:
-    quantity = int(_parse_number(value, default=1))
-    return max(quantity, 1)
+    quantity = _quantity_value(value)
+    return 1 if quantity is None else max(quantity, 1)
+
+
+def _looks_like_quantity(value: object) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    return _quantity_value(text) is not None or text.lower() in {
+        "0",
+        "0.0",
+        "no",
+        "n",
+        "false",
+    }
+
+
+def _parse_dimensions(value: object, default_unit: str = "cm"):
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    unit_match = re.search(r"(mm|cm|in|ft)\b", text, flags=re.IGNORECASE)
+    unit = unit_match.group(1).lower() if unit_match else default_unit
+    parts = re.split(r"\s*(?:x|X|×|\*|/)\s*", text)
+    numbers = []
+    for part in parts:
+        match = re.search(r"-?\d+(?:\.\d+)?", part.replace(",", ""))
+        if match:
+            numbers.append(float(match.group(0)))
+    if len(numbers) < 2:
+        return None
+    if len(numbers) == 2:
+        return normalize_dimensions(numbers[0], numbers[1], None, unit=unit)
+    return normalize_dimensions(numbers[0], numbers[1], numbers[2], unit=unit)
 
 
 def _metadata(row: dict, source_path: str, sheet_name: str) -> dict:
@@ -61,6 +120,28 @@ def _metadata(row: dict, source_path: str, sheet_name: str) -> dict:
     metadata["_source_file"] = str(source_path)
     metadata["_source_sheet"] = sheet_name
     return metadata
+
+
+def _mapping_record(
+    workbook: str,
+    sheet: str,
+    detected_format: str,
+    metadata_columns: list[str] | None = None,
+    product_quantity_columns: list[str] | None = None,
+    dimension_column: str | None = None,
+    weight_column: str | None = None,
+    warnings: list[str] | None = None,
+) -> dict:
+    return {
+        "workbook": workbook,
+        "sheet": sheet,
+        "detected format": detected_format,
+        "detected metadata columns": " | ".join(metadata_columns or []),
+        "detected product quantity columns": " | ".join(product_quantity_columns or []),
+        "detected dimension column": dimension_column or "",
+        "detected weight column": weight_column or "",
+        "warnings": " | ".join(warnings or []),
+    }
 
 
 def _read_csv(path: str) -> list[SourceRows]:
@@ -163,14 +244,43 @@ def read_workbook(path: str) -> list[SourceRows]:
     raise ValueError(f"Unsupported intake file type: {path}")
 
 
-def read_sku_master(path: str) -> list[SKUItem]:
-    """Read SKU master rows from CSV or XLSX and preserve all metadata columns."""
+def _read_sku_master_with_mappings(path: str) -> tuple[list[SKUItem], list[dict], int]:
     sku_items = []
+    mappings = []
+    rows_read = 0
     for source in read_workbook(path):
         if not source.rows:
             continue
-        mapping = infer_columns(list(source.rows[0].keys()))
-        if "sku" not in mapping or "length" not in mapping or "width" not in mapping:
+        rows_read += len(source.rows)
+        headers = list(source.rows[0].keys())
+        mapping = infer_columns(headers)
+        warnings = []
+        has_separate_dimensions = "length" in mapping and "width" in mapping
+        has_combined_dimensions = "dimensions" in mapping
+        if "sku" not in mapping:
+            warnings.append("No SKU column detected")
+        if not has_separate_dimensions and not has_combined_dimensions:
+            warnings.append("No separate or combined dimension columns detected")
+        mappings.append(
+            _mapping_record(
+                path,
+                source.sheet_name,
+                "sku-master",
+                dimension_column=mapping.get("dimensions")
+                or " / ".join(
+                    column
+                    for column in [
+                        mapping.get("length"),
+                        mapping.get("width"),
+                        mapping.get("height"),
+                    ]
+                    if column
+                ),
+                weight_column=mapping.get("weight"),
+                warnings=warnings,
+            )
+        )
+        if "sku" not in mapping or not (has_separate_dimensions or has_combined_dimensions):
             continue
 
         for row in source.rows:
@@ -178,18 +288,25 @@ def read_sku_master(path: str) -> list[SKUItem]:
             if not raw_sku:
                 continue
 
-            height_header = mapping.get("height")
-            length = _parse_number(row.get(mapping["length"]))
-            width = _parse_number(row.get(mapping["width"]))
-            height = _parse_number(row.get(height_header)) if height_header else None
-            dimension_unit = infer_dimension_unit(mapping["length"])
-            dimensions = normalize_dimensions(length, width, height, unit=dimension_unit)
+            if has_combined_dimensions:
+                dimensions = _parse_dimensions(row.get(mapping["dimensions"]))
+                if dimensions is None:
+                    continue
+                is_flat = len(dimensions.original_dimensions) == 2
+            else:
+                height_header = mapping.get("height")
+                length = _parse_number(row.get(mapping["length"]))
+                width = _parse_number(row.get(mapping["width"]))
+                height = _parse_number(row.get(height_header)) if height_header else None
+                dimension_unit = infer_dimension_unit(mapping["length"])
+                dimensions = normalize_dimensions(length, width, height, unit=dimension_unit)
+                is_flat = height is None
 
             weight_header = mapping.get("weight")
             weight_value = _parse_number(row.get(weight_header)) if weight_header else 0.0
             weight_unit = infer_weight_unit(weight_header)
             weight = normalize_weight(weight_value, weight_unit)
-            product_name = str(row.get(mapping.get("product_name", ""), "")).strip()
+            product_name = str(row.get(mapping.get("product_name", ""), "")).strip() or raw_sku
 
             sku_items.append(
                 SKUItem(
@@ -200,41 +317,132 @@ def read_sku_master(path: str) -> list[SKUItem]:
                     width_cm=dimensions.dimensions.width,
                     height_cm=dimensions.dimensions.height,
                     weight_kg=weight.weight_kg,
-                    is_flat=height is None,
+                    is_flat=is_flat,
                     aliases=(),
                     metadata=_metadata(row, path, source.sheet_name),
                 )
             )
+    return sku_items, mappings, rows_read
+
+
+def read_sku_master(path: str) -> list[SKUItem]:
+    """Read SKU master rows from CSV or XLSX and preserve all metadata columns."""
+    sku_items, _, _ = _read_sku_master_with_mappings(path)
     return sku_items
+
+
+def _wide_product_columns(rows: list[dict], headers: list[str], explicit_mapping: dict) -> list[str]:
+    excluded = set(explicit_mapping.values())
+    product_columns = []
+    for header in headers:
+        if header in excluded or is_metadata_column(header):
+            continue
+        values = [row.get(header) for row in rows]
+        nonblank = [value for value in values if str(value or "").strip()]
+        if not nonblank:
+            continue
+        quantity_like = sum(1 for value in values if _looks_like_quantity(value))
+        if quantity_like / len(values) >= 0.8:
+            product_columns.append(header)
+    return product_columns
+
+
+def _read_orders_with_mappings(path: str) -> tuple[list[OrderLine], list[dict], int, int]:
+    order_lines = []
+    mappings = []
+    rows_read = 0
+    wide_product_column_count = 0
+    for source in read_workbook(path):
+        if not source.rows:
+            continue
+        rows_read += len(source.rows)
+        headers = list(source.rows[0].keys())
+        mapping = infer_columns(headers)
+        warnings = []
+        if "sku" in mapping:
+            detected_format = "long-format"
+            product_columns = []
+            metadata_columns = [header for header in headers if header not in set(mapping.values())]
+        else:
+            detected_format = "wide-format"
+            product_columns = _wide_product_columns(source.rows, headers, mapping)
+            wide_product_column_count += len(product_columns)
+            metadata_columns = [header for header in headers if header not in product_columns]
+            if not product_columns:
+                warnings.append("No product quantity columns detected")
+
+        mappings.append(
+            _mapping_record(
+                path,
+                source.sheet_name,
+                detected_format,
+                metadata_columns=metadata_columns,
+                product_quantity_columns=product_columns,
+                warnings=warnings,
+            )
+        )
+
+        for index, row in enumerate(source.rows, start=1):
+            if "sku" in mapping:
+                raw_sku = str(row.get(mapping["sku"], "")).strip()
+                if not raw_sku:
+                    continue
+                order_lines.append(
+                    OrderLine(
+                        order_id=str(row.get(mapping.get("order_id", ""), f"{source.sheet_name}-{index}")).strip(),
+                        raw_sku=raw_sku,
+                        canonical_sku=normalize_sku(raw_sku),
+                        quantity=_parse_quantity(row.get(mapping.get("quantity", ""), 1)),
+                        region=str(row.get(mapping.get("region", ""), "") or "") or source.sheet_name,
+                        country=str(row.get(mapping.get("country", ""), "") or "") or source.sheet_name,
+                        state_province=str(row.get(mapping.get("state_province", ""), "") or "") or None,
+                        metadata=_metadata(row, path, source.sheet_name),
+                    )
+                )
+                continue
+
+            metadata = {
+                header: row.get(header)
+                for header in metadata_columns
+                if str(row.get(header, "")).strip()
+            }
+            metadata["_source_file"] = str(path)
+            metadata["_source_sheet"] = source.sheet_name
+            order_id = str(
+                row.get(mapping.get("order_id", ""), "") or f"{source.sheet_name}-{index}"
+            ).strip()
+            region = str(row.get(mapping.get("region", ""), "") or source.sheet_name) or None
+            country = str(row.get(mapping.get("country", ""), "") or source.sheet_name) or None
+            state_province = str(row.get(mapping.get("state_province", ""), "") or "") or None
+            for product_column in product_columns:
+                quantity = _quantity_value(row.get(product_column))
+                if quantity is None or quantity <= 0:
+                    continue
+                order_lines.append(
+                    OrderLine(
+                        order_id=order_id,
+                        raw_sku=product_column,
+                        canonical_sku=normalize_sku(product_column),
+                        quantity=quantity,
+                        region=region,
+                        country=country,
+                        state_province=state_province,
+                        metadata=dict(metadata),
+                    )
+                )
+    return order_lines, mappings, rows_read, wide_product_column_count
 
 
 def read_orders(path: str) -> list[OrderLine]:
     """Read order rows from CSV or XLSX and preserve all metadata columns."""
-    order_lines = []
-    for source in read_workbook(path):
-        if not source.rows:
-            continue
-        mapping = infer_columns(list(source.rows[0].keys()))
-        if "sku" not in mapping:
-            continue
-
-        for index, row in enumerate(source.rows, start=1):
-            raw_sku = str(row.get(mapping["sku"], "")).strip()
-            if not raw_sku:
-                continue
-            order_lines.append(
-                OrderLine(
-                    order_id=str(row.get(mapping.get("order_id", ""), f"row-{index}")).strip(),
-                    raw_sku=raw_sku,
-                    canonical_sku=normalize_sku(raw_sku),
-                    quantity=_parse_quantity(row.get(mapping.get("quantity", ""), 1)),
-                    region=str(row.get(mapping.get("region", ""), "") or "") or None,
-                    country=str(row.get(mapping.get("country", ""), "") or "") or None,
-                    state_province=str(row.get(mapping.get("state_province", ""), "") or "") or None,
-                    metadata=_metadata(row, path, source.sheet_name),
-                )
-            )
+    order_lines, _, _, _ = _read_orders_with_mappings(path)
     return order_lines
+
+
+def _match_key(value: object) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("“", "\"").replace("”", "\"").replace("’", "'").replace("×", "x")
+    return re.sub(r"[\W_]+", "", text)
 
 
 def match_orders_to_sku_master(
@@ -242,15 +450,20 @@ def match_orders_to_sku_master(
     sku_items: list[SKUItem],
 ) -> tuple[list[OrderLine], list[UnmatchedSKURecord]]:
     """Match order lines to SKU master records while preserving unmatched SKUs."""
-    known_skus = {item.canonical_sku for item in sku_items}
+    known_skus = {}
     for item in sku_items:
-        known_skus.update(normalize_sku(alias) for alias in item.aliases)
+        candidates = [item.canonical_sku, item.raw_sku, item.product_name, *item.aliases]
+        for candidate in candidates:
+            if candidate:
+                known_skus[normalize_sku(candidate)] = item.canonical_sku
+                known_skus[_match_key(candidate)] = item.canonical_sku
 
     matched = []
     unmatched = []
     for line in order_lines:
-        if line.canonical_sku in known_skus:
-            matched.append(line)
+        canonical = known_skus.get(line.canonical_sku) or known_skus.get(_match_key(line.raw_sku))
+        if canonical:
+            matched.append(replace(line, canonical_sku=canonical))
         else:
             unmatched.append(
                 UnmatchedSKURecord(
@@ -264,12 +477,28 @@ def match_orders_to_sku_master(
 
 def read_intake(sku_master_path: str, orders_path: str) -> IntakeResult:
     """Read SKU and order files and return matched plus unmatched records."""
-    sku_items = read_sku_master(sku_master_path)
-    order_lines = read_orders(orders_path)
+    sku_items, sku_mappings, sku_rows_read = _read_sku_master_with_mappings(sku_master_path)
+    order_lines, order_mappings, order_rows_read, wide_product_column_count = _read_orders_with_mappings(orders_path)
     matched, unmatched = match_orders_to_sku_master(order_lines, sku_items)
+    product_columns = []
+    for mapping in order_mappings:
+        columns = mapping["detected product quantity columns"]
+        if columns:
+            product_columns.extend(columns.split(" | "))
     return IntakeResult(
         sku_items=sku_items,
         order_lines=order_lines,
         matched_order_lines=matched,
         unmatched_skus=unmatched,
+        column_mappings=[*sku_mappings, *order_mappings],
+        debug={
+            "sku_rows_read": sku_rows_read,
+            "sku_items_parsed": len(sku_items),
+            "order_rows_read": order_rows_read,
+            "wide_product_columns_detected": wide_product_column_count,
+            "detected_product_quantity_columns": product_columns,
+            "order_lines_created": len(order_lines),
+            "matched": len(matched),
+            "unmatched": len(unmatched),
+        },
     )

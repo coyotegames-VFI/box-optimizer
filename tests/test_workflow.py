@@ -1,4 +1,5 @@
 import csv
+import zipfile
 from pathlib import Path
 
 from box_optimizer import optimize_workbook
@@ -10,6 +11,51 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _inline_cell(column, row, value):
+    return (
+        f'<c r="{column}{row}" t="inlineStr">'
+        f"<is><t>{value}</t></is>"
+        "</c>"
+    )
+
+
+def _write_xlsx(path: Path, sheet_name: str, rows: list[dict]) -> None:
+    headers = list(rows[0].keys())
+    table = [headers, *[[row.get(header, "") for header in headers] for row in rows]]
+    xml_rows = []
+    for row_number, row_values in enumerate(table, start=1):
+        cells = [
+            _inline_cell(chr(ord("A") + column), row_number, value)
+            for column, value in enumerate(row_values)
+        ]
+        xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(xml_rows)}</sheetData>'
+        "</worksheet>"
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", rels)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
 
 
 def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path):
@@ -117,3 +163,53 @@ def test_optimize_workbook_returns_config_warnings_for_unsupported_overrides(tmp
     )
 
     assert "Custom max_carton_cm is not yet supported; using 74 x 37 x 44 cm." in result["warnings"]
+
+
+def test_end_to_end_sample_xlsx_wide_orders_produces_output_rows(tmp_path):
+    sku_master_path = tmp_path / "sample_sku_master.xlsx"
+    orders_path = tmp_path / "sample_orders.xlsx"
+    output_path = tmp_path / "optimized_shipping_plan.xlsx"
+    _write_xlsx(
+        sku_master_path,
+        "SKU Master",
+        [
+            {
+                "SKU": "CG-001",
+                "Product Name": "Core Game",
+                "Dimensions": "10 x 5 x 3 cm",
+                "Weight kg": "1",
+            },
+            {
+                "SKU": "EXP-A",
+                "Product Name": "Expansion A",
+                "Dimensions": "8 x 4 x 2 cm",
+                "Weight kg": "0.5",
+            },
+        ],
+    )
+    _write_xlsx(
+        orders_path,
+        "US",
+        [
+            {
+                "Order ID": "1001",
+                "Country": "US",
+                "Core Game": "1",
+                "Expansion A": "2",
+            }
+        ],
+    )
+
+    result = optimize_workbook(
+        sku_master_path=str(sku_master_path),
+        orders_path=str(orders_path),
+        output_path=str(output_path),
+        config={"preserve_region_sheets": False},
+    )
+
+    assert result["orders_processed"] > 0
+    workbook_rows = read_workbook(str(output_path))
+    order_volume_rows = next(
+        sheet.rows for sheet in workbook_rows if sheet.sheet_name == "Order Volume Weights"
+    )
+    assert len(order_volume_rows) > 0

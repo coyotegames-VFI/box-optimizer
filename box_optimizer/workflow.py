@@ -98,6 +98,23 @@ def _sku_lookup(sku_items: list[SKUItem]) -> dict[str, SKUItem]:
     return lookup
 
 
+def _diagnostic_warnings(debug: dict) -> list[str]:
+    warnings = []
+    if debug.get("sku_items_parsed", 0) == 0:
+        warnings.append("No SKU records parsed.")
+    if debug.get("order_lines_created", 0) == 0:
+        warnings.append("No order lines parsed.")
+    if (
+        debug.get("order_rows_read", 0) > 0
+        and debug.get("order_lines_created", 0) == 0
+        and debug.get("wide_product_columns_detected", 0) == 0
+    ):
+        warnings.append("No product quantity columns detected.")
+    if debug.get("order_lines_created", 0) > 0 and debug.get("matched", 0) == 0:
+        warnings.append("No matched SKUs found.")
+    return warnings
+
+
 def _group_order_lines(lines: list[OrderLine]) -> dict[str, list[OrderLine]]:
     grouped = defaultdict(list)
     for line in lines:
@@ -303,6 +320,7 @@ def optimize_workbook(
     intake = read_intake(sku_master_path, orders_path)
     if intake.unmatched_skus:
         warnings.append(f"{len(intake.unmatched_skus)} unmatched SKU rows were preserved.")
+    warnings.extend(_diagnostic_warnings(intake.debug))
 
     sku_items = _sku_lookup(intake.sku_items)
     grouped_orders = _group_order_lines(intake.matched_order_lines)
@@ -406,6 +424,7 @@ def optimize_workbook(
         unmatched_skus_rows=_unmatched_rows(intake.unmatched_skus),
         packing_detail_rows=_packing_detail_rows(split_results),
         multi_box_detail_rows=_multi_box_rows(split_results),
+        input_column_mapping_rows=intake.column_mappings,
         errors_and_warnings_rows=[{"Warning": warning} for warning in warnings],
         sheets=region_sheets,
     )
