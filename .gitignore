@@ -1,0 +1,8 @@
+﻿.venv/
+.pytest_cache/
+pytest_tmp/
+test_outputs/
+__pycache__/
+*.pyc
+.env
+output.xlsx
