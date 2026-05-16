@@ -8,6 +8,7 @@ from box_optimizer.packing.packer import (
     _expand_items,
     _sort_items,
     optimize_carton_dimensions,
+    optimize_carton_dimensions_fast,
 )
 
 
@@ -82,13 +83,19 @@ def _score_cartons(cartons: list[OptimizedCartonResult]) -> tuple[float, float]:
     )
 
 
-def split_order_into_cartons(items: list[PackedItem]) -> SplitResult:
+def split_order_into_cartons(items: list[PackedItem], packing_mode: str = "normal") -> SplitResult:
     """Split an order into the fewest practical optimized cartons."""
     expanded_items = _sort_items(_expand_items(items))
     if not expanded_items:
         return SplitResult(success=True, box_qty=0, cartons=[], unplaced_items=[])
 
-    single_box = optimize_carton_dimensions(expanded_items)
+    optimizer = (
+        optimize_carton_dimensions_fast
+        if packing_mode == "fast"
+        else optimize_carton_dimensions
+    )
+
+    single_box = optimizer(expanded_items)
     if single_box.success:
         return SplitResult(
             success=True,
@@ -98,12 +105,35 @@ def split_order_into_cartons(items: list[PackedItem]) -> SplitResult:
         )
 
     best_failure = single_box.unplaced_items
+    if packing_mode == "fast":
+        cartons = []
+        unplaced = []
+        for index, item in enumerate(expanded_items, start=1):
+            carton = optimize_carton_dimensions_fast([item])
+            if carton.success:
+                cartons.append(SplitCarton(box_number=index, result=carton))
+            else:
+                unplaced.extend(carton.unplaced_items or [item])
+        if cartons and not unplaced:
+            return SplitResult(
+                success=True,
+                box_qty=len(cartons),
+                cartons=cartons,
+                unplaced_items=[],
+            )
+        return SplitResult(
+            success=False,
+            box_qty=0,
+            cartons=[],
+            unplaced_items=unplaced or best_failure,
+        )
+
     for box_count in range(2, len(expanded_items) + 1):
         best: tuple[tuple[float, float], list[OptimizedCartonResult]] | None = None
 
         for assignment in _canonical_assignments(len(expanded_items), box_count):
             grouped_items = _items_for_assignment(expanded_items, assignment, box_count)
-            carton_results = [optimize_carton_dimensions(group) for group in grouped_items]
+            carton_results = [optimizer(group) for group in grouped_items]
             failures = [
                 item
                 for carton_result in carton_results

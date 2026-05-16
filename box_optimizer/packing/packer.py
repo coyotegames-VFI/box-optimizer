@@ -292,3 +292,58 @@ def optimize_carton_dimensions(items: list[PackedItem]) -> OptimizedCartonResult
         placements=result.placements,
         unplaced_items=[],
     )
+
+
+def optimize_carton_dimensions_fast(items: list[PackedItem]) -> OptimizedCartonResult:
+    """Pack into the capped carton first to avoid expensive carton searching."""
+    expanded_items = _expand_items(items)
+    if not expanded_items:
+        return OptimizedCartonResult(
+            success=True,
+            length_cm=0,
+            width_cm=0,
+            height_cm=0,
+            chargeable_weight_kg=0,
+            volume_cm3=0,
+            placements=[],
+            unplaced_items=[],
+        )
+
+    result = pack_items(expanded_items, MAX_CARTON_DIMENSIONS)
+    if not result.success:
+        return OptimizedCartonResult(
+            success=False,
+            length_cm=None,
+            width_cm=None,
+            height_cm=None,
+            chargeable_weight_kg=None,
+            volume_cm3=None,
+            placements=result.placements,
+            unplaced_items=result.unplaced_items,
+        )
+
+    length = max(
+        placement.origin[0] + placement.dimensions.length
+        for placement in result.placements
+    )
+    width = max(
+        placement.origin[1] + placement.dimensions.width
+        for placement in result.placements
+    )
+    height = max(
+        placement.origin[2] + placement.dimensions.height
+        for placement in result.placements
+    )
+    dimensions = Dimensions(length=length, width=width, height=height)
+    total_weight_kg = sum(item.weight_kg for item in expanded_items)
+
+    return OptimizedCartonResult(
+        success=True,
+        length_cm=length,
+        width_cm=width,
+        height_cm=height,
+        chargeable_weight_kg=chargeable_weight_kg(dimensions, total_weight_kg),
+        volume_cm3=volume(dimensions),
+        placements=result.placements,
+        unplaced_items=[],
+    )

@@ -1,10 +1,12 @@
 """Top-level workbook optimization workflow."""
 
+import logging
+import time
 from collections import defaultdict
 from pathlib import Path
 
 from box_optimizer.bundling import sku_combination_key
-from box_optimizer.io.excel_reader import read_intake
+from box_optimizer.io.excel_reader import IntakeResult, read_intake
 from box_optimizer.io.excel_writer import write_workbook
 from box_optimizer.models import Dimensions, OrderLine, PackedItem, SKUItem
 from box_optimizer.packing.geometry import volume
@@ -24,7 +26,13 @@ DEFAULT_CONFIG = {
     "packing_weight_uplift": 1.15,
     "standardization_tolerance_cm": 2,
     "preserve_region_sheets": True,
+    "debug": False,
+    "max_orders": None,
+    "packing_mode": "normal",
 }
+
+
+logger = logging.getLogger("box_optimizer")
 
 
 _US_STATE_ABBREVIATIONS = {
@@ -87,6 +95,126 @@ def _config(config: dict | None) -> dict:
     if config:
         merged.update(config)
     return merged
+
+
+def _log_event(event: str, **fields) -> None:
+    logger.info(event, extra={"box_optimizer": {"event": event, **fields}})
+
+
+def _limited_order_ids(lines: list[OrderLine], max_orders: int | None) -> set[str] | None:
+    if max_orders is None:
+        return None
+    order_ids = []
+    seen = set()
+    for line in lines:
+        if line.order_id in seen:
+            continue
+        seen.add(line.order_id)
+        order_ids.append(line.order_id)
+        if len(order_ids) >= max_orders:
+            break
+    return set(order_ids)
+
+
+def _limit_intake(intake: IntakeResult, max_orders: int | None) -> IntakeResult:
+    allowed_order_ids = _limited_order_ids(intake.order_lines, max_orders)
+    if allowed_order_ids is None:
+        return intake
+
+    order_lines = [
+        line for line in intake.order_lines if line.order_id in allowed_order_ids
+    ]
+    matched_order_lines = [
+        line for line in intake.matched_order_lines if line.order_id in allowed_order_ids
+    ]
+    unmatched_skus = [
+        record
+        for record in intake.unmatched_skus
+        if record.order_line.order_id in allowed_order_ids
+    ]
+    debug = dict(intake.debug)
+    debug["max_orders"] = max_orders
+    debug["inspected_order_count"] = len(allowed_order_ids)
+    debug["order_lines_created"] = len(order_lines)
+    debug["matched"] = len(matched_order_lines)
+    debug["unmatched"] = len(unmatched_skus)
+    return IntakeResult(
+        sku_items=intake.sku_items,
+        order_lines=order_lines,
+        matched_order_lines=matched_order_lines,
+        unmatched_skus=unmatched_skus,
+        column_mappings=intake.column_mappings,
+        debug=debug,
+    )
+
+
+def _detected_columns(column_mappings: list[dict], key: str) -> list[str]:
+    columns = []
+    for mapping in column_mappings:
+        value = mapping.get(key, "")
+        if value:
+            columns.extend(
+                column.strip()
+                for column in str(value).split(" | ")
+                if column.strip()
+            )
+    return sorted(set(columns))
+
+
+def inspect_workbook(
+    sku_master_path: str,
+    orders_path: str,
+    config: dict | None = None,
+) -> dict:
+    """Parse and match intake files without packing or writing an XLSX file."""
+    started = time.perf_counter()
+    cfg = _config(config)
+
+    _log_event("sku_parsing_started")
+    _log_event("order_parsing_started")
+    intake = read_intake(sku_master_path, orders_path)
+    intake = _limit_intake(intake, cfg.get("max_orders"))
+    _log_event(
+        "matching_finished",
+        sku_items=len(intake.sku_items),
+        order_lines=len(intake.order_lines),
+        matched=len(intake.matched_order_lines),
+        unmatched=len(intake.unmatched_skus),
+    )
+
+    sheets = sorted(
+        {
+            mapping.get("sheet", "")
+            for mapping in intake.column_mappings
+            if mapping.get("sheet")
+        }
+    )
+    sku_columns = _detected_columns(intake.column_mappings, "detected dimension column")
+    weight_columns = _detected_columns(intake.column_mappings, "detected weight column")
+    metadata_columns = _detected_columns(
+        intake.column_mappings,
+        "detected metadata columns",
+    )
+    product_columns = _detected_columns(
+        intake.column_mappings,
+        "detected product quantity columns",
+    )
+    warnings = _diagnostic_warnings(intake.debug)
+
+    return {
+        "sku_items": len(intake.sku_items),
+        "order_rows": intake.debug.get("order_rows_read", 0),
+        "wide_product_columns": intake.debug.get("wide_product_columns_detected", 0),
+        "order_lines": len(intake.order_lines),
+        "matched": len(intake.matched_order_lines),
+        "unmatched": len(intake.unmatched_skus),
+        "sheets_read": sheets,
+        "detected_sku_columns": sku_columns + weight_columns,
+        "detected_order_columns": metadata_columns,
+        "detected_product_quantity_columns": product_columns,
+        "warnings": warnings,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
 
 
 def _sku_lookup(sku_items: list[SKUItem]) -> dict[str, SKUItem]:
@@ -308,6 +436,7 @@ def optimize_workbook(
     config: dict | None = None,
 ) -> dict:
     """Optimize a SKU/order workbook pair and write an output workbook."""
+    started = time.perf_counter()
     cfg = _config(config)
     warnings = []
     if cfg["max_carton_cm"] != DEFAULT_CONFIG["max_carton_cm"]:
@@ -317,7 +446,17 @@ def optimize_workbook(
     if cfg["packing_weight_uplift"] != DEFAULT_CONFIG["packing_weight_uplift"]:
         warnings.append("Custom packing_weight_uplift is not yet supported; using 1.15.")
 
+    _log_event("sku_parsing_started")
+    _log_event("order_parsing_started")
     intake = read_intake(sku_master_path, orders_path)
+    intake = _limit_intake(intake, cfg.get("max_orders"))
+    _log_event(
+        "matching_finished",
+        sku_items=len(intake.sku_items),
+        order_lines=len(intake.order_lines),
+        matched=len(intake.matched_order_lines),
+        unmatched=len(intake.unmatched_skus),
+    )
     if intake.unmatched_skus:
         warnings.append(f"{len(intake.unmatched_skus)} unmatched SKU rows were preserved.")
     warnings.extend(_diagnostic_warnings(intake.debug))
@@ -329,9 +468,19 @@ def optimize_workbook(
     items_by_order = {}
     failed_orders = []
 
+    packing_mode = cfg.get("packing_mode", "normal")
+    _log_event("packing_started", order_count=len(grouped_orders), packing_mode=packing_mode)
     for order_id, lines in grouped_orders.items():
+        order_started = time.perf_counter()
+        _log_event("order_packing_started", order_id=order_id, line_count=len(lines))
         items = _packed_items_for_order(lines, sku_items)
-        split_result = split_order_into_cartons(items)
+        split_result = split_order_into_cartons(items, packing_mode=packing_mode)
+        _log_event(
+            "order_packing_finished",
+            order_id=order_id,
+            success=split_result.success,
+            elapsed_seconds=round(time.perf_counter() - order_started, 3),
+        )
         if split_result.success:
             split_results[order_id] = split_result
             combo_by_order[order_id] = _sku_breakdown(lines)
@@ -341,6 +490,11 @@ def optimize_workbook(
 
     if failed_orders:
         warnings.append(f"{len(failed_orders)} orders could not be packed.")
+    _log_event(
+        "packing_finished",
+        successful_orders=len(split_results),
+        failed_orders=len(failed_orders),
+    )
 
     assignments = standardize_optimized_cartons(
         _build_standardization_inputs(split_results, combo_by_order),
@@ -416,6 +570,7 @@ def optimize_workbook(
                 rows_by_region[f"Region - {row['Region']}"].append(row)
         region_sheets = dict(rows_by_region)
 
+    _log_event("excel_writing_started", output_path=str(Path(output_path).name))
     write_workbook(
         output_path,
         summary_rows=_summary_rows(result),
@@ -427,6 +582,11 @@ def optimize_workbook(
         input_column_mapping_rows=intake.column_mappings,
         errors_and_warnings_rows=[{"Warning": warning} for warning in warnings],
         sheets=region_sheets,
+    )
+    _log_event(
+        "excel_writing_finished",
+        output_path=str(Path(output_path).name),
+        elapsed_seconds=round(time.perf_counter() - started, 3),
     )
 
     return result
