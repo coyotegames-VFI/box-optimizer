@@ -85,19 +85,39 @@ def test_optimize_requires_api_key_when_environment_variable_is_set(monkeypatch)
     assert response.status_code == 401
 
 
-def test_optimize_returns_generated_excel_workbook(monkeypatch):
-    monkeypatch.setenv("BOX_OPTIMIZER_API_KEY", "secret")
+def test_optimize_accepts_x_api_key_header(monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_API_KEY", " secret ")
     client = TestClient(app)
 
     response = client.post(
         "/optimize",
-        headers={"X-API-Key": "secret"},
+        headers={"X-API-Key": " secret "},
         files={
             "sku_master_file": _sku_master_file(),
             "orders_file": _orders_file(),
         },
         data={
             "config_json": '{"standardization_tolerance_cm": 2}',
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    assert response.content[:2] == b"PK"
+
+
+def test_optimize_accepts_authorization_bearer_header(monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_API_KEY", " secret ")
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize",
+        headers={"Authorization": "Bearer  secret "},
+        files={
+            "sku_master_file": _sku_master_file(),
+            "orders_file": _orders_file(),
         },
     )
 

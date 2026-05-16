@@ -35,10 +35,13 @@ def _provided_api_key(
     authorization: str | None,
 ) -> str | None:
     if x_api_key:
-        return x_api_key
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization.split(" ", 1)[1]
-    return authorization
+        return x_api_key.strip()
+    if authorization:
+        provided = authorization.strip()
+        if provided.lower().startswith("bearer "):
+            return provided[len("Bearer ") :].strip()
+        return provided
+    return None
 
 
 def require_api_key(
@@ -46,7 +49,7 @@ def require_api_key(
     authorization: str | None = Header(default=None),
 ) -> None:
     """Require an API key when BOX_OPTIMIZER_API_KEY is configured."""
-    expected = os.getenv("BOX_OPTIMIZER_API_KEY")
+    expected = (os.getenv("BOX_OPTIMIZER_API_KEY") or "").strip()
     if not expected:
         return
 
