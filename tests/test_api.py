@@ -79,6 +79,60 @@ def _orders_file_two_orders():
     )
 
 
+def _mixed_sku_master_file():
+    return (
+        "sku_master.csv",
+        _csv_bytes(
+            [
+                {
+                    "SKU": "Core Game",
+                    "Product Name": "Core Game",
+                    "Length": "5",
+                    "Width": "5",
+                    "Height": "5",
+                    "Weight kg": "1",
+                },
+                {
+                    "SKU": "Oversized",
+                    "Product Name": "Oversized",
+                    "Length": "80",
+                    "Width": "10",
+                    "Height": "10",
+                    "Weight kg": "3",
+                },
+            ]
+        ),
+        "text/csv",
+    )
+
+
+def _mixed_orders_file():
+    return (
+        "orders.csv",
+        _csv_bytes(
+            [
+                {
+                    "Order ID": "1001",
+                    "SKU": "Core Game",
+                    "Quantity": "1",
+                    "Region": "NA",
+                    "Country": "US",
+                    "State": "CA",
+                },
+                {
+                    "Order ID": "1002",
+                    "SKU": "Oversized",
+                    "Quantity": "1",
+                    "Region": "NA",
+                    "Country": "US",
+                    "State": "NY",
+                },
+            ]
+        ),
+        "text/csv",
+    )
+
+
 def test_health_returns_ok():
     client = TestClient(app)
 
@@ -150,6 +204,30 @@ def test_inspect_respects_max_orders(monkeypatch):
     assert body["order_rows"] == 2
     assert body["order_lines"] == 1
     assert body["matched"] == 1
+
+
+def test_config_json_accepts_sku_rules_and_inspect_reports_rule_keys(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/inspect",
+        files={
+            "sku_master_file": _sku_master_file(),
+            "orders_file": _orders_file(),
+        },
+        data={
+            "config_json": (
+                '{"sku_rules":{"Core Game":{"no_padding":true},'
+                '"Missing Rule":{"prepacked":true}}}'
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["matched_rule_keys"] == ["Core Game"]
+    assert body["unmatched_rule_keys"] == ["Missing Rule"]
 
 
 def test_optimize_requires_api_key_when_environment_variable_is_set(monkeypatch):
@@ -268,6 +346,26 @@ def test_optimize_passes_max_orders_and_fast_mode(monkeypatch):
     assert response.status_code == 200
     assert captured["config"]["max_orders"] == 1
     assert captured["config"]["packing_mode"] == "fast"
+
+
+def test_optimize_returns_xlsx_when_one_order_fails_packing(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize",
+        files={
+            "sku_master_file": _mixed_sku_master_file(),
+            "orders_file": _mixed_orders_file(),
+        },
+        data={"config_json": '{"max_orders": 5, "packing_mode": "fast"}'},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    assert response.content[:2] == b"PK"
 
 
 def test_optimize_rejects_invalid_config_json(monkeypatch):

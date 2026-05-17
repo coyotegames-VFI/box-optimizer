@@ -1,6 +1,7 @@
 """Deterministic heuristic 3D packer."""
 
 from dataclasses import dataclass
+from dataclasses import replace
 from itertools import product
 
 from box_optimizer.models import Dimensions, PackedItem
@@ -59,16 +60,28 @@ def _expand_items(items: list[PackedItem]) -> list[PackedItem]:
     expanded = []
     for item in items:
         expanded.extend(
-            PackedItem(
-                canonical_sku=item.canonical_sku,
-                quantity=1,
-                unpadded_dimensions=item.unpadded_dimensions,
-                padded_dimensions=item.padded_dimensions,
-                weight_kg=item.weight_kg,
-            )
+            replace(item, quantity=1)
             for _ in range(item.quantity)
         )
     return expanded
+
+
+def _rotations_for_item(item: PackedItem) -> list[Dimensions]:
+    if item.allowed_orientations:
+        rotations = list(item.allowed_orientations)
+    elif not item.allow_rotation:
+        rotations = [item.padded_dimensions]
+    else:
+        rotations = unique_rotations(item.padded_dimensions)
+
+    if item.must_stay_flat:
+        flat_height = item.padded_dimensions.height
+        rotations = [
+            rotation
+            for rotation in rotations
+            if rotation.height == flat_height
+        ]
+    return rotations
 
 
 def _axis_subset_sums(values_by_item: list[set[float]], limit: float) -> set[float]:
@@ -96,7 +109,7 @@ def _candidate_axis_values(
         values_by_item.append(
             {
                 getattr(rotation, axis)
-                for rotation in unique_rotations(item.padded_dimensions)
+                for rotation in _rotations_for_item(item)
                 if getattr(rotation, axis) <= limit
             }
         )
@@ -167,7 +180,7 @@ def _find_best_placement(
     best: tuple[tuple[float, ...], Placement] | None = None
 
     for point in _candidate_points(placements):
-        for rotation in unique_rotations(item.padded_dimensions):
+        for rotation in _rotations_for_item(item):
             if not fits_within_boundaries(rotation, carton_dimensions, point):
                 continue
             if _overlaps_existing(point, rotation, placements):

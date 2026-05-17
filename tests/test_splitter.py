@@ -79,3 +79,18 @@ def test_split_order_total_packed_skus_equal_original_ordered_skus():
     )
     assert result.success is True
     assert _packed_sku_counts(result) == expected
+
+
+def test_fast_mode_uses_simple_split_without_combinatorial_search(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("fast mode should not run combinatorial assignment search")
+
+    monkeypatch.setattr("box_optimizer.packing.splitter._canonical_assignments", fail_if_called)
+
+    result = split_order_into_cartons(
+        [_item("large-panel", Dimensions(45, 35, 30), 2, quantity=3)],
+        packing_mode="fast",
+    )
+
+    assert result.success is True
+    assert result.box_qty == 3

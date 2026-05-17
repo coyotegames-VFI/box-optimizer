@@ -146,7 +146,8 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
         "Distinct SKUs",
         "SKU Breakdown",
     ]
-    assert headers[29:] == ["Pledge Level", "Shipping Notes"]
+    assert headers[29:31] == ["Box Plan", "Warning Summary"]
+    assert headers[31:] == ["Pledge Level", "Shipping Notes"]
     assert rows[0]["Pledge Level"] == "Deluxe"
     assert rows[0]["Shipping Notes"] == "Leave at door"
 

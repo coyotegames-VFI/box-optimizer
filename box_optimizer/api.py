@@ -106,6 +106,14 @@ def _parse_config(config_json: str | None) -> dict:
             raise HTTPException(status_code=400, detail="max_orders must be a positive integer")
     if "packing_mode" in parsed and parsed["packing_mode"] not in {"normal", "fast"}:
         raise HTTPException(status_code=400, detail='packing_mode must be "normal" or "fast"')
+    if "output_granularity" in parsed and parsed["output_granularity"] not in {"order_summary", "box_detail"}:
+        raise HTTPException(status_code=400, detail='output_granularity must be "order_summary" or "box_detail"')
+    if "sku_rules" in parsed and not isinstance(parsed["sku_rules"], dict):
+        raise HTTPException(status_code=400, detail="sku_rules must be a JSON object")
+    if "box_menu" in parsed and not isinstance(parsed["box_menu"], list):
+        raise HTTPException(status_code=400, detail="box_menu must be a JSON array")
+    if "order_rules" in parsed and not isinstance(parsed["order_rules"], list):
+        raise HTTPException(status_code=400, detail="order_rules must be a JSON array")
     return parsed
 
 

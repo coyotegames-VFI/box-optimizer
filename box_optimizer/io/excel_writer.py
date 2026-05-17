@@ -15,6 +15,7 @@ OPTIONAL_SHEETS = [
     "Unmatched SKUs",
     "Packing Detail",
     "Multi Box Detail",
+    "Pledge Combination Summary",
     "Input Column Mapping",
     "Errors and Warnings",
 ]
@@ -49,6 +50,8 @@ ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Chargeable Weight lb",
     "Distinct SKUs",
     "SKU Breakdown",
+    "Box Plan",
+    "Warning Summary",
 ]
 
 
@@ -293,6 +296,7 @@ def _build_sheet_payloads(
         "unmatched_skus_rows": "Unmatched SKUs",
         "packing_detail_rows": "Packing Detail",
         "multi_box_detail_rows": "Multi Box Detail",
+        "pledge_combination_summary_rows": "Pledge Combination Summary",
         "input_column_mapping_rows": "Input Column Mapping",
         "errors_and_warnings_rows": "Errors and Warnings",
     }

@@ -70,6 +70,16 @@ class PackedItem:
     padded_dimensions: Dimensions
     weight_kg: float
     placement_coordinates: tuple[float, float, float] | None = None
+    raw_sku: str = ""
+    product_name: str = ""
+    rule_key: str | None = None
+    rule_applied: str = ""
+    box_type: str | None = None
+    warning_note: str = ""
+    exclude_from_standardization: bool = False
+    allow_rotation: bool = True
+    must_stay_flat: bool = False
+    allowed_orientations: tuple[Dimensions, ...] | None = None
 
 
 @dataclass(frozen=True)

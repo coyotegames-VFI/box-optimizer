@@ -1,16 +1,25 @@
 """Top-level workbook optimization workflow."""
 
 import logging
+import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 from box_optimizer.bundling import sku_combination_key
 from box_optimizer.io.excel_reader import IntakeResult, read_intake
 from box_optimizer.io.excel_writer import write_workbook
 from box_optimizer.models import Dimensions, OrderLine, PackedItem, SKUItem
+from box_optimizer.normalize import normalize_sku
 from box_optimizer.packing.geometry import volume
-from box_optimizer.packing.splitter import SplitResult, split_order_into_cartons
+from box_optimizer.packing.packer import (
+    MAX_CARTON_DIMENSIONS,
+    OptimizedCartonResult,
+    _expand_items,
+    pack_items,
+)
+from box_optimizer.packing.splitter import SplitCarton, SplitResult, split_order_into_cartons
 from box_optimizer.padding import add_final_exterior_padding, add_padding
 from box_optimizer.standardization import (
     OptimizedOrderCarton,
@@ -29,10 +38,43 @@ DEFAULT_CONFIG = {
     "debug": False,
     "max_orders": None,
     "packing_mode": "normal",
+    "output_granularity": "order_summary",
 }
 
 
 logger = logging.getLogger("box_optimizer")
+
+
+@dataclass(frozen=True)
+class WorkflowWarning:
+    """Structured warning row for the workbook diagnostics tab."""
+
+    order_id: str
+    stage: str
+    error_type: str
+    message: str
+    sku_breakdown: str = ""
+    sku: str = ""
+    rule_applied: str = ""
+
+
+@dataclass(frozen=True)
+class SKUCampaignRule:
+    """Runtime campaign rule matched to a SKU or product name."""
+
+    key: str
+    no_padding: bool = False
+    prepacked: bool = False
+    ships_alone: bool = False
+    can_mix_with_other_items: bool = True
+    forced_box_cm: Dimensions | None = None
+    must_stay_flat: bool = False
+    allow_rotation: bool = True
+    allowed_orientations: tuple[Dimensions, ...] | None = None
+    extra_padding_cm: Dimensions | None = None
+    exclude_from_standardization: bool = False
+    box_type: str | None = None
+    warning_note: str = ""
 
 
 _US_STATE_ABBREVIATIONS = {
@@ -95,6 +137,117 @@ def _config(config: dict | None) -> dict:
     if config:
         merged.update(config)
     return merged
+
+
+def _rule_key(value: object) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("â€œ", "\"").replace("â€", "\"").replace("â€™", "'").replace("Ã—", "x")
+    return re.sub(r"[\W_]+", "", text)
+
+
+def _dimensions_from_config(value: object) -> Dimensions | None:
+    if value is None:
+        return None
+    if not isinstance(value, list | tuple) or len(value) != 3:
+        return None
+    try:
+        length, width, height = [float(part) for part in value]
+    except (TypeError, ValueError):
+        return None
+    sorted_values = sorted([length, width, height], reverse=True)
+    return Dimensions(*sorted_values)
+
+
+def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
+    parsed = {}
+    for key, rule in (config.get("sku_rules") or {}).items():
+        if not isinstance(rule, dict):
+            continue
+        orientations = rule.get("allowed_orientations")
+        allowed_orientations = None
+        if orientations:
+            parsed_orientations = [
+                dimensions
+                for dimensions in (_dimensions_from_config(value) for value in orientations)
+                if dimensions is not None
+            ]
+            allowed_orientations = tuple(parsed_orientations) or None
+        parsed[key] = SKUCampaignRule(
+            key=str(key),
+            no_padding=bool(rule.get("no_padding", False)),
+            prepacked=bool(rule.get("prepacked", False)),
+            ships_alone=bool(rule.get("ships_alone", False)),
+            can_mix_with_other_items=bool(rule.get("can_mix_with_other_items", True)),
+            forced_box_cm=_dimensions_from_config(rule.get("forced_box_cm")),
+            must_stay_flat=bool(rule.get("must_stay_flat", False)),
+            allow_rotation=bool(rule.get("allow_rotation", True)),
+            allowed_orientations=allowed_orientations,
+            extra_padding_cm=_dimensions_from_config(rule.get("extra_padding_cm")),
+            exclude_from_standardization=bool(rule.get("exclude_from_standardization", False)),
+            box_type=rule.get("box_type"),
+            warning_note=str(rule.get("warning_note", "") or ""),
+        )
+    return parsed
+
+
+def _rule_candidates_for_sku(item: SKUItem) -> set[str]:
+    return {
+        normalize_sku(item.raw_sku),
+        normalize_sku(item.canonical_sku),
+        normalize_sku(item.product_name),
+        _rule_key(item.raw_sku),
+        _rule_key(item.canonical_sku),
+        _rule_key(item.product_name),
+    }
+
+
+def _rule_candidates_for_line(line: OrderLine) -> set[str]:
+    return {
+        normalize_sku(line.raw_sku),
+        normalize_sku(line.canonical_sku),
+        _rule_key(line.raw_sku),
+        _rule_key(line.canonical_sku),
+    }
+
+
+def _match_sku_rules(
+    config: dict,
+    sku_items: list[SKUItem],
+    order_lines: list[OrderLine],
+) -> tuple[dict[str, SKUCampaignRule], list[str], list[str]]:
+    rules = _parse_sku_rules(config)
+    normalized_rules = {
+        candidate: rule
+        for rule in rules.values()
+        for candidate in {normalize_sku(rule.key), _rule_key(rule.key)}
+    }
+    matches = {}
+    matched_keys = set()
+    for item in sku_items:
+        rule = next(
+            (
+                normalized_rules[candidate]
+                for candidate in _rule_candidates_for_sku(item)
+                if candidate in normalized_rules
+            ),
+            None,
+        )
+        if rule:
+            matches[item.canonical_sku] = rule
+            matched_keys.add(rule.key)
+    for line in order_lines:
+        rule = next(
+            (
+                normalized_rules[candidate]
+                for candidate in _rule_candidates_for_line(line)
+                if candidate in normalized_rules
+            ),
+            None,
+        )
+        if rule:
+            matches[line.canonical_sku] = rule
+            matched_keys.add(rule.key)
+    return matches, sorted(matched_keys), sorted(set(rules) - matched_keys)
 
 
 def _log_event(event: str, **fields) -> None:
@@ -200,6 +353,11 @@ def inspect_workbook(
         "detected product quantity columns",
     )
     warnings = _diagnostic_warnings(intake.debug)
+    _rule_matches, matched_rule_keys, unmatched_rule_keys = _match_sku_rules(
+        cfg,
+        intake.sku_items,
+        intake.order_lines,
+    )
 
     return {
         "sku_items": len(intake.sku_items),
@@ -212,6 +370,8 @@ def inspect_workbook(
         "detected_sku_columns": sku_columns + weight_columns,
         "detected_order_columns": metadata_columns,
         "detected_product_quantity_columns": product_columns,
+        "matched_rule_keys": matched_rule_keys,
+        "unmatched_rule_keys": unmatched_rule_keys,
         "warnings": warnings,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
@@ -253,22 +413,41 @@ def _group_order_lines(lines: list[OrderLine]) -> dict[str, list[OrderLine]]:
 def _packed_items_for_order(
     lines: list[OrderLine],
     sku_lookup: dict[str, SKUItem],
+    sku_rules: dict[str, SKUCampaignRule] | None = None,
 ) -> list[PackedItem]:
     items = []
     for line in lines:
         sku_item = sku_lookup[line.canonical_sku]
+        rule = (sku_rules or {}).get(line.canonical_sku)
         unpadded = Dimensions(
             length=sku_item.length_cm,
             width=sku_item.width_cm,
             height=sku_item.height_cm,
         )
+        padded = unpadded if rule and (rule.no_padding or rule.prepacked) else add_padding(unpadded)
+        if rule and rule.extra_padding_cm:
+            padded = Dimensions(
+                length=padded.length + rule.extra_padding_cm.length,
+                width=padded.width + rule.extra_padding_cm.width,
+                height=padded.height + rule.extra_padding_cm.height,
+            )
         items.append(
             PackedItem(
                 canonical_sku=line.canonical_sku,
                 quantity=line.quantity,
                 unpadded_dimensions=unpadded,
-                padded_dimensions=add_padding(unpadded),
+                padded_dimensions=padded,
                 weight_kg=sku_item.weight_kg,
+                raw_sku=sku_item.raw_sku,
+                product_name=sku_item.product_name,
+                rule_key=rule.key if rule else None,
+                rule_applied=rule.key if rule else "",
+                box_type=rule.box_type if rule else None,
+                warning_note=rule.warning_note if rule else "",
+                exclude_from_standardization=rule.exclude_from_standardization if rule else False,
+                allow_rotation=rule.allow_rotation if rule else True,
+                must_stay_flat=rule.must_stay_flat if rule else False,
+                allowed_orientations=rule.allowed_orientations if rule else None,
             )
         )
     return items
@@ -326,15 +505,248 @@ def _padded_volume_cm3(items: list[PackedItem]) -> float:
     return sum(volume(item.padded_dimensions) * item.quantity for item in items)
 
 
-def _carton_dimensions(split_result: SplitResult, box_index: int) -> Dimensions:
-    carton = split_result.cartons[box_index].result
-    return add_final_exterior_padding(
-        Dimensions(
-            length=carton.length_cm or 0,
-            width=carton.width_cm or 0,
-            height=carton.height_cm or 0,
-        )
+def _within_carton_cap(dimensions: Dimensions) -> bool:
+    return (
+        dimensions.length <= MAX_CARTON_DIMENSIONS.length
+        and dimensions.width <= MAX_CARTON_DIMENSIONS.width
+        and dimensions.height <= MAX_CARTON_DIMENSIONS.height
     )
+
+
+def _capped_dimensions(dimensions: Dimensions) -> Dimensions:
+    return Dimensions(
+        length=min(dimensions.length, MAX_CARTON_DIMENSIONS.length),
+        width=min(dimensions.width, MAX_CARTON_DIMENSIONS.width),
+        height=min(dimensions.height, MAX_CARTON_DIMENSIONS.height),
+    )
+
+
+def _raw_carton_dimensions(split_result: SplitResult, box_index: int) -> Dimensions:
+    carton = split_result.cartons[box_index].result
+    return Dimensions(
+        length=carton.length_cm or 0,
+        width=carton.width_cm or 0,
+        height=carton.height_cm or 0,
+    )
+
+
+def _carton_dimensions(split_result: SplitResult, box_index: int) -> Dimensions:
+    if split_result.cartons[box_index].dimensions_are_final:
+        return _capped_dimensions(_raw_carton_dimensions(split_result, box_index))
+    return _capped_dimensions(add_final_exterior_padding(_raw_carton_dimensions(split_result, box_index)))
+
+
+def _exterior_cap_violations(split_result: SplitResult) -> list[int]:
+    violations = []
+    for index, _carton in enumerate(split_result.cartons):
+        if split_result.cartons[index].dimensions_are_final:
+            exterior = _raw_carton_dimensions(split_result, index)
+        else:
+            exterior = add_final_exterior_padding(_raw_carton_dimensions(split_result, index))
+        if not _within_carton_cap(exterior):
+            violations.append(index)
+    return violations
+
+
+def _single_item_split(items: list[PackedItem], packing_mode: str) -> SplitResult:
+    return split_order_into_cartons(
+        [
+            PackedItem(
+                canonical_sku=item.canonical_sku,
+                quantity=1,
+                unpadded_dimensions=item.unpadded_dimensions,
+                padded_dimensions=item.padded_dimensions,
+                weight_kg=item.weight_kg,
+            )
+            for item in _expand_items(items)
+        ],
+        packing_mode="fast" if packing_mode == "fast" else "normal",
+        force_simple_split=True,
+    )
+
+
+def _forced_box_result(items: list[PackedItem], dimensions: Dimensions) -> OptimizedCartonResult:
+    result = pack_items(items, dimensions)
+    if not result.success:
+        return OptimizedCartonResult(
+            success=False,
+            length_cm=None,
+            width_cm=None,
+            height_cm=None,
+            chargeable_weight_kg=None,
+            volume_cm3=None,
+            placements=result.placements,
+            unplaced_items=result.unplaced_items,
+        )
+    total_weight_kg = sum(item.weight_kg for item in _expand_items(items))
+    return OptimizedCartonResult(
+        success=True,
+        length_cm=dimensions.length,
+        width_cm=dimensions.width,
+        height_cm=dimensions.height,
+        chargeable_weight_kg=max(
+            packed_actual_weight_kg(total_weight_kg),
+            dimensional_weight_kg(dimensions),
+        ),
+        volume_cm3=volume(dimensions),
+        placements=result.placements,
+        unplaced_items=[],
+    )
+
+
+def _merge_split_results(results: list[SplitResult]) -> SplitResult:
+    cartons = []
+    for result in results:
+        for carton in result.cartons:
+            cartons.append(
+                SplitCarton(
+                    box_number=len(cartons) + 1,
+                    result=carton.result,
+                    box_type=carton.box_type,
+                    rule_applied=carton.rule_applied,
+                    warning=carton.warning,
+                    dimensions_are_final=carton.dimensions_are_final,
+                )
+            )
+    unplaced = [
+        item
+        for result in results
+        for item in result.unplaced_items
+    ]
+    return SplitResult(
+        success=not unplaced and all(result.success for result in results),
+        box_qty=len(cartons),
+        cartons=cartons,
+        unplaced_items=unplaced,
+    )
+
+
+def _split_rule_groups(
+    lines: list[OrderLine],
+    sku_rules: dict[str, SKUCampaignRule],
+    config: dict,
+) -> list[list[OrderLine]]:
+    trigger_keys = set()
+    for order_rule in config.get("order_rules") or []:
+        if not isinstance(order_rule, dict):
+            continue
+        if order_rule.get("split_strategy") != "trigger_skus_ship_alone_addons_separate":
+            continue
+        for value in order_rule.get("trigger_skus", []):
+            trigger_keys.add(normalize_sku(value))
+            trigger_keys.add(_rule_key(value))
+
+    groups: list[list[OrderLine]] = []
+    remainder = []
+    for line in lines:
+        rule = sku_rules.get(line.canonical_sku)
+        line_triggered = bool(_rule_candidates_for_line(line) & trigger_keys)
+        must_split = (
+            line_triggered
+            or bool(rule and rule.prepacked)
+            or bool(rule and rule.ships_alone)
+            or bool(rule and not rule.can_mix_with_other_items)
+            or bool(rule and rule.forced_box_cm)
+        )
+        if must_split:
+            groups.append([line])
+        else:
+            remainder.append(line)
+    if remainder:
+        groups.append(remainder)
+    return groups or [lines]
+
+
+def _pack_group(
+    group: list[OrderLine],
+    items: list[PackedItem],
+    sku_rules: dict[str, SKUCampaignRule],
+    packing_mode: str,
+) -> tuple[SplitResult, list[WorkflowWarning]]:
+    warnings = []
+    group_rule = sku_rules.get(group[0].canonical_sku) if len(group) == 1 else None
+    if group_rule and group_rule.forced_box_cm:
+        if not _within_carton_cap(group_rule.forced_box_cm):
+            warnings.append(
+                WorkflowWarning(
+                    order_id=group[0].order_id,
+                    sku=group[0].canonical_sku,
+                    stage="packing",
+                    error_type="ForcedBoxExceedsCap",
+                    message="forced_box_cm exceeds the 74 x 37 x 44 cm carton cap.",
+                    rule_applied=group_rule.key,
+                    sku_breakdown=_sku_breakdown(group),
+                )
+            )
+            return SplitResult(False, 0, [], items), warnings
+        result = _forced_box_result(items, group_rule.forced_box_cm)
+        if not result.success:
+            warnings.append(
+                WorkflowWarning(
+                    order_id=group[0].order_id,
+                    sku=group[0].canonical_sku,
+                    stage="packing",
+                    error_type="ForcedBoxTooSmall",
+                    message="forced_box_cm is smaller than the item or group dimensions.",
+                    rule_applied=group_rule.key,
+                    sku_breakdown=_sku_breakdown(group),
+                )
+            )
+            return SplitResult(False, 0, [], result.unplaced_items), warnings
+        return (
+            SplitResult(
+                True,
+                1,
+                [
+                    SplitCarton(
+                        box_number=1,
+                        result=result,
+                        box_type=group_rule.box_type,
+                        rule_applied=group_rule.key,
+                        warning=group_rule.warning_note,
+                        dimensions_are_final=True,
+                    )
+                ],
+                [],
+            ),
+            warnings,
+        )
+
+    result = split_order_into_cartons(
+        items,
+        packing_mode=packing_mode,
+        force_simple_split=False,
+    )
+    if len(group) == 1 and group_rule and result.success:
+        result = SplitResult(
+            True,
+            result.box_qty,
+            [
+                SplitCarton(
+                    box_number=carton.box_number,
+                    result=carton.result,
+                    box_type=group_rule.box_type or carton.box_type,
+                    rule_applied=group_rule.key,
+                    warning=group_rule.warning_note,
+                    dimensions_are_final=carton.dimensions_are_final,
+                )
+                for carton in result.cartons
+            ],
+            [],
+        )
+    return result, warnings
+
+
+def _warning_row(warning: WorkflowWarning) -> dict:
+    return {
+        "Order ID": warning.order_id,
+        "SKU": warning.sku,
+        "Stage": warning.stage,
+        "Error Type": warning.error_type,
+        "Message": warning.message,
+        "Rule Applied": warning.rule_applied,
+        "SKU Breakdown": warning.sku_breakdown,
+    }
 
 
 def _build_standardization_inputs(
@@ -369,19 +781,58 @@ def _summary_rows(result: dict) -> list[dict]:
         {"Metric": "Boxes Created", "Value": result["boxes_created"]},
         {"Metric": "Box Types", "Value": result["box_types"]},
         {"Metric": "Unmatched SKUs", "Value": result["unmatched_skus"]},
+        {"Metric": "Warning Count", "Value": result["warning_count"]},
+        {"Metric": "Multi-box Orders", "Value": result["multi_box_order_count"]},
+        {"Metric": "Rules Applied", "Value": result["rules_applied_count"]},
     ]
 
 
-def _box_size_summary(assignments: list[StandardizedBoxAssignment]) -> list[dict]:
-    by_type = {}
-    for assignment in assignments:
-        by_type[assignment.box_type] = {
-            "Box Type": assignment.box_type,
-            "Assigned Box Length cm": assignment.assigned_length_cm,
-            "Assigned Box Width cm": assignment.assigned_width_cm,
-            "Assigned Box Height cm": assignment.assigned_height_cm,
-        }
-    return list(by_type.values())
+def _box_size_summary(box_rows: list[dict]) -> list[dict]:
+    by_type: dict[str, dict] = {}
+    for row in box_rows:
+        box_type = row["Box Type"]
+        summary = by_type.setdefault(
+            box_type,
+            {
+                "Box Type": box_type,
+                "Length cm": row["Length cm"],
+                "Width cm": row["Width cm"],
+                "Height cm": row["Height cm"],
+                "Box Count": 0,
+                "Order IDs": set(),
+                "Unit Count": 0,
+                "Main SKU Combos": set(),
+                "Chargeable Weights": [],
+                "Regions Used": set(),
+            },
+        )
+        summary["Box Count"] += 1
+        summary["Order IDs"].add(row["Order ID"])
+        summary["Unit Count"] += row.get("Unit Count", 0)
+        summary["Main SKU Combos"].add(row.get("SKU Breakdown", ""))
+        summary["Chargeable Weights"].append(row["Chargeable Weight kg"])
+        if row.get("Region"):
+            summary["Regions Used"].add(row["Region"])
+
+    output = []
+    for summary in by_type.values():
+        weights = summary["Chargeable Weights"] or [0]
+        output.append(
+            {
+                "Box Type": summary["Box Type"],
+                "Length cm": summary["Length cm"],
+                "Width cm": summary["Width cm"],
+                "Height cm": summary["Height cm"],
+                "Box Count": summary["Box Count"],
+                "Order Count": len(summary["Order IDs"]),
+                "Unit Count": summary["Unit Count"],
+                "Main SKU Combos": " | ".join(sorted(summary["Main SKU Combos"])),
+                "Average Chargeable Weight kg": sum(weights) / len(weights),
+                "Max Chargeable Weight kg": max(weights),
+                "Regions Used": " | ".join(sorted(summary["Regions Used"])),
+            }
+        )
+    return sorted(output, key=lambda row: row["Box Type"])
 
 
 def _unmatched_rows(unmatched_skus) -> list[dict]:
@@ -421,12 +872,151 @@ def _packing_detail_rows(split_results: dict[str, SplitResult]) -> list[dict]:
     return rows
 
 
-def _multi_box_rows(split_results: dict[str, SplitResult]) -> list[dict]:
+def _multi_box_rows(box_rows: list[dict]) -> list[dict]:
     return [
-        {"Order ID": order_id, "Box Qty": split_result.box_qty}
-        for order_id, split_result in split_results.items()
-        if split_result.box_qty > 1
+        {
+            "Region": row["Region"],
+            "Order ID": row["Order ID"],
+            "Box Number": row["Box Number"],
+            "Box Qty": row["Box Qty"],
+            "Box Type": row["Box Type"],
+            "Length cm": row["Length cm"],
+            "Width cm": row["Width cm"],
+            "Height cm": row["Height cm"],
+            "Actual Weight kg": row["Actual Weight kg"],
+            "Packed Actual Weight kg": row["Packed Actual Weight kg"],
+            "Dimensional Weight kg": row["Dimensional Weight kg (/5000)"],
+            "Chargeable Weight kg": row["Chargeable Weight kg"],
+            "SKUs in Box": row["SKUs in Box"],
+            "Placement Summary": row["Placement Summary"],
+            "Rule Applied": row["Rule Applied"],
+            "Warning": row["Warning"],
+        }
+        for row in box_rows
+        if row["Box Qty"] > 1
     ]
+
+
+def _box_plan(box_rows: list[dict]) -> str:
+    return "; ".join(
+        f"Box {row['Box Number']}: {row['Length cm']}x{row['Width cm']}x{row['Height cm']} cm"
+        for row in sorted(box_rows, key=lambda row: row["Box Number"])
+    )
+
+
+def _joined_box_types(box_rows: list[dict]) -> str:
+    types = [row["Box Type"] for row in box_rows if row.get("Box Type")]
+    unique_types = []
+    for box_type in types:
+        if box_type not in unique_types:
+            unique_types.append(box_type)
+    if len(unique_types) == 1:
+        return unique_types[0]
+    if len(unique_types) <= 3:
+        return " + ".join(unique_types)
+    return "MULTI-BOX"
+
+
+def _max_dimensions(box_rows: list[dict], prefix: str = "") -> Dimensions:
+    return Dimensions(
+        length=max(float(row[f"{prefix}Length cm"]) for row in box_rows),
+        width=max(float(row[f"{prefix}Width cm"]) for row in box_rows),
+        height=max(float(row[f"{prefix}Height cm"]) for row in box_rows),
+    )
+
+
+def _warning_summary(order_id: str, warnings: list[WorkflowWarning]) -> str:
+    return " | ".join(
+        warning.message
+        for warning in warnings
+        if warning.order_id == order_id
+    )
+
+
+def _order_summary_rows(
+    box_rows: list[dict],
+    grouped_orders: dict[str, list[OrderLine]],
+    items_by_order: dict[str, list[PackedItem]],
+    combo_by_order: dict[str, str],
+    warning_rows: list[WorkflowWarning],
+) -> list[dict]:
+    rows = []
+    rows_by_order: dict[str, list[dict]] = defaultdict(list)
+    for row in box_rows:
+        rows_by_order[row["Order ID"]].append(row)
+
+    for order_id, order_box_rows in rows_by_order.items():
+        lines = grouped_orders[order_id]
+        first_line = lines[0]
+        assigned = _max_dimensions(order_box_rows, "Assigned Box ")
+        optimized = _max_dimensions(order_box_rows, "Optimized ")
+        display = _max_dimensions(order_box_rows)
+        actual_weight = _actual_weight_kg(items_by_order[order_id])
+        packed_weight = packed_actual_weight_kg(actual_weight)
+        dim_weight = sum(float(row["Dimensional Weight kg (/5000)"]) for row in order_box_rows)
+        chargeable = sum(float(row["Chargeable Weight kg"]) for row in order_box_rows)
+        box_qty = int(float(order_box_rows[0]["Box Qty"]))
+        row = {
+            "Region": first_line.region or "",
+            "Order ID": order_id,
+            "Country": first_line.country or "",
+            "State/Province": first_line.state_province or "",
+            "US State Abbreviation": _state_abbreviation(first_line.country, first_line.state_province),
+            "Packed Actual Weight kg": packed_weight,
+            "Dimensional Weight kg (/5000)": dim_weight,
+            "Chargeable Weight kg": chargeable,
+            "Chargeable Weight g": chargeable * 1000,
+            "Total Units": _total_units(lines),
+            "Box Qty": box_qty,
+            "Box Type": _joined_box_types(order_box_rows) if box_qty == 1 else "MULTI-BOX",
+            "Length cm": display.length,
+            "Width cm": display.width,
+            "Height cm": display.height,
+            "Optimized Length cm": optimized.length,
+            "Optimized Width cm": optimized.width,
+            "Optimized Height cm": optimized.height,
+            "Assigned Box Length cm": assigned.length,
+            "Assigned Box Width cm": assigned.width,
+            "Assigned Box Height cm": assigned.height,
+            "Box Standardization Note": "Multi-box order; see Multi Box Detail" if box_qty > 1 else order_box_rows[0]["Box Standardization Note"],
+            "Actual Item Weight lb": actual_weight * KG_TO_LB,
+            "Packed Actual Weight lb (+15%)": packed_weight * KG_TO_LB,
+            "Bundled/Padded Volume cmÂ³": _padded_volume_cm3(items_by_order[order_id]),
+            "Dimensional Weight lb": dim_weight * KG_TO_LB,
+            "Chargeable Weight lb": chargeable * KG_TO_LB,
+            "Distinct SKUs": _distinct_skus(lines),
+            "SKU Breakdown": combo_by_order[order_id],
+            "Box Plan": _box_plan(order_box_rows),
+            "Warning Summary": _warning_summary(order_id, warning_rows),
+        }
+        rows.append(_append_metadata(row, _metadata_for_order(lines)))
+    return rows
+
+
+def _pledge_combination_summary_rows(order_rows: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in order_rows:
+        grouped[row["SKU Breakdown"]].append(row)
+
+    output = []
+    for sku_breakdown, rows in grouped.items():
+        chargeable_weights = [float(row["Chargeable Weight kg"]) for row in rows]
+        output.append(
+            {
+                "SKU Breakdown": sku_breakdown,
+                "Order Count": len(rows),
+                "Total Units": sum(int(float(row["Total Units"])) for row in rows),
+                "Box Qty Pattern": " | ".join(sorted({str(row["Box Qty"]) for row in rows})),
+                "Assigned Box Plan": " | ".join(sorted({row.get("Box Plan", "") for row in rows if row.get("Box Plan")})),
+                "Box Types Used": " | ".join(sorted({row["Box Type"] for row in rows})),
+                "Max Assigned Length cm": max(float(row["Assigned Box Length cm"]) for row in rows),
+                "Max Assigned Width cm": max(float(row["Assigned Box Width cm"]) for row in rows),
+                "Max Assigned Height cm": max(float(row["Assigned Box Height cm"]) for row in rows),
+                "Average Chargeable Weight kg": sum(chargeable_weights) / len(chargeable_weights),
+                "Regions Used": " | ".join(sorted({row["Region"] for row in rows if row.get("Region")})),
+            }
+        )
+    return sorted(output, key=lambda row: row["SKU Breakdown"])
 
 
 def optimize_workbook(
@@ -439,6 +1029,7 @@ def optimize_workbook(
     started = time.perf_counter()
     cfg = _config(config)
     warnings = []
+    warning_rows: list[WorkflowWarning] = []
     if cfg["max_carton_cm"] != DEFAULT_CONFIG["max_carton_cm"]:
         warnings.append("Custom max_carton_cm is not yet supported; using 74 x 37 x 44 cm.")
     if cfg["dimensional_divisor"] != DEFAULT_CONFIG["dimensional_divisor"]:
@@ -462,6 +1053,22 @@ def optimize_workbook(
     warnings.extend(_diagnostic_warnings(intake.debug))
 
     sku_items = _sku_lookup(intake.sku_items)
+    sku_rules, matched_rule_keys, unmatched_rule_keys = _match_sku_rules(
+        cfg,
+        intake.sku_items,
+        intake.order_lines,
+    )
+    for rule_key in unmatched_rule_keys:
+        warning_rows.append(
+            WorkflowWarning(
+                order_id="",
+                sku=rule_key,
+                stage="config",
+                error_type="UnmatchedRuleKey",
+                message="sku_rules key did not match any SKU, product name, or order product header.",
+                rule_applied=rule_key,
+            )
+        )
     grouped_orders = _group_order_lines(intake.matched_order_lines)
     split_results = {}
     combo_by_order = {}
@@ -472,21 +1079,108 @@ def optimize_workbook(
     _log_event("packing_started", order_count=len(grouped_orders), packing_mode=packing_mode)
     for order_id, lines in grouped_orders.items():
         order_started = time.perf_counter()
+        combo = _sku_breakdown(lines)
         _log_event("order_packing_started", order_id=order_id, line_count=len(lines))
-        items = _packed_items_for_order(lines, sku_items)
-        split_result = split_order_into_cartons(items, packing_mode=packing_mode)
-        _log_event(
-            "order_packing_finished",
-            order_id=order_id,
-            success=split_result.success,
-            elapsed_seconds=round(time.perf_counter() - order_started, 3),
-        )
-        if split_result.success:
-            split_results[order_id] = split_result
-            combo_by_order[order_id] = _sku_breakdown(lines)
-            items_by_order[order_id] = items
-        else:
+        try:
+            items = _packed_items_for_order(lines, sku_items, sku_rules)
+            groups = _split_rule_groups(lines, sku_rules, cfg)
+            group_results = []
+            for group in groups:
+                group_items = _packed_items_for_order(group, sku_items, sku_rules)
+                group_result, group_warnings = _pack_group(
+                    group,
+                    group_items,
+                    sku_rules,
+                    packing_mode,
+                )
+                group_results.append(group_result)
+                warning_rows.extend(group_warnings)
+            split_result = _merge_split_results(group_results)
+            if len(groups) > 1:
+                warning_rows.append(
+                    WorkflowWarning(
+                        order_id=order_id,
+                        stage="packing",
+                        error_type="OrderSplit",
+                        message="Order split due to ships-alone/prepacked/forced-box/order rule.",
+                        rule_applied=", ".join(
+                            sorted(
+                                {
+                                    sku_rules[line.canonical_sku].key
+                                    for line in lines
+                                    if line.canonical_sku in sku_rules
+                                }
+                            )
+                        ),
+                        sku_breakdown=combo,
+                    )
+                )
+            if split_result.success and _exterior_cap_violations(split_result):
+                retry = _single_item_split(items, packing_mode)
+                if retry.success:
+                    split_result = retry
+                if _exterior_cap_violations(split_result):
+                    message = (
+                        "Final exterior padding would exceed the carton cap; "
+                        "reported carton dimensions were capped at 74 x 37 x 44 cm."
+                    )
+                    warnings.append(f"{order_id}: {message}")
+                    warning_rows.append(
+                        WorkflowWarning(
+                            order_id=order_id,
+                            stage="packing",
+                            error_type="CartonCapWarning",
+                            message=message,
+                            sku_breakdown=combo,
+                        )
+                    )
+            _log_event(
+                "order_packing_finished",
+                order_id=order_id,
+                success=split_result.success,
+                elapsed_seconds=round(time.perf_counter() - order_started, 3),
+            )
+            if split_result.success:
+                split_results[order_id] = split_result
+                combo_by_order[order_id] = combo
+                items_by_order[order_id] = items
+            else:
+                failed_orders.append(order_id)
+                failed_skus = ", ".join(
+                    sorted({item.canonical_sku for item in split_result.unplaced_items})
+                )
+                message = (
+                    "Order contains item(s) that cannot fit inside the 74 x 37 x 44 cm "
+                    f"carton cap in any rotation: {failed_skus or 'unknown SKU'}."
+                )
+                warning_rows.append(
+                    WorkflowWarning(
+                        order_id=order_id,
+                        sku=failed_skus,
+                        stage="packing",
+                        error_type="OversizedItem",
+                        message=message,
+                        sku_breakdown=combo,
+                    )
+                )
+        except Exception as exc:
             failed_orders.append(order_id)
+            message = f"Order packing failed and was skipped: {exc}"
+            warning_rows.append(
+                WorkflowWarning(
+                    order_id=order_id,
+                    stage="packing",
+                    error_type=type(exc).__name__,
+                    message=message,
+                    sku_breakdown=combo,
+                )
+            )
+            _log_event(
+                "order_packing_failed",
+                order_id=order_id,
+                error_type=type(exc).__name__,
+                elapsed_seconds=round(time.perf_counter() - order_started, 3),
+            )
 
     if failed_orders:
         warnings.append(f"{len(failed_orders)} orders could not be packed.")
@@ -496,62 +1190,114 @@ def optimize_workbook(
         failed_orders=len(failed_orders),
     )
 
-    assignments = standardize_optimized_cartons(
-        _build_standardization_inputs(split_results, combo_by_order),
-        tolerance_cm=cfg["standardization_tolerance_cm"],
-    )
+    try:
+        assignments = standardize_optimized_cartons(
+            _build_standardization_inputs(split_results, combo_by_order),
+            tolerance_cm=cfg["standardization_tolerance_cm"],
+        )
+    except Exception as exc:
+        warning_rows.append(
+            WorkflowWarning(
+                order_id="",
+                stage="standardization",
+                error_type=type(exc).__name__,
+                message=f"Box standardization failed; using optimized capped dimensions: {exc}",
+            )
+        )
+        assignments = [
+            StandardizedBoxAssignment(
+                order_id=carton.order_id,
+                combination_key=carton.combination_key,
+                box_type=f"Box Type {index + 1}",
+                optimized_length_cm=carton.optimized_dimensions.length,
+                optimized_width_cm=carton.optimized_dimensions.width,
+                optimized_height_cm=carton.optimized_dimensions.height,
+                assigned_length_cm=carton.optimized_dimensions.length,
+                assigned_width_cm=carton.optimized_dimensions.width,
+                assigned_height_cm=carton.optimized_dimensions.height,
+                box_standardization_note="Optimized capped dimensions used after standardization warning.",
+                placements=carton.placements,
+            )
+            for index, carton in enumerate(_build_standardization_inputs(split_results, combo_by_order))
+        ]
     assignments_by_key = _assignment_lookup(assignments)
-    order_rows = []
+    box_rows = []
 
     for order_id, lines in grouped_orders.items():
         if order_id not in split_results:
             continue
         split_result = split_results[order_id]
         first_line = lines[0]
-        actual_weight_kg = _actual_weight_kg(items_by_order[order_id])
-        packed_weight_kg = packed_actual_weight_kg(actual_weight_kg)
         for index, carton in enumerate(split_result.cartons):
             assignment = assignments_by_key[f"{order_id}#{index + 1}"]
             optimized_dimensions = _carton_dimensions(split_result, index)
+            carton_box_type = carton.box_type or assignment.box_type
+            carton_note_parts = [assignment.box_standardization_note]
+            if carton.rule_applied:
+                carton_note_parts.append(f"Rule applied: {carton.rule_applied}")
+            if carton.warning:
+                carton_note_parts.append(carton.warning)
             assigned_dimensions = Dimensions(
-                assignment.assigned_length_cm,
-                assignment.assigned_width_cm,
-                assignment.assigned_height_cm,
+                optimized_dimensions.length if carton.box_type else assignment.assigned_length_cm,
+                optimized_dimensions.width if carton.box_type else assignment.assigned_width_cm,
+                optimized_dimensions.height if carton.box_type else assignment.assigned_height_cm,
             )
+            box_actual_weight_kg = sum(placement.weight_kg for placement in carton.result.placements)
+            box_packed_weight_kg = packed_actual_weight_kg(box_actual_weight_kg)
             dim_weight_kg = dimensional_weight_kg(assigned_dimensions)
-            chargeable_kg = max(packed_weight_kg, dim_weight_kg)
+            chargeable_kg = max(box_packed_weight_kg, dim_weight_kg)
+            skus_in_box = defaultdict(int)
+            for placement in carton.result.placements:
+                skus_in_box[placement.canonical_sku] += placement.quantity
             row = {
                 "Region": first_line.region or "",
                 "Order ID": order_id,
+                "Box Number": carton.box_number,
                 "Country": first_line.country or "",
                 "State/Province": first_line.state_province or "",
                 "US State Abbreviation": _state_abbreviation(first_line.country, first_line.state_province),
-                "Packed Actual Weight kg": packed_weight_kg,
+                "Actual Weight kg": box_actual_weight_kg,
+                "Packed Actual Weight kg": box_packed_weight_kg,
                 "Dimensional Weight kg (/5000)": dim_weight_kg,
                 "Chargeable Weight kg": chargeable_kg,
                 "Chargeable Weight g": chargeable_kg * 1000,
                 "Total Units": _total_units(lines),
+                "Unit Count": sum(skus_in_box.values()),
                 "Box Qty": split_result.box_qty,
-                "Box Type": assignment.box_type,
+                "Box Type": carton_box_type,
                 "Length cm": assigned_dimensions.length,
                 "Width cm": assigned_dimensions.width,
                 "Height cm": assigned_dimensions.height,
                 "Optimized Length cm": optimized_dimensions.length,
                 "Optimized Width cm": optimized_dimensions.width,
                 "Optimized Height cm": optimized_dimensions.height,
-                "Assigned Box Length cm": assignment.assigned_length_cm,
-                "Assigned Box Width cm": assignment.assigned_width_cm,
-                "Assigned Box Height cm": assignment.assigned_height_cm,
-                "Box Standardization Note": assignment.box_standardization_note,
-                "Actual Item Weight lb": actual_weight_kg * KG_TO_LB,
-                "Packed Actual Weight lb (+15%)": packed_weight_kg * KG_TO_LB,
+                "Assigned Box Length cm": assigned_dimensions.length,
+                "Assigned Box Width cm": assigned_dimensions.width,
+                "Assigned Box Height cm": assigned_dimensions.height,
+                "Box Standardization Note": " ".join(part for part in carton_note_parts if part),
+                "Actual Item Weight lb": box_actual_weight_kg * KG_TO_LB,
+                "Packed Actual Weight lb (+15%)": box_packed_weight_kg * KG_TO_LB,
                 "Bundled/Padded Volume cm³": _padded_volume_cm3(items_by_order[order_id]),
                 "Dimensional Weight lb": dim_weight_kg * KG_TO_LB,
                 "Chargeable Weight lb": chargeable_kg * KG_TO_LB,
                 "Distinct SKUs": _distinct_skus(lines),
                 "SKU Breakdown": combo_by_order[order_id],
+                "SKUs in Box": " | ".join(f"{sku} x{qty}" for sku, qty in sorted(skus_in_box.items())),
+                "Placement Summary": f"{len(carton.result.placements)} item placements",
+                "Rule Applied": carton.rule_applied,
+                "Warning": carton.warning,
             }
-            order_rows.append(_append_metadata(row, _metadata_for_order(lines)))
+            box_rows.append(_append_metadata(row, _metadata_for_order(lines)))
+
+    order_summary_rows = _order_summary_rows(
+        box_rows,
+        grouped_orders,
+        items_by_order,
+        combo_by_order,
+        warning_rows,
+    )
+    output_granularity = cfg.get("output_granularity", "order_summary")
+    order_rows = box_rows if output_granularity == "box_detail" else order_summary_rows
 
     result = {
         "output_path": str(Path(output_path)),
@@ -560,6 +1306,11 @@ def optimize_workbook(
         "box_types": len({assignment.box_type for assignment in assignments}),
         "unmatched_skus": len(intake.unmatched_skus),
         "warnings": warnings,
+        "warning_count": len(warnings) + len(warning_rows),
+        "multi_box_order_count": sum(
+            1 for split_result in split_results.values() if split_result.box_qty > 1
+        ),
+        "rules_applied_count": len(matched_rule_keys),
     }
 
     region_sheets = {}
@@ -575,12 +1326,25 @@ def optimize_workbook(
         output_path,
         summary_rows=_summary_rows(result),
         order_volume_weights_rows=order_rows,
-        box_size_summary_rows=_box_size_summary(assignments),
+        box_size_summary_rows=_box_size_summary(box_rows),
         unmatched_skus_rows=_unmatched_rows(intake.unmatched_skus),
         packing_detail_rows=_packing_detail_rows(split_results),
-        multi_box_detail_rows=_multi_box_rows(split_results),
+        multi_box_detail_rows=_multi_box_rows(box_rows),
+        pledge_combination_summary_rows=_pledge_combination_summary_rows(order_summary_rows),
         input_column_mapping_rows=intake.column_mappings,
-        errors_and_warnings_rows=[{"Warning": warning} for warning in warnings],
+        errors_and_warnings_rows=[
+            {
+                "Order ID": "",
+                "SKU": "",
+                "Stage": "workflow",
+                "Error Type": "Warning",
+                "Message": warning,
+                "Rule Applied": "",
+                "SKU Breakdown": "",
+            }
+            for warning in warnings
+        ]
+        + [_warning_row(warning) for warning in warning_rows],
         sheets=region_sheets,
     )
     _log_event(

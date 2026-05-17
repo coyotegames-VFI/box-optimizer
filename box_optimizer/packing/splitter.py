@@ -18,6 +18,10 @@ class SplitCarton:
 
     box_number: int
     result: OptimizedCartonResult
+    box_type: str | None = None
+    rule_applied: str = ""
+    warning: str = ""
+    dimensions_are_final: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,7 +87,11 @@ def _score_cartons(cartons: list[OptimizedCartonResult]) -> tuple[float, float]:
     )
 
 
-def split_order_into_cartons(items: list[PackedItem], packing_mode: str = "normal") -> SplitResult:
+def split_order_into_cartons(
+    items: list[PackedItem],
+    packing_mode: str = "normal",
+    force_simple_split: bool = False,
+) -> SplitResult:
     """Split an order into the fewest practical optimized cartons."""
     expanded_items = _sort_items(_expand_items(items))
     if not expanded_items:
@@ -94,6 +102,38 @@ def split_order_into_cartons(items: list[PackedItem], packing_mode: str = "norma
         if packing_mode == "fast"
         else optimize_carton_dimensions
     )
+
+    if force_simple_split:
+        cartons = []
+        unplaced = []
+        for index, item in enumerate(expanded_items, start=1):
+            carton = optimizer([item])
+            if carton.success:
+                cartons.append(
+                    SplitCarton(
+                        box_number=index,
+                        result=carton,
+                        box_type=item.box_type,
+                        rule_applied=item.rule_applied,
+                        warning=item.warning_note,
+                        dimensions_are_final=False,
+                    )
+                )
+            else:
+                unplaced.extend(carton.unplaced_items or [item])
+        if cartons and not unplaced:
+            return SplitResult(
+                success=True,
+                box_qty=len(cartons),
+                cartons=cartons,
+                unplaced_items=[],
+            )
+        return SplitResult(
+            success=False,
+            box_qty=0,
+            cartons=[],
+            unplaced_items=unplaced,
+        )
 
     single_box = optimizer(expanded_items)
     if single_box.success:
@@ -111,7 +151,16 @@ def split_order_into_cartons(items: list[PackedItem], packing_mode: str = "norma
         for index, item in enumerate(expanded_items, start=1):
             carton = optimize_carton_dimensions_fast([item])
             if carton.success:
-                cartons.append(SplitCarton(box_number=index, result=carton))
+                cartons.append(
+                    SplitCarton(
+                        box_number=index,
+                        result=carton,
+                        box_type=item.box_type,
+                        rule_applied=item.rule_applied,
+                        warning=item.warning_note,
+                        dimensions_are_final=False,
+                    )
+                )
             else:
                 unplaced.extend(carton.unplaced_items or [item])
         if cartons and not unplaced:
