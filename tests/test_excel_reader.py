@@ -260,6 +260,49 @@ def test_wide_format_metadata_columns_are_not_product_columns(tmp_path):
     assert lines[0].metadata["Email"] == "person@example.com"
 
 
+def test_xlsx_reader_uses_second_row_as_headers_when_first_row_is_title(tmp_path):
+    path = tmp_path / "orders.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "Orders": [
+                ["Campaign export", "", "", ""],
+                ["Backer Number", "Name", "Email", "Core Game"],
+                ["B-100", "Grace Hopper", "grace@example.com", "1"],
+            ]
+        },
+    )
+
+    lines = read_orders(str(path))
+
+    assert len(lines) == 1
+    assert lines[0].raw_sku == "Core Game"
+    assert lines[0].metadata["Backer Number"] == "B-100"
+    assert lines[0].metadata["Name"] == "Grace Hopper"
+    assert lines[0].metadata["Email"] == "grace@example.com"
+
+
+def test_xlsx_reader_merges_row_one_product_headers_with_row_two_metadata_headers(tmp_path):
+    path = tmp_path / "orders.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "Orders": [
+                ["", "", "Core Game"],
+                ["Backer Number", "Email", ""],
+                ["B-100", "grace@example.com", "1"],
+            ]
+        },
+    )
+
+    lines = read_orders(str(path))
+
+    assert len(lines) == 1
+    assert lines[0].raw_sku == "Core Game"
+    assert lines[0].metadata["Backer Number"] == "B-100"
+    assert lines[0].metadata["Email"] == "grace@example.com"
+
+
 def test_wide_format_product_header_matches_sku_master_product_name(tmp_path):
     sku_path = tmp_path / "sku_master.csv"
     order_path = tmp_path / "orders.csv"

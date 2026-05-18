@@ -88,8 +88,8 @@ def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
         "Summary",
         "Order Volume Weights",
         "Box Size Summary",
-        "Packing Detail",
         "Multi Box Detail",
+        "Packing Detail",
         "Input Column Mapping",
         "Errors and Warnings",
     ]
@@ -115,7 +115,7 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
     rows = read_workbook(str(path))[1].rows
     headers = list(rows[0].keys())
 
-    assert headers[:29] == [
+    assert headers[:20] == [
         "Region",
         "Order ID",
         "Country",
@@ -128,26 +128,16 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
         "Total Units",
         "Box Qty",
         "Box Type",
-        "Length cm",
-        "Width cm",
-        "Height cm",
-        "Optimized Length cm",
-        "Optimized Width cm",
-        "Optimized Height cm",
         "Assigned Box Length cm",
         "Assigned Box Width cm",
         "Assigned Box Height cm",
         "Box Standardization Note",
-        "Actual Item Weight lb",
-        "Packed Actual Weight lb (+15%)",
-        "Bundled/Padded Volume cm³",
-        "Dimensional Weight lb",
-        "Chargeable Weight lb",
         "Distinct SKUs",
         "SKU Breakdown",
+        "Box Plan",
+        "Warning Summary",
     ]
-    assert headers[29:31] == ["Box Plan", "Warning Summary"]
-    assert headers[31:] == ["Pledge Level", "Shipping Notes"]
+    assert headers[20:] == ["Pledge Level", "Shipping Notes"]
     assert rows[0]["Pledge Level"] == "Deluxe"
     assert rows[0]["Shipping Notes"] == "Leave at door"
 

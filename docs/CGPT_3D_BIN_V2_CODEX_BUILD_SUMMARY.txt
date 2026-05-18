@@ -1,0 +1,494 @@
+CGPT 3D BIN V2 / box_optimizer Codex Build Summary
+Generated: 2026-05-18
+
+Purpose
+-------
+This document summarizes what has been built and tested in the local Codex
+box_optimizer implementation so the custom GPT named CGPT 3D BIN V2 can be
+checked against the actual code behavior.
+
+Active local repo used by Codex
+-------------------------------
+C:\Users\coyot\Documents\Codex\2026-05-15\in-codex-start-a-new-repo
+
+Do not compare against the older OneDrive copy unless explicitly requested.
+
+Current architecture
+--------------------
+CGPT 3D BIN V2 is expected to call a Railway-hosted FastAPI API.
+
+The implemented stack is:
+
+CGPT 3D BIN V2
+-> Railway FastAPI API
+-> Python box_optimizer package
+-> XLSX workbook output
+
+Public Python workflow
+----------------------
+The public workflow function is:
+
+optimize_workbook(sku_master_path, orders_path, output_path, config=None)
+
+This parses SKU/order files, applies matching and rules, packs orders into one
+or more capped cartons, standardizes box sizes, writes the output workbook, and
+returns a summary dict.
+
+API endpoints implemented
+-------------------------
+GET /health
+- Public health check.
+- Returns {"status": "ok"}.
+
+GET /version
+- Public version/build metadata endpoint.
+- Returns app name, version, timestamp, and git commit when provided by env.
+
+GET /openapi.json
+- Public OpenAPI schema.
+
+POST /inspect
+- Requires API key if BOX_OPTIMIZER_API_KEY is set.
+- Multipart fields:
+  - sku_master_file
+  - orders_file
+  - optional config_json
+- Parses and matches only.
+- Does not run packing.
+- Does not write an XLSX workbook.
+- Reports counts, detected sheets/columns, matched/unmatched rule keys, warnings,
+  and elapsed seconds.
+- Honors max_orders.
+
+POST /optimize
+- Requires API key if BOX_OPTIMIZER_API_KEY is set.
+- Multipart fields:
+  - sku_master_file
+  - orders_file
+  - optional config_json
+- Returns an XLSX workbook unless the whole request is invalid.
+- Individual order packing failures are written as warnings; the API still
+  returns a workbook for successfully processed orders.
+
+API authentication
+------------------
+If BOX_OPTIMIZER_API_KEY is set, /inspect and /optimize require one of:
+
+Authorization: Bearer <key>
+X-API-Key: <key>
+
+Secrets should not be pasted into project instructions or saved docs.
+
+config_json fields currently accepted by API validation
+-------------------------------------------------------
+debug
+- Boolean.
+- Enables more verbose logging behavior.
+
+max_orders
+- Positive integer or null.
+- Limits the number of distinct order IDs processed or inspected.
+
+packing_mode
+- "normal" or "fast".
+- "fast" avoids expensive carton search by trying capped all-in-one packing
+  first, then deterministic greedy fewest-box grouping.
+
+output_granularity
+- "order_summary" or "box_detail".
+- Default is "order_summary".
+- "order_summary" makes Order Volume Weights one row per order.
+- "box_detail" repeats Order Volume Weights one row per box/carton for debug.
+
+sku_rules
+- Object keyed by SKU/product/header rule name.
+- Keys are matched using SKU, product name, aliases, normalized SKU text, and
+  punctuation-insensitive normalized keys.
+
+box_menu
+- Accepted as a JSON array by the API.
+- Currently accepted for forward compatibility; full custom box menu behavior is
+  not the primary implemented path.
+
+order_rules
+- Accepted as a JSON array.
+- Implemented support includes trigger SKU order rules that split trigger SKUs
+  from add-ons when configured.
+
+Core hard carton rule
+---------------------
+The hard maximum carton cap remains:
+
+74 x 37 x 44 cm
+
+Displayed and assigned carton dimensions must not exceed this cap.
+
+Dimension normalization
+-----------------------
+- Dimensions normalize to centimeters.
+- Dimensions are sorted as L >= W >= H.
+- Flat/two-dimension items are given 1 cm thickness.
+- Combined dimension columns are supported, including names such as:
+  - Dimensions
+  - Size
+  - Dims
+  - LxWxH
+
+Weight normalization and output
+-------------------------------
+- Supported input weight units include kg, g, lb, and oz.
+- Dimensional weight uses divisor 5000.
+- Packed actual weight applies the default 15% uplift internally.
+- Chargeable weight is max(packed actual weight, dimensional weight).
+- Displayed kg/lb weights truncate to one decimal.
+- Chargeable Weight g is integer grams.
+
+Current padding rules
+---------------------
+Padding is applied after dimension normalization and before item packing unless
+a rule skips normal item padding.
+
+Per-item padding:
+
+Small:
+- Condition: L <= 7, W <= 7, H <= 3
+- Add: +2 / +2 / +2 cm
+
+Medium:
+- Condition: larger than small, but L <= 22, W <= 22, H <= 5
+- Add: +3 / +2 / +2 cm
+
+Large:
+- Condition: anything larger
+- Add: +3 / +3 / +2 cm
+
+Final exterior carton padding:
+- Add +2 / +2 / +2 cm after items have been packed together into a carton.
+- Final displayed dimensions round up to whole centimeters and remain capped.
+
+Prepacked final-carton behavior
+-------------------------------
+prepacked=true means the SKU dimensions are already packed.
+
+Rules:
+- prepacked skips normal per-item padding.
+- A carton containing only prepacked SKU placements is treated as already being
+  the final shipping carton.
+- A prepacked-only final carton does not receive final exterior carton padding.
+- If a prepacked SKU is packed inside a larger carton with add-ons or any
+  non-prepacked item, the combined carton does receive final exterior padding.
+- prepacked does not automatically mean ships_alone.
+
+SKU rule behavior
+-----------------
+Supported SKU rule fields include:
+
+no_padding
+- Skips normal per-item padding.
+- The final exterior carton padding still applies unless the carton is final
+  because it is prepacked-only or forced final.
+
+prepacked
+- Treats SKU dimensions as already packed.
+- Skips normal per-item padding.
+- Does not automatically force separation.
+- Does not receive final exterior padding when shipped alone as the final
+  shipping carton.
+
+ships_alone
+- Forces the SKU/order line into a separate carton group.
+
+can_mix_with_other_items
+- Defaults to true.
+- false forces the SKU/order line into a separate carton group.
+
+forced_box_cm
+- Applies assigned box dimensions when the SKU/order group is separated and
+  forced into that box.
+- forced_box_cm must still respect the 74 x 37 x 44 cm carton cap.
+- forced_box_cm is treated as final dimensions when it is actually used as a
+  separated forced box.
+- forced_box_cm does not automatically mean ships_alone.
+- A forced/prepacked SKU can still mix with add-ons if not otherwise separated
+  and if the combined items fit.
+
+must_stay_flat
+- Restricts rotations so the item keeps its normalized flat height.
+
+allow_rotation
+- Defaults to true.
+- false restricts the item to its padded/prepacked orientation.
+
+allowed_orientations
+- Explicit list of allowed orientations.
+
+extra_padding_cm
+- Added after the normal/no-padding/prepacked padding decision.
+
+exclude_from_standardization
+- Available on packed item records for standardization behavior.
+
+box_type
+- Can label a rule-applied carton.
+
+warning_note
+- Can add warning text to rule-applied carton rows.
+
+Mixing and splitting behavior
+-----------------------------
+prepacked and forced_box_cm do not automatically mean ships_alone.
+
+A prepacked or forced-box SKU can mix with add-ons if:
+- ships_alone is not true,
+- can_mix_with_other_items is not false,
+- no order_rule requires separation,
+- and the combined items fit safely inside the max carton cap.
+
+Ship separately only when:
+- ships_alone=true,
+- can_mix_with_other_items=false,
+- an order_rule requires separation,
+- or physical fit fails.
+
+If all items fit into one capped carton, fast mode should keep them together.
+Small add-ons should not be split into separate boxes unless a rule forces it or
+physical fit fails.
+
+Packing engine behavior
+-----------------------
+- Uses deterministic heuristic 3D packing.
+- Expands quantities into individual placements.
+- Supports rotations subject to SKU rules.
+- Checks carton boundaries.
+- Checks for no overlaps.
+- Produces placement coordinates.
+- Sorts larger/heavier items first.
+- Is not volume-only; geometry can fail even when total volume seems sufficient.
+- Optimized carton dimensions are capped at 74 x 37 x 44 cm.
+- If one capped carton cannot hold the order, splitter creates multiple cartons.
+
+Fast packing mode
+-----------------
+packing_mode="fast" behavior:
+- Try all items in one capped 74 x 37 x 44 cm carton first.
+- If that fails, greedily group into as few capped cartons as practical.
+- Avoids the expensive combinatorial search used in normal mode.
+- Intended for real workbook debugging and API responsiveness.
+
+Output workbook tabs
+--------------------
+Required tabs, first and in exact order:
+1. Summary
+2. Order Volume Weights
+3. Box Size Summary
+
+Optional tabs when data exists:
+- Unmatched SKUs
+- Multi Box Detail
+- Pledge Combination Summary
+- Packing Detail
+- Input Column Mapping
+- Errors and Warnings
+- Region-specific sheets when preserve_region_sheets is true
+
+Order Volume Weights
+--------------------
+Default behavior:
+- One row per order.
+- Generated packing/weight/carton columns appear first.
+- Real backer/customer/order metadata is preserved at the end.
+- _source_file and _source_sheet do not appear in default Order Volume Weights.
+- For multi-box orders, Box Standardization Note tells the user to see Multi Box
+  Detail.
+- Box Plan summarizes per-box dimensions.
+
+When output_granularity="box_detail":
+- Order Volume Weights repeats one row per order-box/carton for debug/audit.
+
+Multi Box Detail
+----------------
+- One row per order-box/carton.
+- Includes Order Box ID, Box Number, Box Qty, box type, dimensions, weights,
+  SKUs in Box, placement summary, rule applied, and warning.
+- This is the main tab for carton-level review.
+
+Packing Detail
+--------------
+- Debug/audit tab.
+- One row per placement.
+- Uses clear coordinate columns:
+  - Placement X cm
+  - Placement Y cm
+  - Placement Z cm
+- Also includes placed item dimensions.
+
+Pledge Combination Summary
+--------------------------
+- Groups identical SKU breakdowns.
+- Multi-box pledge combinations expand into one row per box pattern/box number.
+- Includes order count, total units, box number, box qty, order box pattern,
+  box type, dimensions, average displayed weights, box count, and regions used.
+
+Box Size Summary
+----------------
+- Summarizes campaign box types and usage.
+- Includes box count and order count.
+
+Excel writing behavior
+----------------------
+- XLSX writer is lightweight and writes the required report workbook directly.
+- Headers are frozen.
+- Auto-filters are applied.
+- Column widths are set.
+- Units are added to headers where appropriate.
+- Required Order Volume Weights columns appear before metadata columns.
+
+Intake and parsing behavior
+---------------------------
+- CSV and XLSX are supported for SKU master and order files.
+- XLSX reader processes useful sheets.
+- The reader is lightweight and not a full Excel engine.
+- SKU master column inference is implemented.
+- Order column inference is implemented.
+- Wide-format order parsing is implemented where product/SKU names are column
+  headers and cells are quantities.
+- Wide-format metadata columns are detected and preserved rather than treated as
+  product quantity columns.
+- When no explicit order/backer ID exists, wide-format order IDs may be
+  generated from sheet name and row number.
+
+SKU matching behavior
+---------------------
+- Matches by SKU, canonical SKU, product name, aliases, and normalized variants.
+- Punctuation-insensitive rule keys are supported.
+- Stable exact SKU combination keys include quantities and sorted SKUs.
+- /inspect reports matched_rule_keys and unmatched_rule_keys for sku_rules.
+
+Failure and warning behavior
+----------------------------
+- /optimize returns a workbook unless the entire request is invalid.
+- Unmatched SKU rows are preserved in Unmatched SKUs.
+- Orders with oversized items or packing failures are warned and skipped rather
+  than crashing the whole request.
+- If final exterior padding would exceed the carton cap, reported carton
+  dimensions are capped and a warning is included.
+- Unsupported override config values currently generate workflow warnings:
+  - custom max_carton_cm
+  - custom dimensional_divisor
+  - custom packing_weight_uplift
+
+Current test coverage
+---------------------
+Latest full suite run:
+
+134 passed, 1 warning
+
+The warning is a local Windows/Codex pytest cache permission warning and does
+not indicate an app failure.
+
+Major covered areas:
+- API health/version/openapi.
+- API auth with X-API-Key and Authorization Bearer.
+- /inspect counts, max_orders, and rule-key reporting.
+- /optimize config validation and XLSX response behavior.
+- /optimize still returns workbook when one order fails packing.
+- Dimension normalization, including inches to cm and flat items.
+- Weight normalization for kg/g/lb/oz.
+- Dimensional, packed actual, and chargeable weight math.
+- Per-item padding tiers and final exterior carton padding.
+- no_padding behavior.
+- prepacked standalone final-carton behavior.
+- prepacked mixed-with-addons behavior.
+- forced_box_cm behavior and validation warnings.
+- ships_alone and can_mix_with_other_items splitting.
+- Rotations, geometry, overlap checks, boundaries.
+- Packer placement behavior and optimized carton dimensions.
+- Fast mode split behavior.
+- Multi-box splitting.
+- Standardization and upward-only shared box assignment.
+- Excel reader behavior for CSV/XLSX and wide-format orders.
+- Excel writer required/optional sheets, headers, filters, and metadata ordering.
+- Workflow output rows, clean default Order Volume Weights, Multi Box Detail,
+  Packing Detail, Pledge Combination Summary, and Box Size Summary.
+- Real example files parse nonzero SKUs and order lines.
+- Asia-like fast-mode fixture does not split small items into many separate
+  boxes when they physically fit.
+
+Latest limited real-file validation
+-----------------------------------
+Using local real files:
+- sku_master.xlsx
+- orders.xlsx
+
+Config used:
+{
+  "debug": true,
+  "max_orders": 5,
+  "packing_mode": "fast",
+  "output_granularity": "order_summary",
+  "preserve_region_sheets": false
+}
+
+Observed result:
+- orders_processed: 5
+- boxes_created: 5
+- unmatched_skus: 0
+- multi_box_order_count: 0
+- Order Volume Weights: 5 rows
+- Multi Box Detail: 5 rows
+- No small add-ons split separately in that run
+- Carton dimensions displayed as whole cm with no decimals
+- One warning occurred where final exterior padding would exceed the carton cap;
+  reported dimensions were capped at 74 x 37 x 44 cm.
+
+Known gaps / caveats
+--------------------
+- The XLSX reader is lightweight and supports tested workbook shapes, but it is
+  not a complete Excel engine.
+- Some real campaign SKU/header names may still need alias improvements when
+  they differ substantially from SKU master names, such as free-gift prefixes,
+  language variants, or renamed token pack columns.
+- Region/country/state metadata may need campaign-specific inference when the
+  workbook only encodes geography in sheet names.
+- Custom max_carton_cm, dimensional_divisor, and packing_weight_uplift are
+  accepted but not fully applied throughout the algorithms; workflow warnings
+  are emitted when custom values are supplied.
+- box_menu is accepted by API validation, but full custom box-menu operation is
+  not the main implemented workflow.
+- Git was not available in the local shell session during recent Codex work, so
+  git status was not checked from this environment.
+
+CGPT 3D BIN V2 alignment checklist
+----------------------------------
+The custom GPT should match these behaviors:
+
+- Use /inspect for parse/match/debug before full /optimize on uncertain files.
+- Use max_orders for limited validation runs.
+- Use packing_mode="fast" for real workbook debugging and API responsiveness.
+- Expect /optimize to return XLSX when at least some orders can be processed.
+- Treat 74 x 37 x 44 cm as the hard carton cap.
+- Normalize dimensions to cm and L >= W >= H.
+- Treat flat/two-dimension items as 1 cm thick.
+- Apply current per-item padding tiers exactly:
+  - small +2/+2/+2
+  - medium +3/+2/+2
+  - large +3/+3/+2
+- Apply final exterior carton padding +2/+2/+2 after packing.
+- Do not add final exterior padding to a prepacked-only final shipping carton.
+- Do add final exterior padding when a prepacked SKU is combined in a larger
+  carton with add-ons or non-prepacked items.
+- Do not assume prepacked or forced_box_cm means ships_alone.
+- Split only when rules force separation or physical fit fails.
+- Use default Order Volume Weights as one row per order.
+- Use Multi Box Detail for one row per carton.
+- Use Packing Detail only for debug/audit placement review.
+- Expect displayed carton dimensions as whole cm and capped.
+- Expect displayed kg/lb weights truncated to one decimal.
+- Expect Chargeable Weight g as integer grams.
+- Preserve real customer/backer/order metadata at the end of Order Volume
+  Weights.
+- Do not expose internal _source_file or _source_sheet in default Order Volume
+  Weights.
+- Use matched_rule_keys and unmatched_rule_keys from /inspect to verify rule
+  coverage.
+

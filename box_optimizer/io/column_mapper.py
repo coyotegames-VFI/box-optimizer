@@ -76,31 +76,83 @@ METADATA_COLUMN_ALIASES = {
     "name",
     "firstname",
     "lastname",
+    "fullname",
     "email",
     "phone",
     "company",
     "address",
     "address1",
     "address2",
+    "addressline1",
+    "addressline2",
     "city",
     "state",
     "province",
+    "stateprovince",
     "country",
     "postal",
+    "postalcode",
     "zipcode",
     "zip",
+    "shippingservice",
     "shippingmethod",
+    "shipservice",
+    "shipmethod",
+    "shipmentmethod",
+    "shippingaddress",
+    "shippingaddress1",
+    "shippingaddress2",
+    "shipaddress",
+    "shipaddress1",
+    "shipaddress2",
+    "addresstype",
+    "shippingaddresstype",
     "region",
     "notes",
+    "note",
+    "comments",
+    "comment",
     "pledge",
+    "pledgename",
+    "pledgelevel",
     "reward",
+    "addons",
+    "add ons",
     "status",
+    "fulfillmentstatus",
+    "fulfilmentstatus",
+    "tracking",
+    "trackingnumber",
     "total",
     "amount",
     "currency",
     "date",
     "created",
     "updated",
+}
+
+_METADATA_WORD_HINTS = {
+    "address",
+    "backer",
+    "billing",
+    "city",
+    "country",
+    "customer",
+    "email",
+    "fulfillment",
+    "fulfilment",
+    "name",
+    "order",
+    "phone",
+    "postal",
+    "province",
+    "ship",
+    "shipping",
+    "state",
+    "status",
+    "street",
+    "tracking",
+    "zip",
 }
 
 
@@ -159,4 +211,11 @@ def infer_dimension_unit(header: str | None, default: str = "cm") -> str:
 def is_metadata_column(header: str) -> bool:
     """Return whether a header is likely order/customer metadata."""
     normalized = normalize_column_name(header)
-    return normalized in METADATA_COLUMN_ALIASES
+    if normalized in METADATA_COLUMN_ALIASES:
+        return True
+    words = {
+        normalize_column_name(word)
+        for word in re.split(r"[^A-Za-z0-9]+", str(header or ""))
+        if word
+    }
+    return bool(words & _METADATA_WORD_HINTS)

@@ -200,6 +200,35 @@ def _xlsx_cell_value(cell, shared_strings: list[str]) -> str:
     return value
 
 
+def _header_score(values: list[object]) -> int:
+    headers = [str(value).strip() for value in values]
+    nonblank = [header for header in headers if header]
+    mapping = infer_columns(headers)
+    metadata_count = sum(1 for header in headers if is_metadata_column(header))
+    return len(mapping) * 4 + metadata_count * 3 + min(len(nonblank), 3)
+
+
+def _headers_and_data_start(table: list[list[object]]) -> tuple[list[str], int]:
+    first_headers = [str(value).strip() for value in table[0]]
+    first_score = _header_score(table[0])
+    if len(table) < 2:
+        return first_headers, 1
+
+    second_headers = [str(value).strip() for value in table[1]]
+    second_score = _header_score(table[1])
+    second_mapping = infer_columns(second_headers)
+    second_has_header_signal = (
+        any(is_metadata_column(header) for header in second_headers)
+        or bool({"sku", "order_id"} & set(second_mapping))
+    )
+    if second_has_header_signal and second_score >= 4 and second_score > first_score:
+        return [
+            second if second else first
+            for first, second in zip(first_headers, second_headers, strict=True)
+        ], 2
+    return first_headers, 1
+
+
 def _read_xlsx(path: str) -> list[SourceRows]:
     source_rows = []
     with zipfile.ZipFile(path) as archive:
@@ -223,10 +252,10 @@ def _read_xlsx(path: str) -> list[SourceRows]:
                 [row.get(index, "") for index in range(max_index + 1)]
                 for row in raw_rows
             ]
-            headers = [str(value).strip() for value in table[0]]
+            headers, data_start = _headers_and_data_start(table)
             rows = [
                 {headers[index]: value for index, value in enumerate(values) if headers[index]}
-                for values in table[1:]
+                for values in table[data_start:]
                 if any(str(value).strip() for value in values)
             ]
             if rows:
