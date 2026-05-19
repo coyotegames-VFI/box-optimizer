@@ -43,12 +43,13 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[:3] == [
+    assert sheet_names[:4] == [
         "Summary",
         "Order Volume Weights",
+        "Optimized to Pack",
         "Box Size Summary",
     ]
-    assert sheet_names[3:] == ["Unmatched SKUs"]
+    assert sheet_names[4:] == ["Unmatched SKUs"]
 
 
 def test_write_workbook_freezes_headers_applies_filters_and_widths(tmp_path):
@@ -87,6 +88,7 @@ def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
     assert _workbook_sheet_names(path) == [
         "Summary",
         "Order Volume Weights",
+        "Optimized to Pack",
         "Box Size Summary",
         "Multi Box Detail",
         "Packing Detail",
@@ -115,7 +117,7 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
     rows = read_workbook(str(path))[1].rows
     headers = list(rows[0].keys())
 
-    assert headers[:20] == [
+    assert headers[:15] == [
         "Region",
         "Order ID",
         "Country",
@@ -128,16 +130,11 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
         "Total Units",
         "Box Qty",
         "Box Type",
-        "Assigned Box Length cm",
-        "Assigned Box Width cm",
-        "Assigned Box Height cm",
-        "Box Standardization Note",
-        "Distinct SKUs",
-        "SKU Breakdown",
         "Box Plan",
-        "Warning Summary",
+        "Per-Box Chargeable Weight",
+        "SKU Breakdown",
     ]
-    assert headers[20:] == ["Pledge Level", "Shipping Notes"]
+    assert headers[15:] == ["Pledge Level", "Shipping Notes"]
     assert rows[0]["Pledge Level"] == "Deluxe"
     assert rows[0]["Shipping Notes"] == "Leave at door"
 

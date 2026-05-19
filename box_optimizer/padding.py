@@ -22,12 +22,17 @@ def add_padding(dimensions: Dimensions) -> Dimensions:
         and normalized.height <= 5
     )
 
-    tier_padding = 2 if is_small or is_medium else 3
+    if is_small:
+        padding = Dimensions(length=2, width=2, height=2)
+    elif is_medium:
+        padding = Dimensions(length=3, width=2, height=2)
+    else:
+        padding = Dimensions(length=3, width=3, height=2)
 
     return Dimensions(
-        length=normalized.length + tier_padding,
-        width=normalized.width + tier_padding,
-        height=normalized.height + tier_padding,
+        length=normalized.length + padding.length,
+        width=normalized.width + padding.width,
+        height=normalized.height + padding.height,
     )
 
 
@@ -35,7 +40,7 @@ def add_final_exterior_padding(dimensions: Dimensions) -> Dimensions:
     """Add final exterior box padding after all items have been packed together."""
     normalized = _sorted_dimensions(dimensions)
     return Dimensions(
-        length=normalized.length + 1,
-        width=normalized.width + 1,
-        height=normalized.height + 1,
+        length=normalized.length + 2,
+        width=normalized.width + 2,
+        height=normalized.height + 2,
     )

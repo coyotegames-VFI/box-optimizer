@@ -4,6 +4,9 @@ from pathlib import Path
 
 from box_optimizer import optimize_workbook
 from box_optimizer.io.excel_reader import read_workbook
+from box_optimizer.models import Dimensions
+from box_optimizer.packing.packer import OptimizedCartonResult, Placement
+from box_optimizer.packing.splitter import SplitCarton, SplitResult
 from box_optimizer.weights import packed_actual_weight_kg
 from box_optimizer.workflow import format_kg_display, inspect_workbook
 
@@ -162,9 +165,10 @@ def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path
     assert output_path.exists()
 
     workbook_rows = read_workbook(str(output_path))
-    assert [sheet.sheet_name for sheet in workbook_rows[:3]] == [
+    assert [sheet.sheet_name for sheet in workbook_rows[:4]] == [
         "Summary",
         "Order Volume Weights",
+        "Optimized to Pack",
         "Box Size Summary",
     ]
     order_volume_rows = workbook_rows[1].rows
@@ -381,11 +385,11 @@ def test_optimized_carton_dimensions_remain_capped_but_vendor_assignment_can_exc
     )
 
     workbook_rows = read_workbook(str(output_path))
-    order_volume_rows = next(
-        sheet.rows for sheet in workbook_rows if sheet.sheet_name == "Order Volume Weights"
+    multi_box_rows = next(
+        sheet.rows for sheet in workbook_rows if sheet.sheet_name == "Multi Box Detail"
     )
-    for row in order_volume_rows:
-        assert float(row["Assigned Box Length cm"]) >= 74
+    for row in multi_box_rows:
+        assert float(row["Length cm"]) >= 74
         assert row["Vendor Box ID"]
     warning_rows = next(
         sheet.rows for sheet in workbook_rows if sheet.sheet_name == "Errors and Warnings"
@@ -520,10 +524,11 @@ def test_forced_box_cm_sets_assigned_box_dimensions(tmp_path):
     )
 
     row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    detail_row = _sheet_rows(output_path, "Multi Box Detail")[0]
     assert row["Box Type"] == "PREPACK-CORE-BOX"
-    assert float(row["Assigned Box Length cm"]) == 31
-    assert float(row["Assigned Box Width cm"]) == 22
-    assert float(row["Assigned Box Height cm"]) == 8
+    assert float(detail_row["Length cm"]) == 31
+    assert float(detail_row["Width cm"]) == 22
+    assert float(detail_row["Height cm"]) == 8
 
 
 def test_ships_alone_sku_is_separated_from_addons(tmp_path):
@@ -689,9 +694,100 @@ def test_default_order_summary_has_one_order_row_and_box_detail_rows(tmp_path):
     for row in order_rows:
         matching_detail = [detail for detail in multi_rows if detail["Order ID"] == row["Order ID"]]
         assert int(float(row["Box Qty"])) == len(matching_detail)
-        assert row["Box Type"] == "MULTI-BOX"
-        assert row["Box Standardization Note"] == "Multi-box order; see Multi Box Detail"
+        assert row["Box Type"] == " | ".join(sorted({detail["Box Type"] for detail in matching_detail}))
+        assert "MULTI-BOX" not in row["Box Type"]
+        assert "Box Standardization Note" not in row
         assert "Box 1:" in row["Box Plan"]
+
+
+def test_workbook_presentation_tabs_and_compact_columns(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "All-in Storage Solution [72570]", "Product Name": "All-in Storage Solution [72570]", "Length": "20", "Width": "10", "Height": "5", "Weight kg": "1"},
+            {"SKU": "Core", "Product Name": "Core", "Length": "10", "Width": "8", "Height": "3", "Weight kg": "0.5"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "All-in Storage Solution [72570]", "Quantity": "1", "Country": "USA", "State": "Armed Forces AE", "Name": "Alice"},
+            {"Order ID": "1", "SKU": "Core", "Quantity": "1", "Country": "USA", "State": "Armed Forces AE", "Name": "Alice"},
+            {"Order ID": "2", "SKU": "Core", "Quantity": "1", "Country": "Republic of Korea", "State": "", "Name": "Bob"},
+            {"Order ID": "2", "SKU": "All-in Storage Solution [72570]", "Quantity": "1", "Country": "Republic of Korea", "State": "", "Name": "Bob"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "preserve_region_sheets": False,
+            "sku_rules": {
+                "All-in Storage Solution [72570]": {
+                    "prepacked": True,
+                    "no_padding": True,
+                    "ships_alone": True,
+                    "can_mix_with_other_items": False,
+                    "box_type": "All-in Storage Solution carton",
+                }
+            },
+        },
+    )
+
+    workbook = read_workbook(str(output_path))
+    assert [sheet.sheet_name for sheet in workbook[:4]] == [
+        "Summary",
+        "Order Volume Weights",
+        "Optimized to Pack",
+        "Box Size Summary",
+    ]
+
+    summary_rows = _sheet_rows(output_path, "Summary")
+    assert any(row["Section"] == "Boxes Needed" and row["Metric"].startswith("VB ") for row in summary_rows)
+    assert any(row["Section"] == "Rules Applied Summary" and "ship-alone" in row["Value"] for row in summary_rows)
+    assert any(row["Section"] == "Unique Warning Summary" for row in summary_rows)
+
+    order_rows = {row["Order ID"]: row for row in _sheet_rows(output_path, "Order Volume Weights")}
+    headers = list(next(iter(order_rows.values())))
+    assert order_rows["1"]["Country"] == "United States"
+    assert order_rows["1"]["US State Abbreviation"] == "AE"
+    assert order_rows["2"]["Country"] == "South Korea"
+    assert order_rows["1"]["Box Type"].startswith("All-in Storage Solution carton | VB ")
+    assert "Box Plan" in headers
+    assert headers.index("Box Plan") == headers.index("Box Type") + 1
+    assert headers.index("Per-Box Chargeable Weight") == headers.index("Box Plan") + 1
+    assert "All-in Storage Solution carton:" in order_rows["1"]["Per-Box Chargeable Weight"]
+    assert "VB " in order_rows["1"]["Per-Box Chargeable Weight"]
+    for removed in [
+        "Assigned Box Length cm",
+        "Assigned Box Width cm",
+        "Assigned Box Height cm",
+        "Box Standardization Note",
+        "Distinct SKUs",
+        "Warning Summary",
+        "Vendor Box ID",
+    ]:
+        assert removed not in headers
+    assert headers.index("Name") > headers.index("SKU Breakdown")
+
+    box_size_rows = _sheet_rows(output_path, "Box Size Summary")
+    assert all(not row["Box Type"].startswith("Vendor Box") for row in box_size_rows)
+    assert any(row["Box Type"].startswith("VB ") for row in box_size_rows)
+    assert "Main SKU Combos" not in box_size_rows[0]
+
+    optimized_rows = _sheet_rows(output_path, "Optimized to Pack")
+    assert optimized_rows[0]["Pledge Configuration"] == "1"
+    assert int(float(optimized_rows[0]["Total Pledges"])) == 2
+    assert "ALL-IN STORAGE SOLUTION [72570] x1" in optimized_rows[0]["All Items"]
+    assert "All-in Storage Solution carton:" in optimized_rows[0]["Box 1"]
+    assert "VB " in optimized_rows[0]["Box 2"]
+    assert "CORE x1" in optimized_rows[0]["Box 2"]
 
 
 def test_box_size_summary_includes_usage_counts(tmp_path):
@@ -825,11 +921,11 @@ def test_display_carton_dimensions_are_whole_centimeters_rounded_up(tmp_path):
         },
     )
 
-    rows = _sheet_rows(output_path, "Order Volume Weights")
+    rows = _sheet_rows(output_path, "Multi Box Detail")
     by_order = {row["Order ID"]: row for row in rows}
-    assert float(by_order["1"]["Assigned Box Length cm"]) == 35
-    assert float(by_order["2"]["Assigned Box Length cm"]) == 36
-    for sheet_name in ["Order Volume Weights", "Multi Box Detail", "Box Size Summary", "Pledge Combination Summary"]:
+    assert float(by_order["1"]["Length cm"]) == 35
+    assert float(by_order["2"]["Length cm"]) == 36
+    for sheet_name in ["Multi Box Detail", "Box Size Summary", "Pledge Combination Summary"]:
         for row in _sheet_rows(output_path, sheet_name):
             for column in [key for key in row if key.endswith("Length cm") or key.endswith("Width cm") or key.endswith("Height cm")]:
                 assert float(row[column]).is_integer()
@@ -902,7 +998,7 @@ def test_order_metadata_columns_survive_at_end_of_order_volume_weights(tmp_path)
     assert row["Address 1"] == "1 Algorithm Ave"
     assert row["Shipping Method"] == "Courier"
     assert row["Notes"] == "Leave with desk"
-    assert headers.index("Backer Number") > headers.index("Warning Summary")
+    assert headers.index("Backer Number") > headers.index("SKU Breakdown")
 
 
 def test_clean_default_order_volume_weights_hides_audit_columns(tmp_path):
@@ -937,7 +1033,11 @@ def test_clean_default_order_volume_weights_hides_audit_columns(tmp_path):
         "Optimized Height cm",
     ]:
         assert hidden_column not in row
-    assert "Assigned Box Length cm" in row
+    assert "Assigned Box Length cm" not in row
+    assert "Box Standardization Note" not in row
+    assert "Distinct SKUs" not in row
+    assert "Warning Summary" not in row
+    assert "Vendor Box ID" not in row
     assert "Packed Actual Weight kg" in row
     assert "Chargeable Weight g" in row
 
@@ -995,7 +1095,7 @@ def test_wide_format_metadata_columns_detected_and_preserved(tmp_path):
     assert row["Address Type"] == "Residential"
     assert row["Customer ID"] == "42"
     assert row["Address Line 1"] == "1 Compiler Way"
-    assert list(row).index("Backer Number") > list(row).index("Warning Summary")
+    assert list(row).index("Backer Number") > list(row).index("SKU Breakdown")
 
 
 def test_second_row_xlsx_headers_preserve_metadata_in_order_volume_weights(tmp_path):
@@ -1034,7 +1134,7 @@ def test_second_row_xlsx_headers_preserve_metadata_in_order_volume_weights(tmp_p
     assert row["Name"] == "Ada Lovelace"
     assert row["Email"] == "ada@example.com"
     assert row["Address Type"] == "Residential"
-    assert headers.index("Backer Number") > headers.index("Warning Summary")
+    assert headers.index("Backer Number") > headers.index("SKU Breakdown")
 
 
 def test_packing_detail_uses_clear_coordinate_columns(tmp_path):
@@ -1211,6 +1311,186 @@ def test_pledge_combination_summary_expands_multi_box_patterns(tmp_path):
     assert all(int(float(row["Order Count"])) == 2 for row in rows)
     assert all(float(row["Length cm"]).is_integer() for row in rows)
     assert all("Chargeable Weight kg" in row for row in rows)
+
+
+def test_identical_sku_combinations_reuse_packing_plan_and_preserve_metadata(tmp_path, monkeypatch):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Core", "Product Name": "Core", "Length": "10", "Width": "8", "Height": "4", "Weight kg": "1"},
+            {"SKU": "Addon", "Product Name": "Addon", "Length": "6", "Width": "4", "Height": "2", "Weight kg": "0.2"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1001", "SKU": "Core", "Quantity": "1", "Name": "Alice", "Email": "alice@example.com"},
+            {"Order ID": "1001", "SKU": "Addon", "Quantity": "1", "Name": "Alice", "Email": "alice@example.com"},
+            {"Order ID": "1002", "SKU": "Addon", "Quantity": "1", "Name": "Bob", "Email": "bob@example.com"},
+            {"Order ID": "1002", "SKU": "Core", "Quantity": "1", "Name": "Bob", "Email": "bob@example.com"},
+        ],
+    )
+    calls = {"count": 0}
+
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+        calls["count"] += 1
+        length = 20 + calls["count"]
+        placements = [
+            Placement(
+                canonical_sku=item.canonical_sku,
+                quantity=1,
+                dimensions=item.padded_dimensions,
+                origin=(0, 0, 0),
+                weight_kg=item.weight_kg,
+            )
+            for item in items
+        ]
+        return SplitResult(
+            success=True,
+            box_qty=1,
+            cartons=[
+                SplitCarton(
+                    box_number=1,
+                    result=OptimizedCartonResult(
+                        success=True,
+                        length_cm=length,
+                        width_cm=12,
+                        height_cm=8,
+                        chargeable_weight_kg=1,
+                        volume_cm3=length * 12 * 8,
+                        placements=placements,
+                        unplaced_items=[],
+                    ),
+                )
+            ],
+            unplaced_items=[],
+        )
+
+    monkeypatch.setattr("box_optimizer.workflow.split_order_into_cartons", fake_split_order_into_cartons)
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "use_vendor_box_menu": False,
+            "preserve_region_sheets": False,
+        },
+    )
+
+    assert calls["count"] == 1
+    order_rows = {row["Order ID"]: row for row in _sheet_rows(output_path, "Order Volume Weights")}
+    assert order_rows["1001"]["Name"] == "Alice"
+    assert order_rows["1002"]["Name"] == "Bob"
+    detail_rows = sorted(_sheet_rows(output_path, "Multi Box Detail"), key=lambda row: row["Order ID"])
+    assert [row["Order Box ID"] for row in detail_rows] == ["1001-1", "1002-1"]
+    assert {row["Length cm"] for row in detail_rows} == {"23"}
+    summary_rows = _sheet_rows(output_path, "Box Size Summary")
+    assert len(summary_rows) == 1
+    assert int(float(summary_rows[0]["Box Count"])) == 2
+
+
+def test_all_in_ship_alone_does_not_force_every_sku_into_own_carton(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "All-in Storage Solution [72570]", "Product Name": "All-in Storage Solution [72570]", "Length": "60", "Width": "30", "Height": "30", "Weight kg": "2"},
+            {"SKU": "Core", "Product Name": "Core", "Length": "30", "Width": "20", "Height": "7", "Weight kg": "1"},
+            {"SKU": "Expansion", "Product Name": "Expansion", "Length": "24", "Width": "16", "Height": "5", "Weight kg": "0.8"},
+            {"SKU": "Dice", "Product Name": "Dice", "Length": "8", "Width": "5", "Height": "2", "Weight kg": "0.2"},
+            {"SKU": "Tokens", "Product Name": "Tokens", "Length": "10", "Width": "7", "Height": "2", "Weight kg": "0.2"},
+            {"SKU": "Sleeves", "Product Name": "Sleeves", "Length": "12", "Width": "8", "Height": "2", "Weight kg": "0.2"},
+            {"SKU": "Tray", "Product Name": "Tray", "Length": "18", "Width": "12", "Height": "3", "Weight kg": "0.4"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "All-in Storage Solution [72570]", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Core", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Expansion", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Dice", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Tokens", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Sleeves", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Tray", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "sku_rules": {
+                "All-in Storage Solution [72570]": {
+                    "prepacked": True,
+                    "no_padding": True,
+                    "ships_alone": True,
+                    "can_mix_with_other_items": False,
+                    "box_type": "All-in Storage Solution carton",
+                }
+            },
+            "preserve_region_sheets": False,
+        },
+    )
+
+    order_row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    assert int(float(order_row["Box Qty"])) == 2
+    detail_rows = _sheet_rows(output_path, "Multi Box Detail")
+    assert len(detail_rows) == 2
+    all_in_row = next(row for row in detail_rows if row["Box Type"] == "All-in Storage Solution carton")
+    combined_row = next(row for row in detail_rows if row["Box Type"] != "All-in Storage Solution carton")
+    assert all_in_row["SKUs in Box"] == "ALL-IN STORAGE SOLUTION [72570] x1"
+    assert "CORE x1" in combined_row["SKUs in Box"]
+    assert "EXPANSION x1" in combined_row["SKUs in Box"]
+    assert "DICE x1" in combined_row["SKUs in Box"]
+    warning_messages = [row["Message"] for row in _sheet_rows(output_path, "Errors and Warnings")]
+    assert any("Order split due to ships_alone=true" in message for message in warning_messages)
+    assert all("prepacked/forced-box" not in message for message in warning_messages)
+
+
+def test_string_false_can_mix_config_still_forces_separation(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Solo", "Product Name": "Solo", "Length": "20", "Width": "12", "Height": "5", "Weight kg": "1"},
+            {"SKU": "Addon", "Product Name": "Addon", "Length": "8", "Width": "5", "Height": "2", "Weight kg": "0.2"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "Solo", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Addon", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "sku_rules": {"Solo": {"can_mix_with_other_items": "false"}},
+            "preserve_region_sheets": False,
+        },
+    )
+
+    row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    assert int(float(row["Box Qty"])) == 2
+    warning_messages = [warning["Message"] for warning in _sheet_rows(output_path, "Errors and Warnings")]
+    assert any("can_mix_with_other_items=false" in message for message in warning_messages)
 
 
 def test_prepacked_sku_without_ships_alone_can_mix_with_addons(tmp_path):

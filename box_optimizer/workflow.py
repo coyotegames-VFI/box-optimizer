@@ -1,11 +1,13 @@
 """Top-level workbook optimization workflow."""
 
+import json
 import logging
 import math
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from box_optimizer.bundling import sku_combination_key
@@ -63,6 +65,23 @@ class WorkflowWarning:
 
 
 @dataclass(frozen=True)
+class RuleSplitGroup:
+    """Order lines grouped for either rule-required separation or normal packing."""
+
+    lines: list[OrderLine]
+    reason: str = ""
+    rule_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CachedPackingPlan:
+    """Order-neutral packing output reused for matching pledge combinations."""
+
+    split_result: SplitResult
+    group_warnings: tuple[WorkflowWarning, ...] = ()
+
+
+@dataclass(frozen=True)
 class SKUCampaignRule:
     """Runtime campaign rule matched to a SKU or product name."""
 
@@ -82,58 +101,405 @@ class SKUCampaignRule:
 
 
 _US_STATE_ABBREVIATIONS = {
-    "alabama": "AL",
-    "alaska": "AK",
-    "arizona": "AZ",
-    "arkansas": "AR",
-    "california": "CA",
-    "colorado": "CO",
-    "connecticut": "CT",
-    "delaware": "DE",
-    "district of columbia": "DC",
-    "florida": "FL",
-    "georgia": "GA",
-    "hawaii": "HI",
-    "idaho": "ID",
-    "illinois": "IL",
-    "indiana": "IN",
-    "iowa": "IA",
-    "kansas": "KS",
-    "kentucky": "KY",
-    "louisiana": "LA",
-    "maine": "ME",
-    "maryland": "MD",
-    "massachusetts": "MA",
-    "michigan": "MI",
-    "minnesota": "MN",
-    "mississippi": "MS",
-    "missouri": "MO",
-    "montana": "MT",
-    "nebraska": "NE",
-    "nevada": "NV",
-    "new hampshire": "NH",
-    "new jersey": "NJ",
-    "new mexico": "NM",
-    "new york": "NY",
-    "north carolina": "NC",
-    "north dakota": "ND",
-    "ohio": "OH",
-    "oklahoma": "OK",
-    "oregon": "OR",
-    "pennsylvania": "PA",
-    "rhode island": "RI",
-    "south carolina": "SC",
-    "south dakota": "SD",
-    "tennessee": "TN",
-    "texas": "TX",
-    "utah": "UT",
-    "vermont": "VT",
-    "virginia": "VA",
-    "washington": "WA",
-    "west virginia": "WV",
-    "wisconsin": "WI",
-    "wyoming": "WY",
+    'aa': 'AA',
+    'ae': 'AE',
+    'ak': 'AK',
+    'al': 'AL',
+    'alabama': 'AL',
+    'alaska': 'AK',
+    'american samoa': 'AS',
+    'ap': 'AP',
+    'ar': 'AR',
+    'arizona': 'AZ',
+    'arkansas': 'AR',
+    'armed forces': 'AP',
+    'armed forces aa': 'AA',
+    'armed forces ae': 'AE',
+    'armed forces ap': 'AP',
+    'as': 'AS',
+    'az': 'AZ',
+    'ca': 'CA',
+    'california': 'CA',
+    'co': 'CO',
+    'colorado': 'CO',
+    'connecticut': 'CT',
+    'ct': 'CT',
+    'dc': 'DC',
+    'de': 'DE',
+    'delaware': 'DE',
+    'district of columbia': 'DC',
+    'fl': 'FL',
+    'florida': 'FL',
+    'ga': 'GA',
+    'georgia': 'GA',
+    'gu': 'GU',
+    'guam': 'GU',
+    'hawaii': 'HI',
+    'hi': 'HI',
+    'ia': 'IA',
+    'id': 'ID',
+    'idaho': 'ID',
+    'il': 'IL',
+    'illinois': 'IL',
+    'in': 'IN',
+    'indiana': 'IN',
+    'iowa': 'IA',
+    'kansas': 'KS',
+    'kentucky': 'KY',
+    'ks': 'KS',
+    'ky': 'KY',
+    'la': 'LA',
+    'louisiana': 'LA',
+    'ma': 'MA',
+    'maine': 'ME',
+    'maryland': 'MD',
+    'massachusetts': 'MA',
+    'md': 'MD',
+    'me': 'ME',
+    'mi': 'MI',
+    'michigan': 'MI',
+    'minnesota': 'MN',
+    'mississippi': 'MS',
+    'missouri': 'MO',
+    'mn': 'MN',
+    'mo': 'MO',
+    'montana': 'MT',
+    'mp': 'MP',
+    'ms': 'MS',
+    'mt': 'MT',
+    'nc': 'NC',
+    'nd': 'ND',
+    'ne': 'NE',
+    'nebraska': 'NE',
+    'nevada': 'NV',
+    'new hampshire': 'NH',
+    'new jersey': 'NJ',
+    'new mexico': 'NM',
+    'new york': 'NY',
+    'nh': 'NH',
+    'nj': 'NJ',
+    'nm': 'NM',
+    'north carolina': 'NC',
+    'north dakota': 'ND',
+    'northern mariana islands': 'MP',
+    'nv': 'NV',
+    'ny': 'NY',
+    'oh': 'OH',
+    'ohio': 'OH',
+    'ok': 'OK',
+    'oklahoma': 'OK',
+    'or': 'OR',
+    'oregon': 'OR',
+    'pa': 'PA',
+    'pennsylvania': 'PA',
+    'pr': 'PR',
+    'puerto rico': 'PR',
+    'rhode island': 'RI',
+    'ri': 'RI',
+    'sc': 'SC',
+    'sd': 'SD',
+    'south carolina': 'SC',
+    'south dakota': 'SD',
+    'tennessee': 'TN',
+    'texas': 'TX',
+    'tn': 'TN',
+    'tx': 'TX',
+    'u s virgin islands': 'VI',
+    'ut': 'UT',
+    'utah': 'UT',
+    'va': 'VA',
+    'vermont': 'VT',
+    'vi': 'VI',
+    'virginia': 'VA',
+    'vt': 'VT',
+    'wa': 'WA',
+    'washington': 'WA',
+    'west virginia': 'WV',
+    'wi': 'WI',
+    'wisconsin': 'WI',
+    'wv': 'WV',
+    'wy': 'WY',
+    'wyoming': 'WY',
 }
+
+_US_STATE_CODES = {
+    'AA', 'AE', 'AK', 'AL', 'AP', 'AR', 'AS', 'AZ', 'CA', 'CO', 'CT', 'DC', 'DE', 'FL', 'GA', 'GU', 'HI', 'IA', 'ID', 'IL', 'IN', 'KS', 'KY', 'LA', 'MA', 'MD', 'ME', 'MI', 'MN', 'MO', 'MP', 'MS', 'MT', 'NC', 'ND', 'NE', 'NH', 'NJ', 'NM', 'NV', 'NY', 'OH', 'OK', 'OR', 'PA', 'PR', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VA', 'VI', 'VT', 'WA', 'WI', 'WV', 'WY',
+}
+
+_COUNTRY_NAME_BY_CODE = {
+    'AD': 'Andorra',
+    'AE': 'United Arab Emirates',
+    'AF': 'Afghanistan',
+    'AG': 'Antigua and Barbuda',
+    'AI': 'Anguilla',
+    'AL': 'Albania',
+    'AM': 'Armenia',
+    'AN': 'Netherlands Antilles',
+    'AO': 'Cabinda',
+    'AR': 'Argentina',
+    'AS': 'American Samoa',
+    'AT': 'Austria',
+    'AU': 'Australia',
+    'AW': 'Aruba',
+    'AZ': 'Azerbaijan',
+    'BA': 'Bosnia and Herzegovina',
+    'BB': 'Barbados',
+    'BD': 'Bangladesh',
+    'BE': 'Belgium',
+    'BF': 'Burkina Faso',
+    'BG': 'Bulgaria',
+    'BH': 'Bahrain',
+    'BI': 'Burundi',
+    'BJ': 'Benin',
+    'BM': 'Bermuda',
+    'BN': 'Brunei',
+    'BO': 'Bolivia',
+    'BR': 'Brazil',
+    'BS': 'Bahamas',
+    'BT': 'Bhutan',
+    'BW': 'Botswana',
+    'BY': 'Belarus',
+    'BZ': 'Belize',
+    'CA': 'Canada',
+    'CC': 'Cocos Island',
+    'CD': 'Zaire (DRC)',
+    'CF': 'Central African Republic',
+    'CG': 'Congo',
+    'CH': 'Switzerland',
+    'CI': 'Ivory coast',
+    'CK': 'Cook islands',
+    'CL': 'Easter Island',
+    'CM': 'Cameroon',
+    'CN': 'China',
+    'CO': 'Colombia',
+    'CR': 'Costa Rica',
+    'CU': 'Cuba',
+    'CV': 'Cape Verde',
+    'CX': 'Christmas Island',
+    'CY': 'Cyprus',
+    'CZ': 'Czech Republic',
+    'DE': 'Germany',
+    'DJ': 'Djibouti',
+    'DK': 'Denmark',
+    'DM': 'Dominica',
+    'DZ': 'Algeria',
+    'EC': 'Ecuador',
+    'EE': 'Estonia',
+    'EG': 'Egypt',
+    'EH': 'Western Sahara',
+    'ER': 'Eritrea',
+    'ES': 'Spain',
+    'ET': 'Ethiopia',
+    'FI': 'Finland',
+    'FJ': 'Fiji',
+    'FK': 'Falkland Islands',
+    'FM': 'Micronesia',
+    'FO': 'Faroe Islands',
+    'FR': 'France',
+    'GA': 'Gabon',
+    'GB': 'United Kingdom',
+    'GD': 'Grenada',
+    'GE': 'Georgia',
+    'GF': 'French Guiana',
+    'GI': 'Gibraltar',
+    'GL': 'Greenland',
+    'GM': 'Gambia',
+    'GN': 'Guinea',
+    'GR': 'Greece',
+    'GT': 'Guatemala',
+    'GU': 'Guam',
+    'GY': 'Guyana',
+    'HK': 'Hong Kong',
+    'HN': 'Honduras',
+    'HR': 'Croatia',
+    'HT': 'Haiti',
+    'HU': 'Hungary',
+    'IC': 'Canary Islands',
+    'ID': 'Indonesia',
+    'IE': 'Ireland',
+    'IL': 'Israel',
+    'IN': 'India',
+    'IO': 'British Indian Ocean Territory',
+    'IQ': 'Iraq',
+    'IR': 'Iran',
+    'IS': 'Iceland',
+    'IT': 'Italy',
+    'JM': 'Jamaica',
+    'JO': 'Jordan',
+    'JP': 'Japan',
+    'KE': 'Kenya',
+    'KG': 'Kyrgyzstan',
+    'KH': 'Cambodia',
+    'KI': 'Kiribati',
+    'KM': 'Comoros',
+    'KN': 'St. Kitts and Nevis',
+    'KP': 'Korea, North',
+    'KR': 'South Korea',
+    'KW': 'Kuwait',
+    'KY': 'Cayman Islands',
+    'KZ': 'Kazakhstan',
+    'LA': 'Laos',
+    'LB': 'Lebanon',
+    'LC': 'Saint Lucia',
+    'LI': 'Liechtenstein',
+    'LK': 'Sri Lanka',
+    'LS': 'Lesotho',
+    'LT': 'Lithuania',
+    'LU': 'Luxembourg',
+    'LV': 'Latvia',
+    'LY': 'Libya',
+    'MA': 'Morocco',
+    'MC': 'Monaco',
+    'MD': 'Moldova',
+    'ME': 'Montenegro',
+    'MG': 'Madagascar',
+    'MH': 'Marshall Islands',
+    'MK': 'Macedonia',
+    'ML': 'Mali',
+    'MM': 'Myanmar',
+    'MN': 'Mongolia',
+    'MP': 'Northern Mariana Islands',
+    'MQ': 'Martinique',
+    'MR': 'Mauritania',
+    'MS': 'Montserrat',
+    'MT': 'Malta',
+    'MU': 'Mauritius',
+    'MV': 'Maldives',
+    'MW': 'Malawi',
+    'MX': 'Mexico',
+    'MY': 'Malaysia',
+    'MZ': 'Mozambique',
+    'NA': 'Namibia',
+    'NC': 'New Caledonia',
+    'NE': 'Niger',
+    'NF': 'Norfolk Island',
+    'NG': 'Nigeria',
+    'NI': 'Nicaragua',
+    'NL': 'Netherlands',
+    'NO': 'Norway',
+    'NP': 'Nepal',
+    'NR': 'Nauru',
+    'NU': 'Niue',
+    'NZ': 'New Zealand',
+    'OM': 'Oman',
+    'PA': 'Panama',
+    'PF': 'French Polynesia',
+    'PG': 'Papua New Guinea',
+    'PH': 'Philippines',
+    'PK': 'Pakistan',
+    'PL': 'Poland',
+    'PM': 'Saint Pierre and Miquelon',
+    'PR': 'Puerto Rico',
+    'PS': 'Palestine',
+    'PT': 'Portugal',
+    'PW': 'Palau',
+    'PY': 'Paraguay',
+    'QA': 'Qatar',
+    'RE': 'Reunion',
+    'RO': 'Romania',
+    'RS': 'Serbia',
+    'RU': 'Russia',
+    'RW': 'Rwanda',
+    'SA': 'Saudi Arabia',
+    'SB': 'Solomon islands',
+    'SC': 'Seychelles',
+    'SE': 'Sweden',
+    'SG': 'Singapore',
+    'SH': 'St. Helena',
+    'SI': 'Slovenia',
+    'SJ': 'Svalbard and Jan Mayen',
+    'SK': 'Slovakia',
+    'SL': 'Sierra Leone',
+    'SN': 'Senegal',
+    'SO': 'Somalia',
+    'SR': 'Suriname',
+    'ST': 'Sao Tome and Principe',
+    'SY': 'Syria',
+    'SZ': 'Swaziland (Eswatini)',
+    'TC': 'Turks and Caicos Islands',
+    'TD': 'Chad',
+    'TF': 'French Southern Territories',
+    'TG': 'Togo',
+    'TH': 'Thailand',
+    'TJ': 'Tajikistan',
+    'TL': 'East Timor',
+    'TM': 'Turkmenistan',
+    'TN': 'Tunisia',
+    'TO': 'Tonga',
+    'TR': 'Turkey',
+    'TT': 'Trinidad and Tobago',
+    'TV': 'Tuvalu',
+    'TW': 'Taiwan',
+    'TZ': 'Tanzania',
+    'UA': 'Ukraine',
+    'UG': 'Uganda',
+    'UM': 'United States Minor Outlying Islands',
+    'US': 'United States',
+    'UY': 'Uruguay',
+    'UZ': 'Uzbekistan',
+    'VA': 'Vatican City',
+    'VC': 'Saint Vincent and the Grenadines',
+    'VE': 'Venezuela',
+    'VG': 'British Virgin Islands',
+    'VI': 'US Virgin Islands',
+    'VN': 'Vietnam',
+    'VU': 'Vanuatu',
+    'WF': 'Wallis and Futuna',
+    'YE': 'Yemen',
+    'YT': 'Mayotte',
+    'ZA': 'South Africa',
+    'ZM': 'Zambia',
+    'ZW': 'Zimbabwe',
+}
+
+_COUNTRY_ALIASES = {
+    'america': 'US',
+    'bolivia plurinational state of': 'BO',
+    'britain': 'GB',
+    'brunei darussalam': 'BN',
+    'congo democratic republic': 'CD',
+    'cote d ivoire': 'CI',
+    'czechia': 'CZ',
+    'democratic republic of congo': 'CD',
+    'democratic republic of the congo': 'CD',
+    'drc': 'CD',
+    'england': 'GB',
+    'great britain': 'GB',
+    'ivory coast': 'CI',
+    'korea': 'KR',
+    'korea north': 'KP',
+    'korea republic of': 'KR',
+    'korea south': 'KR',
+    'macao': 'MO',
+    'moldova republic of': 'MD',
+    'north korea': 'KP',
+    'republic of korea': 'KR',
+    'russian federation': 'RU',
+    's korea': 'KR',
+    'saint kitts and nevis': 'KN',
+    'saint lucia': 'LC',
+    'saint vincent and the grenadines': 'VC',
+    'south korea': 'KR',
+    'st kitts and nevis': 'KN',
+    'st lucia': 'LC',
+    'st vincent and the grenadines': 'VC',
+    'taiwan province of china': 'TW',
+    'tanzania united republic of': 'TZ',
+    'u k': 'GB',
+    'u s': 'US',
+    'u s a': 'US',
+    'uk': 'GB',
+    'united states': 'US',
+    'united states of america': 'US',
+    'us': 'US',
+    'usa': 'US',
+    'venezuela bolivarian republic of': 'VE',
+    'viet nam': 'VN',
+    'zaire': 'CD',
+}
+
+def _normalize_lookup_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
 
 
 def _config(config: dict | None) -> dict:
@@ -183,6 +549,20 @@ def _rule_key(value: object) -> str:
     return re.sub(r"[\W_]+", "", text)
 
 
+def _bool_from_config(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
 def _dimensions_from_config(value: object) -> Dimensions | None:
     if value is None:
         return None
@@ -212,16 +592,16 @@ def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
             allowed_orientations = tuple(parsed_orientations) or None
         parsed[key] = SKUCampaignRule(
             key=str(key),
-            no_padding=bool(rule.get("no_padding", False)),
-            prepacked=bool(rule.get("prepacked", False)),
-            ships_alone=bool(rule.get("ships_alone", False)),
-            can_mix_with_other_items=bool(rule.get("can_mix_with_other_items", True)),
+            no_padding=_bool_from_config(rule.get("no_padding"), False),
+            prepacked=_bool_from_config(rule.get("prepacked"), False),
+            ships_alone=_bool_from_config(rule.get("ships_alone"), False),
+            can_mix_with_other_items=_bool_from_config(rule.get("can_mix_with_other_items"), True),
             forced_box_cm=_dimensions_from_config(rule.get("forced_box_cm")),
-            must_stay_flat=bool(rule.get("must_stay_flat", False)),
-            allow_rotation=bool(rule.get("allow_rotation", True)),
+            must_stay_flat=_bool_from_config(rule.get("must_stay_flat"), False),
+            allow_rotation=_bool_from_config(rule.get("allow_rotation"), True),
             allowed_orientations=allowed_orientations,
             extra_padding_cm=_dimensions_from_config(rule.get("extra_padding_cm")),
-            exclude_from_standardization=bool(rule.get("exclude_from_standardization", False)),
+            exclude_from_standardization=_bool_from_config(rule.get("exclude_from_standardization"), False),
             box_type=rule.get("box_type"),
             warning_note=str(rule.get("warning_note", "") or ""),
         )
@@ -491,13 +871,54 @@ def _packed_items_for_order(
     return items
 
 
-def _state_abbreviation(country: str | None, state_province: str | None) -> str:
-    if not country or not state_province or country.strip().upper() not in {"US", "USA", "UNITED STATES"}:
+def _normalize_country(country: str | None) -> str:
+    raw = str(country or "").strip()
+    if not raw:
         return ""
-    normalized = state_province.strip()
-    if len(normalized) == 2:
-        return normalized.upper()
-    return _US_STATE_ABBREVIATIONS.get(normalized.lower(), "")
+    upper = raw.upper().replace(".", "")
+    if upper in _COUNTRY_NAME_BY_CODE:
+        return _COUNTRY_NAME_BY_CODE[upper]
+    key = _normalize_lookup_key(raw)
+    alias_code = _COUNTRY_ALIASES.get(key)
+    if alias_code:
+        return _COUNTRY_NAME_BY_CODE[alias_code]
+    for name in _COUNTRY_NAME_BY_CODE.values():
+        if _normalize_lookup_key(name) == key:
+            return name
+    return raw
+
+
+def _state_abbreviation(country: str | None, state_province: str | None) -> str:
+    if _normalize_country(country) != "United States" or not state_province:
+        return ""
+    normalized = str(state_province or "").strip()
+    upper = normalized.upper().replace(".", "")
+    if upper in _US_STATE_CODES:
+        return upper
+    return _US_STATE_ABBREVIATIONS.get(_normalize_lookup_key(normalized), "")
+
+
+def _compact_box_type(box_type: str | None, dimensions: Dimensions | None = None) -> str:
+    text = str(box_type or "").strip()
+    if not text:
+        if dimensions is None:
+            return "Custom"
+        return f"Custom {int(dimensions.length)}x{int(dimensions.width)}x{int(dimensions.height)}"
+    vendor_match = re.fullmatch(r"Vendor Box\s+(.+)", text, flags=re.IGNORECASE)
+    if vendor_match:
+        return f"VB {vendor_match.group(1).strip()}"
+    if re.fullmatch(r"(?:Box Type|Custom Box)\s+\d+", text, flags=re.IGNORECASE) or text == "NO-VENDOR-BOX":
+        if dimensions is None:
+            return text
+        return f"Custom {int(dimensions.length)}x{int(dimensions.width)}x{int(dimensions.height)}"
+    return text
+
+
+def _per_box_chargeable_weight_summary(box_rows: list[dict]) -> str:
+    return "; ".join(
+        f"{row['Box Type']}: {row['Chargeable Weight kg']} kg"
+        for row in sorted(box_rows, key=lambda row: row["Box Number"])
+    )
 
 
 def _metadata_for_order(lines: list[OrderLine]) -> dict:
@@ -623,10 +1044,10 @@ def _carton_is_prepacked_final(
 ) -> bool:
     if not carton.result.placements:
         return False
-    return all(
-        (rule := sku_rules.get(placement.canonical_sku)) is not None and rule.prepacked
-        for placement in carton.result.placements
-    )
+    placement_rules = [sku_rules.get(placement.canonical_sku) for placement in carton.result.placements]
+    if all(_final_shipping_carton_rule(rule) for rule in placement_rules):
+        return True
+    return len(placement_rules) == 1 and bool(placement_rules[0] and placement_rules[0].prepacked)
 
 
 def _merge_split_results(results: list[SplitResult]) -> SplitResult:
@@ -656,11 +1077,11 @@ def _merge_split_results(results: list[SplitResult]) -> SplitResult:
     )
 
 
-def _split_rule_groups(
+def _split_rule_group_records(
     lines: list[OrderLine],
     sku_rules: dict[str, SKUCampaignRule],
     config: dict,
-) -> list[list[OrderLine]]:
+) -> list[RuleSplitGroup]:
     trigger_keys = set()
     for order_rule in config.get("order_rules") or []:
         if not isinstance(order_rule, dict):
@@ -671,23 +1092,180 @@ def _split_rule_groups(
             trigger_keys.add(normalize_sku(value))
             trigger_keys.add(_rule_key(value))
 
-    groups: list[list[OrderLine]] = []
+    groups: list[RuleSplitGroup] = []
     remainder = []
     for line in lines:
         rule = sku_rules.get(line.canonical_sku)
         line_triggered = bool(_rule_candidates_for_line(line) & trigger_keys)
-        must_split = (
-            line_triggered
-            or bool(rule and rule.ships_alone)
-            or bool(rule and not rule.can_mix_with_other_items)
-        )
-        if must_split:
-            groups.append([line])
+        if line_triggered:
+            groups.append(
+                RuleSplitGroup(
+                    lines=[line],
+                    reason="explicit order rule",
+                    rule_keys=(rule.key,) if rule else (),
+                )
+            )
+        elif rule and rule.ships_alone:
+            groups.append(
+                RuleSplitGroup(
+                    lines=[line],
+                    reason="ships_alone=true",
+                    rule_keys=(rule.key,),
+                )
+            )
+        elif rule and not rule.can_mix_with_other_items:
+            groups.append(
+                RuleSplitGroup(
+                    lines=[line],
+                    reason="can_mix_with_other_items=false",
+                    rule_keys=(rule.key,),
+                )
+            )
         else:
             remainder.append(line)
     if remainder:
-        groups.append(remainder)
-    return groups or [lines]
+        groups.append(RuleSplitGroup(lines=remainder))
+    return groups or [RuleSplitGroup(lines=lines)]
+
+
+def _split_rule_groups(
+    lines: list[OrderLine],
+    sku_rules: dict[str, SKUCampaignRule],
+    config: dict,
+) -> list[list[OrderLine]]:
+    return [group.lines for group in _split_rule_group_records(lines, sku_rules, config)]
+
+
+def _rule_split_message(groups: list[RuleSplitGroup]) -> str:
+    reasons = [group.reason for group in groups if group.reason]
+    if not reasons:
+        return ""
+    return "Order split due to " + ", ".join(dict.fromkeys(reasons)) + "."
+
+
+def _rule_split_keys(groups: list[RuleSplitGroup]) -> str:
+    keys = [key for group in groups for key in group.rule_keys if key]
+    return ", ".join(dict.fromkeys(keys))
+
+
+def _final_shipping_carton_rule(rule: SKUCampaignRule | None) -> bool:
+    return bool(rule and rule.prepacked and (rule.ships_alone or not rule.can_mix_with_other_items))
+
+
+def _dimensions_cache_tuple(dimensions: Dimensions | None) -> tuple[float, float, float] | None:
+    if dimensions is None:
+        return None
+    return (float(dimensions.length), float(dimensions.width), float(dimensions.height))
+
+
+def _rule_cache_signature(rule: SKUCampaignRule | None) -> dict:
+    if rule is None:
+        return {}
+    return {
+        "key": rule.key,
+        "no_padding": rule.no_padding,
+        "prepacked": rule.prepacked,
+        "ships_alone": rule.ships_alone,
+        "can_mix_with_other_items": rule.can_mix_with_other_items,
+        "forced_box_cm": _dimensions_cache_tuple(rule.forced_box_cm),
+        "must_stay_flat": rule.must_stay_flat,
+        "allow_rotation": rule.allow_rotation,
+        "allowed_orientations": tuple(_dimensions_cache_tuple(dimensions) for dimensions in (rule.allowed_orientations or ())),
+        "extra_padding_cm": _dimensions_cache_tuple(rule.extra_padding_cm),
+        "exclude_from_standardization": rule.exclude_from_standardization,
+        "box_type": rule.box_type,
+        "warning_note": rule.warning_note,
+    }
+
+
+def _packed_item_cache_signature(item: PackedItem) -> dict:
+    return {
+        "canonical_sku": item.canonical_sku,
+        "quantity": item.quantity,
+        "unpadded_dimensions": _dimensions_cache_tuple(item.unpadded_dimensions),
+        "padded_dimensions": _dimensions_cache_tuple(item.padded_dimensions),
+        "weight_kg": float(item.weight_kg),
+        "rule_key": item.rule_key,
+        "rule_applied": item.rule_applied,
+        "box_type": item.box_type,
+        "warning_note": item.warning_note,
+        "exclude_from_standardization": item.exclude_from_standardization,
+        "allow_rotation": item.allow_rotation,
+        "must_stay_flat": item.must_stay_flat,
+        "allowed_orientations": tuple(_dimensions_cache_tuple(dimensions) for dimensions in (item.allowed_orientations or ())),
+    }
+
+
+def _group_cache_signature(group: RuleSplitGroup) -> dict:
+    quantities = defaultdict(int)
+    for line in group.lines:
+        quantities[line.canonical_sku] += line.quantity
+    return {
+        "reason": group.reason,
+        "rule_keys": group.rule_keys,
+        "skus": tuple((sku, quantities[sku]) for sku in sorted(quantities)),
+    }
+
+
+def _config_cache_signature(cfg: dict) -> dict:
+    return {
+        "packing_mode": cfg.get("packing_mode"),
+        "standardization_tolerance_cm": cfg.get("standardization_tolerance_cm"),
+        "use_vendor_box_menu": cfg.get("use_vendor_box_menu"),
+        "billing_band_kg": cfg.get("billing_band_kg"),
+        "custom_box_min_units": cfg.get("custom_box_min_units"),
+        "box_menu": cfg.get("box_menu"),
+        "order_rules": cfg.get("order_rules"),
+        "max_carton_cm": cfg.get("max_carton_cm"),
+        "dimensional_divisor": cfg.get("dimensional_divisor"),
+        "packing_weight_uplift": cfg.get("packing_weight_uplift"),
+        "final_exterior_padding_cm": (2, 2, 2),
+        "carton_cap_cm": _dimensions_cache_tuple(MAX_CARTON_DIMENSIONS),
+    }
+
+
+def _packing_cache_key(
+    combo: str,
+    lines: list[OrderLine],
+    items: list[PackedItem],
+    groups: list[RuleSplitGroup],
+    sku_rules: dict[str, SKUCampaignRule],
+    cfg: dict,
+) -> str:
+    relevant_skus = sorted({line.canonical_sku for line in lines})
+    payload = {
+        "sku_combination": combo,
+        "items": sorted(
+            (_packed_item_cache_signature(item) for item in items),
+            key=lambda item: (item["canonical_sku"], item["quantity"]),
+        ),
+        "groups": sorted(
+            (_group_cache_signature(group) for group in groups),
+            key=lambda group: (group["reason"], group["skus"], group["rule_keys"]),
+        ),
+        "rules": {sku: _rule_cache_signature(sku_rules.get(sku)) for sku in relevant_skus},
+        "config": _config_cache_signature(cfg),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _clone_split_result(split_result: SplitResult) -> SplitResult:
+    return deepcopy(split_result)
+
+
+def _materialize_cached_warnings(
+    warnings: tuple[WorkflowWarning, ...],
+    order_id: str,
+    combo: str,
+) -> list[WorkflowWarning]:
+    return [
+        replace(
+            warning,
+            order_id=order_id if warning.order_id else warning.order_id,
+            sku_breakdown=combo if warning.sku_breakdown else warning.sku_breakdown,
+        )
+        for warning in warnings
+    ]
 
 
 def _pack_group(
@@ -822,16 +1400,84 @@ def _assignment_lookup(
     return {assignment.order_id: assignment for assignment in assignments}
 
 
-def _summary_rows(result: dict) -> list[dict]:
-    return [
-        {"Metric": "Orders Processed", "Value": result["orders_processed"]},
-        {"Metric": "Boxes Created", "Value": result["boxes_created"]},
-        {"Metric": "Box Types", "Value": result["box_types"]},
-        {"Metric": "Unmatched SKUs", "Value": result["unmatched_skus"]},
-        {"Metric": "Warning Count", "Value": result["warning_count"]},
-        {"Metric": "Multi-box Orders", "Value": result["multi_box_order_count"]},
-        {"Metric": "Rules Applied", "Value": result["rules_applied_count"]},
+def _rule_summary(sku_rules: dict[str, SKUCampaignRule]) -> list[str]:
+    summaries = []
+    for rule in sorted(sku_rules.values(), key=lambda item: item.key):
+        flags = []
+        if rule.ships_alone:
+            flags.append("ship-alone")
+        if rule.prepacked:
+            flags.append("prepacked")
+        if rule.no_padding:
+            flags.append("no-padding")
+        if rule.forced_box_cm:
+            flags.append(
+                f"fixed carton {_compact_box_type(rule.box_type, rule.forced_box_cm)} "
+                f"{int(rule.forced_box_cm.length)}x{int(rule.forced_box_cm.width)}x{int(rule.forced_box_cm.height)}"
+            )
+        if not rule.can_mix_with_other_items:
+            flags.append("no-mix")
+        if rule.must_stay_flat:
+            flags.append("must-stay-flat")
+        if rule.extra_padding_cm:
+            flags.append("extra padding")
+        if flags:
+            summaries.append(f"{rule.key}: {', '.join(flags)}")
+    return summaries
+
+
+def _summary_rows(
+    result: dict,
+    box_size_rows: list[dict],
+    unmatched_rows: list[dict],
+    warning_rows: list[WorkflowWarning],
+    sku_rules: dict[str, SKUCampaignRule],
+) -> list[dict]:
+    rows = [
+        {"Section": "Run Summary", "Metric": "Orders Processed", "Value": result["orders_processed"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Boxes Created", "Value": result["boxes_created"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Box Types", "Value": result["box_types"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Unmatched SKUs", "Value": result["unmatched_skus"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Warning Count", "Value": result["warning_count"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Multi-box Orders", "Value": result["multi_box_order_count"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Rules Applied", "Value": result["rules_applied_count"], "Detail": ""},
     ]
+    for box in box_size_rows:
+        rows.append(
+            {
+                "Section": "Boxes Needed",
+                "Metric": box.get("Box Type", ""),
+                "Value": box.get("Box Count", ""),
+                "Detail": f"{box.get('Length cm', '')}x{box.get('Width cm', '')}x{box.get('Height cm', '')} cm",
+            }
+        )
+    if unmatched_rows:
+        for unmatched in unmatched_rows[:20]:
+            rows.append(
+                {
+                    "Section": "Unmatched SKU Summary",
+                    "Metric": unmatched.get("Canonical SKU") or unmatched.get("Raw SKU", ""),
+                    "Value": unmatched.get("Reason", ""),
+                    "Detail": unmatched.get("Order ID", ""),
+                }
+            )
+    else:
+        rows.append({"Section": "Unmatched SKU Summary", "Metric": "Unmatched SKUs", "Value": 0, "Detail": "None"})
+
+    unique_warning_messages = list(dict.fromkeys(warning.message for warning in warning_rows))
+    if unique_warning_messages:
+        for message in unique_warning_messages[:20]:
+            rows.append({"Section": "Unique Warning Summary", "Metric": "Warning", "Value": message, "Detail": ""})
+    else:
+        rows.append({"Section": "Unique Warning Summary", "Metric": "Warnings", "Value": 0, "Detail": "None"})
+
+    rule_summaries = _rule_summary(sku_rules)
+    if rule_summaries:
+        for summary in rule_summaries:
+            rows.append({"Section": "Rules Applied Summary", "Metric": "Rule", "Value": summary, "Detail": ""})
+    else:
+        rows.append({"Section": "Rules Applied Summary", "Metric": "Rules", "Value": 0, "Detail": "No special packing rules matched"})
+    return rows
 
 
 def _box_size_summary(box_rows: list[dict]) -> list[dict]:
@@ -848,7 +1494,6 @@ def _box_size_summary(box_rows: list[dict]) -> list[dict]:
                 "Box Count": 0,
                 "Order IDs": set(),
                 "Unit Count": 0,
-                "Main SKU Combos": set(),
                 "Chargeable Weights": [],
                 "Regions Used": set(),
             },
@@ -856,7 +1501,6 @@ def _box_size_summary(box_rows: list[dict]) -> list[dict]:
         summary["Box Count"] += 1
         summary["Order IDs"].add(row["Order ID"])
         summary["Unit Count"] += row.get("Unit Count", 0)
-        summary["Main SKU Combos"].add(row.get("SKU Breakdown", ""))
         summary["Chargeable Weights"].append(row["Chargeable Weight kg"])
         if row.get("Region"):
             summary["Regions Used"].add(row["Region"])
@@ -873,7 +1517,6 @@ def _box_size_summary(box_rows: list[dict]) -> list[dict]:
                 "Box Count": summary["Box Count"],
                 "Order Count": len(summary["Order IDs"]),
                 "Unit Count": summary["Unit Count"],
-                "Main SKU Combos": " | ".join(sorted(summary["Main SKU Combos"])),
                 "Average Chargeable Weight kg": _format_weight_display(sum(weights) / len(weights)),
                 "Max Chargeable Weight kg": _format_weight_display(max(weights)),
                 "Regions Used": " | ".join(sorted(summary["Regions Used"])),
@@ -951,7 +1594,7 @@ def _multi_box_rows(box_rows: list[dict]) -> list[dict]:
 
 def _box_plan(box_rows: list[dict]) -> str:
     return "; ".join(
-        f"Box {row['Box Number']}: {row['Length cm']}x{row['Width cm']}x{row['Height cm']} cm"
+        f"Box {row['Box Number']}: {row['Box Type']} {row['Length cm']}x{row['Width cm']}x{row['Height cm']} cm"
         for row in sorted(box_rows, key=lambda row: row["Box Number"])
     )
 
@@ -964,9 +1607,7 @@ def _joined_box_types(box_rows: list[dict]) -> str:
             unique_types.append(box_type)
     if len(unique_types) == 1:
         return unique_types[0]
-    if len(unique_types) <= 3:
-        return " + ".join(unique_types)
-    return "MULTI-BOX"
+    return " | ".join(unique_types)
 
 
 def _max_dimensions(box_rows: list[dict], prefix: str = "") -> Dimensions:
@@ -1022,7 +1663,6 @@ def _order_summary_rows(
     for order_id, order_box_rows in rows_by_order.items():
         lines = grouped_orders[order_id]
         first_line = lines[0]
-        assigned = _max_dimensions(order_box_rows, "Assigned Box ")
         packed_weight = sum(float(row["Packed Actual Weight kg"]) for row in order_box_rows)
         dim_weight = sum(float(row["Dimensional Weight kg (/5000)"]) for row in order_box_rows)
         chargeable = sum(float(row["Chargeable Weight kg"]) for row in order_box_rows)
@@ -1030,7 +1670,7 @@ def _order_summary_rows(
         row = {
             "Region": first_line.region or "",
             "Order ID": order_id,
-            "Country": first_line.country or "",
+            "Country": _normalize_country(first_line.country),
             "State/Province": first_line.state_province or "",
             "US State Abbreviation": _state_abbreviation(first_line.country, first_line.state_province),
             "Packed Actual Weight kg": _format_weight_display(packed_weight),
@@ -1039,17 +1679,10 @@ def _order_summary_rows(
             "Chargeable Weight g": int(chargeable * 1000),
             "Total Units": _total_units(lines),
             "Box Qty": box_qty,
-            "Box Type": _joined_box_types(order_box_rows) if box_qty == 1 else "MULTI-BOX",
-            "Vendor Box ID": order_box_rows[0].get("Vendor Box ID", "") if box_qty == 1 else "MULTI-BOX",
-            "Box Selection Decision": order_box_rows[0].get("Box Selection Decision", "") if box_qty == 1 else "MULTI-BOX",
-            "Assigned Box Length cm": assigned.length,
-            "Assigned Box Width cm": assigned.width,
-            "Assigned Box Height cm": assigned.height,
-            "Box Standardization Note": "Multi-box order; see Multi Box Detail" if box_qty > 1 else order_box_rows[0]["Box Standardization Note"],
-            "Distinct SKUs": _distinct_skus(lines),
-            "SKU Breakdown": combo_by_order[order_id],
+            "Box Type": _joined_box_types(order_box_rows),
             "Box Plan": _box_plan(order_box_rows),
-            "Warning Summary": _warning_summary(order_id, warning_rows),
+            "Per-Box Chargeable Weight": _per_box_chargeable_weight_summary(order_box_rows),
+            "SKU Breakdown": combo_by_order[order_id],
         }
         rows.append(_append_metadata(row, _metadata_for_order(lines)))
     return rows
@@ -1057,6 +1690,43 @@ def _order_summary_rows(
 
 def _pledge_combination_summary_rows(order_rows: list[dict]) -> list[dict]:
     return _pledge_combination_summary_rows_from_boxes(order_rows)
+
+
+def _optimized_to_pack_rows(box_rows: list[dict]) -> list[dict]:
+    combos: dict[str, dict] = {}
+    for row in box_rows:
+        combo = row["SKU Breakdown"]
+        entry = combos.setdefault(
+            combo,
+            {
+                "order_ids": set(),
+                "boxes": defaultdict(list),
+            },
+        )
+        entry["order_ids"].add(row["Order ID"])
+        entry["boxes"][int(float(row["Box Number"]))].append(row)
+
+    sorted_entries = sorted(
+        combos.items(),
+        key=lambda item: (-len(item[1]["order_ids"]), item[0]),
+    )
+    max_box = max((max(entry["boxes"]) for _combo, entry in sorted_entries if entry["boxes"]), default=0)
+    output = []
+    for index, (combo, entry) in enumerate(sorted_entries, start=1):
+        row = {
+            "Pledge Configuration": index,
+            "Total Pledges": len(entry["order_ids"]),
+            "All Items": combo.replace(" | ", ", "),
+        }
+        for box_number in range(1, max_box + 1):
+            rows = entry["boxes"].get(box_number, [])
+            if not rows:
+                row[f"Box {box_number}"] = ""
+                continue
+            first = rows[0]
+            row[f"Box {box_number}"] = f"{first['Box Type']}: {first['SKUs in Box'].replace(' | ', ', ')}"
+        output.append(row)
+    return output
 
 
 def _pledge_combination_summary_rows_from_boxes(box_rows: list[dict]) -> list[dict]:
@@ -1151,6 +1821,7 @@ def optimize_workbook(
     combo_by_order = {}
     items_by_order = {}
     failed_orders = []
+    packing_cache: dict[str, CachedPackingPlan] = {}
 
     packing_mode = cfg.get("packing_mode", "normal")
     _log_event("packing_started", order_count=len(grouped_orders), packing_mode=packing_mode)
@@ -1160,35 +1831,43 @@ def optimize_workbook(
         _log_event("order_packing_started", order_id=order_id, line_count=len(lines))
         try:
             items = _packed_items_for_order(lines, sku_items, sku_rules)
-            groups = _split_rule_groups(lines, sku_rules, cfg)
-            group_results = []
-            for group in groups:
-                group_items = _packed_items_for_order(group, sku_items, sku_rules)
-                group_result, group_warnings = _pack_group(
-                    group,
-                    group_items,
-                    sku_rules,
-                    packing_mode,
+            groups = _split_rule_group_records(lines, sku_rules, cfg)
+            cache_key = _packing_cache_key(combo, lines, items, groups, sku_rules, cfg)
+            cached_plan = packing_cache.get(cache_key)
+            if cached_plan is not None:
+                split_result = _clone_split_result(cached_plan.split_result)
+                warning_rows.extend(
+                    _materialize_cached_warnings(cached_plan.group_warnings, order_id, combo)
                 )
-                group_results.append(group_result)
-                warning_rows.extend(group_warnings)
-            split_result = _merge_split_results(group_results)
-            if len(groups) > 1:
+            else:
+                group_results = []
+                group_warnings_for_cache = []
+                for group_record in groups:
+                    group = group_record.lines
+                    group_items = _packed_items_for_order(group, sku_items, sku_rules)
+                    group_result, group_warnings = _pack_group(
+                        group,
+                        group_items,
+                        sku_rules,
+                        packing_mode,
+                    )
+                    group_results.append(group_result)
+                    group_warnings_for_cache.extend(group_warnings)
+                    warning_rows.extend(group_warnings)
+                split_result = _merge_split_results(group_results)
+                packing_cache[cache_key] = CachedPackingPlan(
+                    split_result=_clone_split_result(split_result),
+                    group_warnings=tuple(group_warnings_for_cache),
+                )
+            rule_split_message = _rule_split_message(groups)
+            if rule_split_message:
                 warning_rows.append(
                     WorkflowWarning(
                         order_id=order_id,
                         stage="packing",
-                        error_type="OrderSplit",
-                        message="Order split due to ships-alone/prepacked/forced-box/order rule.",
-                        rule_applied=", ".join(
-                            sorted(
-                                {
-                                    sku_rules[line.canonical_sku].key
-                                    for line in lines
-                                    if line.canonical_sku in sku_rules
-                                }
-                            )
-                        ),
+                        error_type="RuleBasedOrderSplit",
+                        message=rule_split_message,
+                        rule_applied=_rule_split_keys(groups),
                         sku_breakdown=combo,
                     )
                 )
@@ -1310,7 +1989,7 @@ def optimize_workbook(
         for index, carton in enumerate(split_result.cartons):
             assignment = assignments_by_key[f"{order_id}#{index + 1}"]
             optimized_dimensions = _carton_dimensions(split_result, index)
-            carton_box_type = carton.box_type or assignment.box_type
+            raw_carton_box_type = carton.box_type or assignment.box_type
             vendor_box_id = "" if carton.box_type else (assignment.vendor_box_id or "")
             selection_decision = "rule_assigned_box" if carton.box_type else assignment.selection_decision
             carton_note_parts = [assignment.box_standardization_note]
@@ -1326,6 +2005,7 @@ def optimize_workbook(
                 ),
                 cap=bool(carton.box_type),
             )
+            carton_box_type = _compact_box_type(raw_carton_box_type, assigned_dimensions)
             box_actual_weight_kg = sum(placement.weight_kg for placement in carton.result.placements)
             box_packed_weight_kg = packed_actual_weight_kg(box_actual_weight_kg)
             dim_weight_kg = dimensional_weight_kg(assigned_dimensions)
@@ -1338,7 +2018,7 @@ def optimize_workbook(
                 "Order ID": order_id,
                 "Order Box ID": f"{order_id}-{carton.box_number}",
                 "Box Number": carton.box_number,
-                "Country": first_line.country or "",
+                "Country": _normalize_country(first_line.country),
                 "State/Province": first_line.state_province or "",
                 "US State Abbreviation": _state_abbreviation(first_line.country, first_line.state_province),
                 "Actual Weight kg": _format_weight_display(box_actual_weight_kg),
@@ -1376,6 +2056,22 @@ def optimize_workbook(
             }
             box_rows.append(_append_metadata(row, _metadata_for_order(lines)))
 
+    for order_id, lines in grouped_orders.items():
+        if order_id not in split_results or not lines:
+            continue
+        first_line = lines[0]
+        if _normalize_country(first_line.country) == "United States" and not _state_abbreviation(first_line.country, first_line.state_province):
+            warning_rows.append(
+                WorkflowWarning(
+                    order_id=order_id,
+                    stage="report",
+                    error_type="MissingUSStateAbbreviation",
+                    message="US order is missing a valid state/territory/armed forces abbreviation for costing calculator.",
+                    sku_breakdown=combo_by_order.get(order_id, ""),
+                )
+            )
+    warning_rows = _dedupe_workflow_warnings(warning_rows)
+
     order_summary_rows = _order_summary_rows(
         box_rows,
         grouped_orders,
@@ -1408,13 +2104,18 @@ def optimize_workbook(
                 rows_by_region[f"Region - {row['Region']}"].append(row)
         region_sheets = dict(rows_by_region)
 
+    box_size_rows = _box_size_summary(box_rows)
+    unmatched_rows = _unmatched_rows(intake.unmatched_skus)
+    optimized_to_pack_rows = _optimized_to_pack_rows(box_rows)
+
     _log_event("excel_writing_started", output_path=str(Path(output_path).name))
     write_workbook(
         output_path,
-        summary_rows=_summary_rows(result),
+        summary_rows=_summary_rows(result, box_size_rows, unmatched_rows, warning_rows, sku_rules),
         order_volume_weights_rows=order_rows,
-        box_size_summary_rows=_box_size_summary(box_rows),
-        unmatched_skus_rows=_unmatched_rows(intake.unmatched_skus),
+        optimized_to_pack_rows=optimized_to_pack_rows,
+        box_size_summary_rows=box_size_rows,
+        unmatched_skus_rows=unmatched_rows,
         packing_detail_rows=_packing_detail_rows(split_results),
         multi_box_detail_rows=_multi_box_rows(box_rows),
         pledge_combination_summary_rows=_pledge_combination_summary_rows_from_boxes(box_rows),

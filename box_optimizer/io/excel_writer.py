@@ -8,14 +8,15 @@ import zipfile
 REQUIRED_SHEETS = [
     "Summary",
     "Order Volume Weights",
+    "Optimized to Pack",
     "Box Size Summary",
 ]
 
 OPTIONAL_SHEETS = [
     "Unmatched SKUs",
-    "Packing Detail",
     "Multi Box Detail",
     "Pledge Combination Summary",
+    "Packing Detail",
     "Input Column Mapping",
     "Errors and Warnings",
 ]
@@ -33,27 +34,10 @@ ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Total Units",
     "Box Qty",
     "Box Type",
-    "Length cm",
-    "Width cm",
-    "Height cm",
-    "Optimized Length cm",
-    "Optimized Width cm",
-    "Optimized Height cm",
-    "Assigned Box Length cm",
-    "Assigned Box Width cm",
-    "Assigned Box Height cm",
-    "Box Standardization Note",
-    "Actual Item Weight lb",
-    "Packed Actual Weight lb (+15%)",
-    "Bundled/Padded Volume cm³",
-    "Dimensional Weight lb",
-    "Chargeable Weight lb",
-    "Distinct SKUs",
-    "SKU Breakdown",
     "Box Plan",
-    "Warning Summary",
+    "Per-Box Chargeable Weight",
+    "SKU Breakdown",
 ]
-
 
 _UNIT_HINTS = {
     "length": "cm",
@@ -82,6 +66,8 @@ def _safe_sheet_name(name: str) -> str:
 def _header_with_units(header: str) -> str:
     normalized = header.lower()
     if header in ORDER_VOLUME_WEIGHTS_COLUMNS:
+        return header
+    if any(unit in normalized for unit in [" cm", " kg", " lb"]) or normalized.endswith(" g"):
         return header
     if "(" in header and ")" in header:
         return header
@@ -292,6 +278,7 @@ def _build_sheet_payloads(
     aliases = {
         "summary_rows": "Summary",
         "order_volume_weights_rows": "Order Volume Weights",
+        "optimized_to_pack_rows": "Optimized to Pack",
         "box_size_summary_rows": "Box Size Summary",
         "unmatched_skus_rows": "Unmatched SKUs",
         "packing_detail_rows": "Packing Detail",

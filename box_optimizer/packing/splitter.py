@@ -87,6 +87,71 @@ def _score_cartons(cartons: list[OptimizedCartonResult]) -> tuple[float, float]:
     )
 
 
+def _fast_greedy_split(items: list[PackedItem]) -> SplitResult:
+    """Deterministically split into as few capped cartons as practical."""
+    groups: list[list[PackedItem]] = []
+    best_failure: list[PackedItem] = []
+
+    for item in items:
+        placed = False
+        best_group_index: int | None = None
+        best_group_result: OptimizedCartonResult | None = None
+        best_score: tuple[float, float] | None = None
+
+        for index, group in enumerate(groups):
+            candidate_group = [*group, item]
+            candidate_result = optimize_carton_dimensions_fast(candidate_group)
+            if not candidate_result.success:
+                best_failure = candidate_result.unplaced_items
+                continue
+            score = (
+                candidate_result.chargeable_weight_kg or 0,
+                candidate_result.volume_cm3 or 0,
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_group_index = index
+                best_group_result = candidate_result
+
+        if best_group_index is not None and best_group_result is not None:
+            groups[best_group_index].append(item)
+            placed = True
+
+        if not placed:
+            single_result = optimize_carton_dimensions_fast([item])
+            if not single_result.success:
+                return SplitResult(
+                    success=False,
+                    box_qty=0,
+                    cartons=[],
+                    unplaced_items=single_result.unplaced_items or [item],
+                )
+            groups.append([item])
+
+    cartons = []
+    for index, group in enumerate(groups, start=1):
+        result = optimize_carton_dimensions_fast(group)
+        if not result.success:
+            best_failure = result.unplaced_items
+            continue
+        cartons.append(
+            SplitCarton(
+                box_number=index,
+                result=result,
+                warning="Split created because items could not fit existing capped cartons." if len(groups) > 1 else "",
+            )
+        )
+
+    if len(cartons) == len(groups):
+        return SplitResult(
+            success=True,
+            box_qty=len(cartons),
+            cartons=cartons,
+            unplaced_items=[],
+        )
+    return SplitResult(False, 0, [], best_failure)
+
+
 def split_order_into_cartons(
     items: list[PackedItem],
     packing_mode: str = "normal",
@@ -146,36 +211,8 @@ def split_order_into_cartons(
 
     best_failure = single_box.unplaced_items
     if packing_mode == "fast":
-        cartons = []
-        unplaced = []
-        for index, item in enumerate(expanded_items, start=1):
-            carton = optimize_carton_dimensions_fast([item])
-            if carton.success:
-                cartons.append(
-                    SplitCarton(
-                        box_number=index,
-                        result=carton,
-                        box_type=item.box_type,
-                        rule_applied=item.rule_applied,
-                        warning=item.warning_note,
-                        dimensions_are_final=False,
-                    )
-                )
-            else:
-                unplaced.extend(carton.unplaced_items or [item])
-        if cartons and not unplaced:
-            return SplitResult(
-                success=True,
-                box_qty=len(cartons),
-                cartons=cartons,
-                unplaced_items=[],
-            )
-        return SplitResult(
-            success=False,
-            box_qty=0,
-            cartons=[],
-            unplaced_items=unplaced or best_failure,
-        )
+        result = _fast_greedy_split(expanded_items)
+        return result if result.success else SplitResult(False, 0, [], result.unplaced_items or best_failure)
 
     for box_count in range(2, len(expanded_items) + 1):
         best: tuple[tuple[float, float], list[OptimizedCartonResult]] | None = None
