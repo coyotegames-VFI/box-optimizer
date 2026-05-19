@@ -1,5 +1,7 @@
+import base64
 import csv
 from io import StringIO
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -79,6 +81,37 @@ def _orders_file_two_orders():
     )
 
 
+def _base64_text(content: bytes) -> str:
+    return base64.b64encode(content).decode("ascii")
+
+
+def _base64_csv_payload(config_json=None) -> dict:
+    sku_name, sku_content, _sku_type = _sku_master_file()
+    orders_name, orders_content, _orders_type = _orders_file()
+    payload = {
+        "sku_master_filename": sku_name,
+        "sku_master_base64": _base64_text(sku_content),
+        "orders_filename": orders_name,
+        "orders_base64": _base64_text(orders_content),
+    }
+    if config_json is not None:
+        payload["config_json"] = config_json
+    return payload
+
+
+def _base64_example_workbook_payload(config_json=None) -> dict:
+    root = Path(__file__).resolve().parents[1]
+    payload = {
+        "sku_master_filename": "sku_master.xlsx",
+        "sku_master_base64": _base64_text((root / "examples" / "sku_master.xlsx").read_bytes()),
+        "orders_filename": "orders.xlsx",
+        "orders_base64": _base64_text((root / "examples" / "orders.xlsx").read_bytes()),
+    }
+    if config_json is not None:
+        payload["config_json"] = config_json
+    return payload
+
+
 def _mixed_sku_master_file():
     return (
         "sku_master.csv",
@@ -149,6 +182,31 @@ def test_openapi_json_is_exposed():
 
     assert response.status_code == 200
     assert response.json()["info"]["title"] == "box_optimizer"
+
+
+def test_openapi_includes_base64_action_endpoints_with_explicit_schemas():
+    client = TestClient(app)
+
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    schema = response.json()
+    assert "/inspect_base64" in schema["paths"]
+    assert "/optimize_base64" in schema["paths"]
+    assert "status" in schema["components"]["schemas"]["HealthResponse"]["properties"]
+    assert "git_commit" in schema["components"]["schemas"]["VersionResponse"]["properties"]
+    assert "properties" in schema["components"]["schemas"]["InspectSummaryResponse"]
+    assert "sku_items" in schema["components"]["schemas"]["InspectSummaryResponse"]["properties"]
+    optimize_schema = schema["components"]["schemas"]["OptimizeBase64Response"]
+    assert set(optimize_schema["properties"]) >= {"filename", "content_type", "workbook_base64", "summary"}
+    request_schema = schema["components"]["schemas"]["Base64WorkbookRequest"]
+    assert set(request_schema["properties"]) >= {
+        "sku_master_filename",
+        "sku_master_base64",
+        "orders_filename",
+        "orders_base64",
+        "config_json",
+    }
 
 
 def test_version_returns_json():
@@ -228,6 +286,88 @@ def test_config_json_accepts_sku_rules_and_inspect_reports_rule_keys(monkeypatch
     body = response.json()
     assert body["matched_rule_keys"] == ["Core Game"]
     assert body["unmatched_rule_keys"] == ["Missing Rule"]
+
+
+def test_inspect_base64_accepts_xlsx_workbooks(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/inspect_base64",
+        json=_base64_example_workbook_payload(
+            {"max_orders": 1, "debug": True, "packing_mode": "fast"}
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sku_items"] > 0
+    assert body["order_rows"] > 0
+    assert body["matched"] > 0
+    assert "elapsed_seconds" in body
+
+
+def test_inspect_base64_accepts_config_json_string(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/inspect_base64",
+        json=_base64_csv_payload('{"max_orders": 1, "packing_mode": "fast"}'),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["order_lines"] == 1
+    assert body["matched"] == 1
+
+
+def test_optimize_base64_returns_json_workbook(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize_base64",
+        json=_base64_example_workbook_payload(
+            {
+                "max_orders": 1,
+                "packing_mode": "fast",
+                "output_granularity": "order_summary",
+                "preserve_region_sheets": False,
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "optimized_shipping_plan.xlsx"
+    assert body["content_type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert base64.b64decode(body["workbook_base64"])[:2] == b"PK"
+    assert body["summary"]["orders_processed"] == 1
+    assert "elapsed_seconds" in body["summary"]
+
+
+def test_inspect_base64_requires_api_key_when_environment_variable_is_set(monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_API_KEY", "secret")
+    client = TestClient(app)
+
+    response = client.post("/inspect_base64", json=_base64_csv_payload())
+
+    assert response.status_code == 401
+
+
+def test_optimize_base64_accepts_authorization_bearer_header(monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_API_KEY", " secret ")
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize_base64",
+        headers={"Authorization": "Bearer  secret "},
+        json=_base64_csv_payload({"packing_mode": "fast"}),
+    )
+
+    assert response.status_code == 200
+    assert base64.b64decode(response.json()["workbook_base64"])[:2] == b"PK"
 
 
 def test_optimize_requires_api_key_when_environment_variable_is_set(monkeypatch):
