@@ -2,19 +2,22 @@
 
 import base64
 import binascii
+import html
 import logging
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copyfileobj, rmtree
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from box_optimizer.models import (
@@ -32,6 +35,15 @@ from box_optimizer.workflow import inspect_workbook, optimize_workbook
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("box_optimizer")
+
+DEFAULT_UPLOAD_CONFIG = {
+    "debug": True,
+    "packing_mode": "fast",
+    "output_granularity": "order_summary",
+    "preserve_region_sheets": False,
+}
+JOB_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+WORKBOOK_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 app = FastAPI(
     title="box_optimizer",
@@ -116,6 +128,16 @@ class OptimizeBase64Response(BaseModel):
     content_type: str
     workbook_base64: str
     summary: OptimizeSummaryResponse
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+    expires_at: str
+    summary: OptimizeSummaryResponse | None = None
+    download_url: str | None = None
+    error: str | None = None
 
 
 def _log_event(event: str, **fields) -> None:
@@ -260,6 +282,188 @@ def _save_base64_request_files(payload: Base64WorkbookRequest, work_dir: Path) -
     return sku_master_path, orders_path
 
 
+def _upload_suffix_strict(upload: UploadFile, label: str) -> str:
+    suffix = Path(upload.filename or "").suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise HTTPException(status_code=400, detail=f"{label} must be a .csv or .xlsx file")
+    return suffix
+
+
+def _jobs_root() -> Path:
+    root = Path(os.getenv("BOX_OPTIMIZER_JOBS_DIR") or Path(tempfile.gettempdir()) / "box_optimizer_jobs")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _job_dir(job_id: str) -> Path:
+    if not JOB_ID_PATTERN.fullmatch(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _jobs_root() / job_id
+
+
+def _job_ttl_seconds() -> float:
+    raw = os.getenv("BOX_OPTIMIZER_JOB_TTL_HOURS", "24")
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 24.0
+    return max(hours, 1.0) * 3600
+
+
+def _cleanup_expired_jobs() -> None:
+    root = _jobs_root()
+    cutoff = time.time() - _job_ttl_seconds()
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            if child.stat().st_mtime < cutoff:
+                rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _upload_access_token() -> str:
+    return (os.getenv("BOX_OPTIMIZER_UPLOAD_TOKEN") or "").strip()
+
+
+def _require_upload_access(upload_token: str | None = None, token: str | None = None) -> str:
+    expected = _upload_access_token()
+    provided = (upload_token or token or "").strip()
+    if expected and provided != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing upload access token")
+    return provided
+
+
+def _token_query(upload_token: str | None) -> str:
+    expected = _upload_access_token()
+    if not expected:
+        return ""
+    return f"?upload_token={quote(upload_token or '')}"
+
+
+def _default_upload_config_text() -> str:
+    return json.dumps(DEFAULT_UPLOAD_CONFIG, indent=2)
+
+
+def _html_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        status_code=status_code,
+        content=f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 2rem; max-width: 880px; line-height: 1.4; }}
+    label {{ display: block; font-weight: 700; margin-top: 1rem; }}
+    input[type=file], textarea {{ display: block; width: 100%; margin-top: .35rem; }}
+    textarea {{ min-height: 9rem; font-family: Consolas, monospace; }}
+    button, .button {{ display: inline-block; margin-top: 1.25rem; padding: .65rem 1rem; background: #174ea6; color: white; border: 0; border-radius: 4px; text-decoration: none; cursor: pointer; }}
+    .summary {{ border: 1px solid #ddd; padding: 1rem; border-radius: 6px; background: #fafafa; }}
+    .error {{ border: 1px solid #b00020; padding: 1rem; border-radius: 6px; background: #fff4f4; color: #7a0015; }}
+    .muted {{ color: #555; }}
+    li {{ margin-bottom: .25rem; }}
+  </style>
+</head>
+<body>
+{body}
+</body>
+</html>""",
+    )
+
+
+def _upload_form_html(config_text: str, upload_token: str | None = None, error: str | None = None) -> HTMLResponse:
+    safe_config = html.escape(config_text or _default_upload_config_text())
+    hidden_token = html.escape(upload_token or "")
+    error_html = f'<div class="error"><strong>Something needs attention:</strong> {html.escape(error)}</div>' if error else ""
+    return _html_page(
+        "Box Optimizer Upload",
+        f"""
+<h1>Box Optimizer Upload</h1>
+<p class="muted">Upload the two campaign files, then run the optimizer. The file names do not need to follow a special pattern.</p>
+{error_html}
+<form action="/upload" method="post" enctype="multipart/form-data">
+  <input type="hidden" name="upload_token" value="{hidden_token}">
+  <label for="sku_master_file">Put your SKU file here</label>
+  <input id="sku_master_file" name="sku_master_file" type="file" accept=".csv,.xlsx" required>
+
+  <label for="orders_file">Put your orders file here</label>
+  <input id="orders_file" name="orders_file" type="file" accept=".csv,.xlsx" required>
+
+  <details>
+    <summary>Advanced settings</summary>
+    <label for="config_json">Optional packing instructions generated by GPT</label>
+    <textarea id="config_json" name="config_json">{safe_config}</textarea>
+  </details>
+
+  <button type="submit">Run Optimization</button>
+</form>
+""",
+    )
+
+
+def _summary_value(summary: dict, key: str) -> str:
+    value = summary.get(key)
+    return html.escape(str(value if value is not None else ""))
+
+
+def _result_page(record: dict, upload_token: str | None = None, status_code: int = 200) -> HTMLResponse:
+    summary = record.get("summary") or {}
+    warnings = summary.get("warnings") or []
+    warning_items = "".join(f"<li>{html.escape(str(warning))}</li>" for warning in warnings) or "<li>No workflow warnings.</li>"
+    download_url = f"/jobs/{record['job_id']}/download{_token_query(upload_token)}"
+    status_url = f"/jobs/{record['job_id']}{_token_query(upload_token)}"
+    return _html_page(
+        "Box Optimizer Results",
+        f"""
+<h1>Optimization Results</h1>
+<div class="summary">
+  <p><strong>Job ID:</strong> {html.escape(record['job_id'])}</p>
+  <p><strong>Orders processed:</strong> {_summary_value(summary, 'orders_processed')}</p>
+  <p><strong>Boxes created:</strong> {_summary_value(summary, 'boxes_created')}</p>
+  <p><strong>Box types used:</strong> {_summary_value(summary, 'box_types')}</p>
+  <p><strong>Unmatched SKUs:</strong> {_summary_value(summary, 'unmatched_skus')}</p>
+  <p><strong>Warning count:</strong> {_summary_value(summary, 'warning_count')}</p>
+  <a class="button" href="{html.escape(download_url)}">Download optimized workbook</a>
+  <p><a href="{html.escape(status_url)}">View job status as JSON</a></p>
+</div>
+<h2>Warnings</h2>
+<ul>{warning_items}</ul>
+""",
+        status_code=status_code,
+    )
+
+
+def _error_page(message: str, upload_token: str | None = None, status_code: int = 400) -> HTMLResponse:
+    return _html_page(
+        "Box Optimizer Error",
+        f"""
+<h1>Optimization could not finish</h1>
+<div class="error">{html.escape(message)}</div>
+<p><a href="/upload{html.escape(_token_query(upload_token))}">Return to upload page</a></p>
+""",
+        status_code=status_code,
+    )
+
+
+def _write_job_record(job_dir: Path, record: dict) -> None:
+    (job_dir / "summary.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
+def _read_job_record(job_id: str) -> dict:
+    job_dir = _job_dir(job_id)
+    summary_path = job_dir / "summary.json"
+    if not summary_path.exists():
+        raise HTTPException(status_code=404, detail="Job not found")
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
+def _job_expiration(created_at_seconds: float) -> str:
+    return datetime.fromtimestamp(created_at_seconds + _job_ttl_seconds(), timezone.utc).isoformat()
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     """Health check endpoint."""
@@ -277,6 +481,131 @@ def version() -> VersionResponse:
         or os.getenv("GIT_COMMIT")
         or "unknown",
     }
+
+
+@app.get("/upload", response_class=HTMLResponse, include_in_schema=False)
+def upload_page(
+    upload_token: str | None = None,
+    token: str | None = None,
+    job_config: str | None = None,
+):
+    """Return an employee-friendly upload page for daily optimizer use."""
+    try:
+        provided_token = _require_upload_access(upload_token=upload_token, token=token)
+    except HTTPException as exc:
+        return _error_page(str(exc.detail), status_code=exc.status_code)
+    config_text = job_config or _default_upload_config_text()
+    return _upload_form_html(config_text=config_text, upload_token=provided_token)
+
+
+@app.post("/upload", response_class=HTMLResponse, include_in_schema=False)
+def upload_workbooks(
+    sku_master_file: UploadFile = File(...),
+    orders_file: UploadFile = File(...),
+    config_json: str | None = Form(default=None),
+    upload_token: str | None = Form(default=None),
+):
+    """Run the existing optimizer from the employee upload page and return an HTML result."""
+    started = time.perf_counter()
+    job_id = uuid4().hex
+    created_seconds = time.time()
+    job_dir = _jobs_root() / job_id
+    try:
+        provided_token = _require_upload_access(upload_token=upload_token)
+    except HTTPException as exc:
+        return _error_page(str(exc.detail), status_code=exc.status_code)
+
+    try:
+        _cleanup_expired_jobs()
+        job_dir.mkdir(parents=True, exist_ok=False)
+        config = _parse_config(config_json or DEFAULT_UPLOAD_CONFIG)
+        if config.get("debug"):
+            logger.setLevel(logging.DEBUG)
+
+        sku_master_path = _save_upload(
+            sku_master_file,
+            job_dir,
+            f"sku_master{_upload_suffix_strict(sku_master_file, 'SKU file')}",
+        )
+        orders_path = _save_upload(
+            orders_file,
+            job_dir,
+            f"orders{_upload_suffix_strict(orders_file, 'Orders file')}",
+        )
+        output_path = job_dir / "optimized_shipping_plan.xlsx"
+        summary = optimize_workbook(
+            sku_master_path=str(sku_master_path),
+            orders_path=str(orders_path),
+            output_path=str(output_path),
+            config=config,
+        )
+        summary["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        record = {
+            "job_id": job_id,
+            "status": "completed",
+            "created_at": datetime.fromtimestamp(created_seconds, timezone.utc).isoformat(),
+            "expires_at": _job_expiration(created_seconds),
+            "summary": summary,
+            "download_url": f"/jobs/{job_id}/download",
+            "error": None,
+        }
+        _write_job_record(job_dir, record)
+        return _result_page(record, upload_token=provided_token)
+    except HTTPException as exc:
+        record = {
+            "job_id": job_id,
+            "status": "failed",
+            "created_at": datetime.fromtimestamp(created_seconds, timezone.utc).isoformat(),
+            "expires_at": _job_expiration(created_seconds),
+            "summary": None,
+            "download_url": None,
+            "error": str(exc.detail),
+        }
+        job_dir.mkdir(parents=True, exist_ok=True)
+        _write_job_record(job_dir, record)
+        return _error_page(str(exc.detail), upload_token=provided_token, status_code=exc.status_code)
+    except Exception as exc:
+        logger.exception("upload optimization failed")
+        message = f"The optimizer could not finish this job: {exc}"
+        record = {
+            "job_id": job_id,
+            "status": "failed",
+            "created_at": datetime.fromtimestamp(created_seconds, timezone.utc).isoformat(),
+            "expires_at": _job_expiration(created_seconds),
+            "summary": None,
+            "download_url": None,
+            "error": message,
+        }
+        job_dir.mkdir(parents=True, exist_ok=True)
+        _write_job_record(job_dir, record)
+        return _error_page(message, upload_token=provided_token, status_code=500)
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+def job_status(job_id: str, upload_token: str | None = None, token: str | None = None):
+    """Return compact status and summary for an upload job."""
+    _require_upload_access(upload_token=upload_token, token=token)
+    _cleanup_expired_jobs()
+    return _read_job_record(job_id)
+
+
+@app.get("/jobs/{job_id}/download")
+def job_download(job_id: str, upload_token: str | None = None, token: str | None = None) -> FileResponse:
+    """Download the optimized XLSX output for an upload job."""
+    _require_upload_access(upload_token=upload_token, token=token)
+    _cleanup_expired_jobs()
+    job_dir = _job_dir(job_id)
+    record = _read_job_record(job_id)
+    if record.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Job is not complete")
+    output_path = job_dir / "optimized_shipping_plan.xlsx"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Optimized workbook not found")
+    return FileResponse(
+        path=str(output_path),
+        media_type=WORKBOOK_CONTENT_TYPE,
+        filename="optimized_shipping_plan.xlsx",
+    )
 
 
 @app.post("/inspect", dependencies=[Depends(require_api_key)])
@@ -402,7 +731,7 @@ def optimize_base64(payload: Base64WorkbookRequest):
     stage = "request_received"
     run_id = uuid4().hex
     work_dir: Path | None = None
-    content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    content_type = WORKBOOK_CONTENT_TYPE
     output_filename = "optimized_shipping_plan.xlsx"
     try:
         _log_event("request_received", endpoint="/optimize_base64", run_id=run_id)
@@ -510,7 +839,7 @@ def optimize(
         )
         return FileResponse(
             path=str(output_path),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type=WORKBOOK_CONTENT_TYPE,
             filename="optimized_shipping_plan.xlsx",
         )
     except HTTPException as exc:
