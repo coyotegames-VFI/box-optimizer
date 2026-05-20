@@ -218,6 +218,29 @@ def test_requested_5_no_placed_items_overlap():
             )
 
 
+
+def test_pack_items_backtracks_for_flat_layered_layout():
+    result = pack_items(
+        items=[
+            _item("dice-tray", Dimensions(20.32, 20.32, 1), 0.1),
+            _item("operative", Dimensions(25.8, 16.6, 6.3), 1.7),
+            _item("sleeve-1", Dimensions(17.5, 10, 4), 0.88),
+            _item("sleeve-2", Dimensions(17.5, 10, 4), 0.88),
+        ],
+        carton_dimensions=Dimensions(26, 36, 14),
+    )
+
+    assert result.success is True
+    assert {placement.canonical_sku for placement in result.placements} == {
+        "dice-tray",
+        "operative",
+        "sleeve-1",
+        "sleeve-2",
+    }
+    for index, first in enumerate(result.placements):
+        for second in result.placements[index + 1 :]:
+            assert not boxes_overlap(first.origin, first.dimensions, second.origin, second.dimensions)
+
 def test_optimize_carton_dimensions_finds_smallest_side_by_side_carton():
     result = optimize_carton_dimensions(
         [_item("cube", Dimensions(5, 5, 5), 1, quantity=2)]

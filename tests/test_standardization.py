@@ -213,6 +213,40 @@ def test_vendor_box_menu_can_use_full_list_beyond_old_cap():
     assert assignments[0].assigned_height_cm == 38
 
 
+
+
+def test_vendor_box_menu_uses_preferred_fallback_when_non_preferred_demand_is_below_threshold():
+    assignments = standardize_optimized_cartons(
+        [_optimized("order-1", "Combo x1", Dimensions(54.3, 36.6, 10.3), chargeable_weight_kg=5)],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        non_preferred_box_min_units=100,
+    )
+
+    assert assignments[0].box_type == "Vendor Box 36"
+    assert assignments[0].vendor_box_id == "36"
+    assert assignments[0].selection_decision == "preferred_fallback_higher_band"
+    assert "non-preferred demand is below 100" in assignments[0].box_standardization_note
+
+
+def test_vendor_box_menu_uses_non_preferred_box_when_threshold_is_met():
+    cartons = [
+        _optimized(f"order-{index}", "Combo x1", Dimensions(54.3, 36.6, 10.3), chargeable_weight_kg=5)
+        for index in range(100)
+    ]
+
+    assignments = standardize_optimized_cartons(
+        cartons,
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        non_preferred_box_min_units=100,
+    )
+
+    assert {assignment.box_type for assignment in assignments} == {"Vendor Box 42"}
+    assert {assignment.vendor_box_id for assignment in assignments} == {"42"}
+    assert {assignment.selection_decision for assignment in assignments} == {"non_preferred_threshold_met"}
+    assert all("demand 100 meets 100 carton threshold" in assignment.box_standardization_note for assignment in assignments)
+
 def test_vendor_box_menu_uses_custom_box_when_400_carton_minimum_is_met():
     cartons = [
         _optimized(f"order-{index}", "Same x1", Dimensions(74, 37, 38), chargeable_weight_kg=21)

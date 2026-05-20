@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     "use_vendor_box_menu": True,
     "billing_band_kg": 1.0,
     "custom_box_min_units": 400,
+    "non_preferred_box_min_units": 100,
     "preserve_region_sheets": True,
     "debug": False,
     "max_orders": None,
@@ -1214,6 +1215,7 @@ def _config_cache_signature(cfg: dict) -> dict:
         "use_vendor_box_menu": cfg.get("use_vendor_box_menu"),
         "billing_band_kg": cfg.get("billing_band_kg"),
         "custom_box_min_units": cfg.get("custom_box_min_units"),
+        "non_preferred_box_min_units": cfg.get("non_preferred_box_min_units"),
         "box_menu": cfg.get("box_menu"),
         "order_rules": cfg.get("order_rules"),
         "max_carton_cm": cfg.get("max_carton_cm"),
@@ -1517,7 +1519,6 @@ def _box_size_summary(box_rows: list[dict]) -> list[dict]:
                 "Box Count": summary["Box Count"],
                 "Order Count": len(summary["Order IDs"]),
                 "Unit Count": summary["Unit Count"],
-                "Average Chargeable Weight kg": _format_weight_display(sum(weights) / len(weights)),
                 "Max Chargeable Weight kg": _format_weight_display(max(weights)),
                 "Regions Used": " | ".join(sorted(summary["Regions Used"])),
             }
@@ -1663,9 +1664,9 @@ def _order_summary_rows(
     for order_id, order_box_rows in rows_by_order.items():
         lines = grouped_orders[order_id]
         first_line = lines[0]
-        packed_weight = sum(float(row["Packed Actual Weight kg"]) for row in order_box_rows)
+        packed_weight = packed_actual_weight_kg(_actual_weight_kg(items_by_order[order_id]))
         dim_weight = sum(float(row["Dimensional Weight kg (/5000)"]) for row in order_box_rows)
-        chargeable = sum(float(row["Chargeable Weight kg"]) for row in order_box_rows)
+        chargeable = sum(float(row["Chargeable Weight g"]) / 1000 for row in order_box_rows)
         box_qty = int(float(order_box_rows[0]["Box Qty"]))
         row = {
             "Region": first_line.region or "",
@@ -1951,6 +1952,7 @@ def optimize_workbook(
             use_vendor_box_menu=cfg.get("use_vendor_box_menu", True),
             billing_band_kg=cfg.get("billing_band_kg", 1.0),
             custom_box_min_units=cfg.get("custom_box_min_units", 400),
+            non_preferred_box_min_units=cfg.get("non_preferred_box_min_units", 100),
         )
     except Exception as exc:
         warning_rows.append(

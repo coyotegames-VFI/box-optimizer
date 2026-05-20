@@ -1,5 +1,6 @@
 """Deterministic heuristic 3D packer."""
 
+from collections import Counter
 from dataclasses import dataclass
 from dataclasses import replace
 from itertools import product
@@ -212,6 +213,116 @@ def _find_best_placement(
     return None if best is None else best[1]
 
 
+
+def _placement_bounds(placements: list[Placement]) -> tuple[float, float, float]:
+    if not placements:
+        return (0.0, 0.0, 0.0)
+    return (
+        max(placement.origin[0] + placement.dimensions.length for placement in placements),
+        max(placement.origin[1] + placement.dimensions.width for placement in placements),
+        max(placement.origin[2] + placement.dimensions.height for placement in placements),
+    )
+
+
+def _candidate_placements_for_item(
+    item: PackedItem,
+    carton_dimensions: Dimensions,
+    placements: list[Placement],
+) -> list[tuple[tuple[float, ...], Placement]]:
+    candidates = []
+    for point in _candidate_points(placements):
+        for rotation in _rotations_for_item(item):
+            if not fits_within_boundaries(rotation, carton_dimensions, point):
+                continue
+            if _overlaps_existing(point, rotation, placements):
+                continue
+
+            x, y, z = point
+            candidate = Placement(
+                canonical_sku=item.canonical_sku,
+                quantity=1,
+                dimensions=rotation,
+                origin=point,
+                weight_kg=item.weight_kg,
+            )
+            next_placements = [*placements, candidate]
+            used_length, used_width, used_height = _placement_bounds(next_placements)
+            score = (
+                used_height,
+                used_width,
+                used_length,
+                z,
+                y,
+                x,
+                rotation.height,
+                rotation.width,
+                rotation.length,
+            )
+            candidates.append((score, candidate))
+    return sorted(candidates, key=lambda candidate: candidate[0])
+
+
+def _pack_items_with_backtracking(
+    items: list[PackedItem],
+    carton_dimensions: Dimensions,
+    max_nodes: int = 20000,
+) -> PackingResult:
+    """Try a bounded small-order search when the greedy pass paints itself into a corner."""
+    expanded = _sort_items(_expand_items(items))
+    if len(expanded) > 8:
+        return PackingResult(success=False, placements=[], unplaced_items=expanded)
+
+    best_partial: list[Placement] = []
+    best_success: list[Placement] | None = None
+    nodes = 0
+
+    def search(remaining: list[PackedItem], placements: list[Placement]) -> bool:
+        nonlocal best_partial, best_success, nodes
+        nodes += 1
+        if nodes > max_nodes:
+            return False
+        if len(placements) > len(best_partial):
+            best_partial = list(placements)
+        if not remaining:
+            best_success = list(placements)
+            return True
+
+        # Prefer the item with the fewest currently feasible placements. This avoids
+        # spending the small search budget on easy pieces while a constrained flat
+        # item gets boxed out by an earlier rotation.
+        options_by_index = []
+        for index, item in enumerate(remaining):
+            options = _candidate_placements_for_item(item, carton_dimensions, placements)
+            if not options:
+                return False
+            options_by_index.append((len(options), -volume(item.padded_dimensions), index, options))
+        _count, _volume_score, index, options = min(options_by_index, key=lambda value: value[:3])
+        item = remaining[index]
+        next_remaining = [*remaining[:index], *remaining[index + 1 :]]
+
+        for _score, placement in options:
+            if search(next_remaining, [*placements, placement]):
+                return True
+        return False
+
+    success = search(expanded, [])
+    if success and best_success is not None:
+        return PackingResult(success=True, placements=best_success, unplaced_items=[])
+
+    placed_keys = Counter((p.canonical_sku, p.weight_kg, p.dimensions) for p in best_partial)
+    unplaced = []
+    for item in expanded:
+        key_options = [
+            (item.canonical_sku, item.weight_kg, rotation)
+            for rotation in _rotations_for_item(item)
+        ]
+        matched_key = next((key for key in key_options if placed_keys.get(key, 0) > 0), None)
+        if matched_key:
+            placed_keys[matched_key] -= 1
+        else:
+            unplaced.append(item)
+    return PackingResult(success=False, placements=best_partial, unplaced_items=unplaced or expanded[len(best_partial):])
+
 def pack_items(
     items: list[PackedItem],
     carton_dimensions: Dimensions,
@@ -227,11 +338,18 @@ def pack_items(
             continue
         placements.append(placement)
 
-    return PackingResult(
+    greedy_result = PackingResult(
         success=not unplaced_items,
         placements=placements,
         unplaced_items=unplaced_items,
     )
+    if greedy_result.success:
+        return greedy_result
+
+    fallback_result = _pack_items_with_backtracking(items, carton_dimensions)
+    if fallback_result.success or len(fallback_result.placements) > len(greedy_result.placements):
+        return fallback_result
+    return greedy_result
 
 
 def _awkward_dimension_count(dimensions: Dimensions) -> int:

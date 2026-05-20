@@ -816,6 +816,7 @@ def test_box_size_summary_includes_usage_counts(tmp_path):
     rows = _sheet_rows(output_path, "Box Size Summary")
     assert "Box Count" in rows[0]
     assert "Order Count" in rows[0]
+    assert "Average Chargeable Weight kg" not in rows[0]
     assert int(float(rows[0]["Box Count"])) == 2
     assert int(float(rows[0]["Order Count"])) == 2
 
@@ -930,6 +931,83 @@ def test_display_carton_dimensions_are_whole_centimeters_rounded_up(tmp_path):
             for column in [key for key in row if key.endswith("Length cm") or key.endswith("Width cm") or key.endswith("Height cm")]:
                 assert float(row[column]).is_integer()
                 assert "." not in row[column]
+
+
+def test_single_box_order_packed_actual_weight_totals_all_skus(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Core", "Product Name": "Core", "Length": "5", "Width": "5", "Height": "5", "Weight kg": "1.04"},
+            {"SKU": "Addon", "Product Name": "Addon", "Length": "4", "Width": "4", "Height": "2", "Weight kg": "0.36"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "Core", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Addon", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"preserve_region_sheets": False},
+    )
+
+    order_row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    detail_rows = _sheet_rows(output_path, "Multi Box Detail")
+    expected = format_kg_display(packed_actual_weight_kg(1.04 + 0.36))
+    assert len(detail_rows) == 1
+    assert float(order_row["Packed Actual Weight kg"]) == expected
+    assert float(order_row["Packed Actual Weight kg"]) == float(detail_rows[0]["Packed Actual Weight kg"])
+    assert float(order_row["Packed Actual Weight kg"]) not in {
+        format_kg_display(packed_actual_weight_kg(1.04)),
+        format_kg_display(packed_actual_weight_kg(0.36)),
+    }
+
+
+def test_multi_box_order_packed_actual_weight_sums_raw_carton_weights(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Solo", "Product Name": "Solo", "Length": "8", "Width": "6", "Height": "4", "Weight kg": "1.04"},
+            {"SKU": "Addon", "Product Name": "Addon", "Length": "7", "Width": "5", "Height": "3", "Weight kg": "1.04"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "Solo", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Addon", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "sku_rules": {"Solo": {"can_mix_with_other_items": False}},
+            "preserve_region_sheets": False,
+        },
+    )
+
+    order_row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    detail_rows = _sheet_rows(output_path, "Multi Box Detail")
+    expected = format_kg_display(packed_actual_weight_kg(1.04 + 1.04))
+    displayed_detail_sum = sum(float(row["Packed Actual Weight kg"]) for row in detail_rows)
+    assert len(detail_rows) == 2
+    assert float(order_row["Packed Actual Weight kg"]) == expected
+    assert float(order_row["Packed Actual Weight kg"]) >= displayed_detail_sum
+    assert float(order_row["Packed Actual Weight kg"]) - displayed_detail_sum <= 0.2
 
 
 def test_weight_display_truncates_to_one_decimal_without_changing_internal_math(tmp_path):
