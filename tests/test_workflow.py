@@ -525,7 +525,8 @@ def test_forced_box_cm_sets_assigned_box_dimensions(tmp_path):
 
     row = _sheet_rows(output_path, "Order Volume Weights")[0]
     detail_row = _sheet_rows(output_path, "Multi Box Detail")[0]
-    assert row["Box Type"] == "PREPACK-CORE-BOX"
+    assert "PREPACK-CORE-BOX" in row["Box Plan"]
+    assert detail_row["Box Type"] == "PREPACK-CORE-BOX"
     assert float(detail_row["Length cm"]) == 31
     assert float(detail_row["Width cm"]) == 22
     assert float(detail_row["Height cm"]) == 8
@@ -694,10 +695,10 @@ def test_default_order_summary_has_one_order_row_and_box_detail_rows(tmp_path):
     for row in order_rows:
         matching_detail = [detail for detail in multi_rows if detail["Order ID"] == row["Order ID"]]
         assert int(float(row["Box Qty"])) == len(matching_detail)
-        assert row["Box Type"] == " | ".join(sorted({detail["Box Type"] for detail in matching_detail}))
-        assert "MULTI-BOX" not in row["Box Type"]
+        assert "Box Type" not in row
         assert "Box Standardization Note" not in row
         assert "Box 1:" in row["Box Plan"]
+        assert all(detail["Box Type"] in row["Box Plan"] for detail in matching_detail)
 
 
 def test_workbook_presentation_tabs_and_compact_columns(tmp_path):
@@ -758,13 +759,16 @@ def test_workbook_presentation_tabs_and_compact_columns(tmp_path):
     assert order_rows["1"]["Country"] == "United States"
     assert order_rows["1"]["US State Abbreviation"] == "AE"
     assert order_rows["2"]["Country"] == "South Korea"
-    assert order_rows["1"]["Box Type"].startswith("All-in Storage Solution carton | VB ")
+    assert "Box Type" not in headers
+    assert "All-in Storage Solution carton" in order_rows["1"]["Box Plan"]
+    assert "VB " in order_rows["1"]["Box Plan"]
     assert "Box Plan" in headers
-    assert headers.index("Box Plan") == headers.index("Box Type") + 1
+    assert headers.index("Box Plan") == headers.index("Box Qty") + 1
     assert headers.index("Per-Box Chargeable Weight") == headers.index("Box Plan") + 1
     assert "All-in Storage Solution carton:" in order_rows["1"]["Per-Box Chargeable Weight"]
     assert "VB " in order_rows["1"]["Per-Box Chargeable Weight"]
     for removed in [
+        "Box Type",
         "Assigned Box Length cm",
         "Assigned Box Width cm",
         "Assigned Box Height cm",

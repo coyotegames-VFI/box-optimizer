@@ -33,7 +33,6 @@ ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Chargeable Weight g",
     "Total Units",
     "Box Qty",
-    "Box Type",
     "Box Plan",
     "Per-Box Chargeable Weight",
     "SKU Breakdown",

@@ -1680,7 +1680,6 @@ def _order_summary_rows(
             "Chargeable Weight g": int(chargeable * 1000),
             "Total Units": _total_units(lines),
             "Box Qty": box_qty,
-            "Box Type": _joined_box_types(order_box_rows),
             "Box Plan": _box_plan(order_box_rows),
             "Per-Box Chargeable Weight": _per_box_chargeable_weight_summary(order_box_rows),
             "SKU Breakdown": combo_by_order[order_id],

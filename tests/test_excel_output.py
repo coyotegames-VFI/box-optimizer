@@ -117,7 +117,7 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
     rows = read_workbook(str(path))[1].rows
     headers = list(rows[0].keys())
 
-    assert headers[:15] == [
+    assert headers[:14] == [
         "Region",
         "Order ID",
         "Country",
@@ -129,12 +129,11 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
         "Chargeable Weight g",
         "Total Units",
         "Box Qty",
-        "Box Type",
         "Box Plan",
         "Per-Box Chargeable Weight",
         "SKU Breakdown",
     ]
-    assert headers[15:] == ["Pledge Level", "Shipping Notes"]
+    assert headers[14:] == ["Pledge Level", "Shipping Notes"]
     assert rows[0]["Pledge Level"] == "Deluxe"
     assert rows[0]["Shipping Notes"] == "Leave at door"
 
