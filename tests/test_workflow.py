@@ -794,6 +794,91 @@ def test_workbook_presentation_tabs_and_compact_columns(tmp_path):
     assert "CORE x1" in optimized_rows[0]["Box 2"]
 
 
+
+
+def test_small_split_carton_uses_smaller_vendor_box_across_workbook_tabs(tmp_path, monkeypatch):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Large", "Product Name": "Large", "Length": "60", "Width": "30", "Height": "30", "Weight kg": "2"},
+            {"SKU": "Small Addons", "Product Name": "Small Addons", "Length": "20", "Width": "10", "Height": "4", "Weight kg": "0.5"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "Large", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "Small Addons", "Quantity": "1"},
+        ],
+    )
+
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+        by_sku = {item.canonical_sku: item for item in items}
+        large = by_sku["LARGE"]
+        small = by_sku["SMALL ADDONS"]
+        return SplitResult(
+            success=True,
+            box_qty=2,
+            cartons=[
+                SplitCarton(
+                    box_number=1,
+                    result=OptimizedCartonResult(
+                        success=True,
+                        length_cm=72,
+                        width_cm=34,
+                        height_cm=40,
+                        chargeable_weight_kg=20,
+                        volume_cm3=72 * 34 * 40,
+                        placements=[Placement("LARGE", 1, large.padded_dimensions, (0, 0, 0), large.weight_kg)],
+                        unplaced_items=[],
+                    ),
+                ),
+                SplitCarton(
+                    box_number=2,
+                    result=OptimizedCartonResult(
+                        success=True,
+                        length_cm=34,
+                        width_cm=24,
+                        height_cm=12,
+                        chargeable_weight_kg=3,
+                        volume_cm3=34 * 24 * 12,
+                        placements=[Placement("SMALL ADDONS", 1, small.padded_dimensions, (0, 0, 0), small.weight_kg)],
+                        unplaced_items=[],
+                    ),
+                ),
+            ],
+            unplaced_items=[],
+        )
+
+    monkeypatch.setattr("box_optimizer.workflow.split_order_into_cartons", fake_split_order_into_cartons)
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"packing_mode": "fast", "preserve_region_sheets": False},
+    )
+
+    order_row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    assert "Box Type" not in order_row
+    assert "VB 36" in order_row["Box Plan"]
+    assert "VB 16" in order_row["Box Plan"]
+    assert "VB 16:" in order_row["Per-Box Chargeable Weight"]
+
+    detail_types = {row["Box Type"] for row in _sheet_rows(output_path, "Multi Box Detail")}
+    assert detail_types == {"VB 36", "VB 16"}
+
+    box_summary_types = {row["Box Type"] for row in _sheet_rows(output_path, "Box Size Summary")}
+    assert {"VB 36", "VB 16"}.issubset(box_summary_types)
+
+    optimized_rows = _sheet_rows(output_path, "Optimized to Pack")
+    joined_boxes = " | ".join(value for key, value in optimized_rows[0].items() if key.startswith("Box "))
+    assert "VB 36:" in joined_boxes
+    assert "VB 16:" in joined_boxes
+
 def test_box_size_summary_includes_usage_counts(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
@@ -1746,3 +1831,124 @@ def test_default_order_volume_excludes_source_fields_but_keeps_real_metadata(tmp
 
     mapping_rows = _sheet_rows(output_path, "Input Column Mapping")
     assert mapping_rows[0]["workbook"]
+
+
+def test_balanced_workflow_prioritizes_high_volume_pledge_combinations(tmp_path, monkeypatch):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Rare", "Product Name": "Rare", "Length": "10", "Width": "8", "Height": "4", "Weight kg": "1"},
+            {"SKU": "Common", "Product Name": "Common", "Length": "10", "Width": "8", "Height": "4", "Weight kg": "1"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "Rare", "Quantity": "1"},
+            {"Order ID": "2", "SKU": "Common", "Quantity": "1"},
+            {"Order ID": "3", "SKU": "Common", "Quantity": "1"},
+        ],
+    )
+    calls = []
+
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+        calls.append((items[0].canonical_sku, packing_mode))
+        item = items[0]
+        return SplitResult(
+            success=True,
+            box_qty=1,
+            cartons=[
+                SplitCarton(
+                    box_number=1,
+                    result=OptimizedCartonResult(
+                        success=True,
+                        length_cm=10,
+                        width_cm=8,
+                        height_cm=4,
+                        chargeable_weight_kg=1,
+                        volume_cm3=320,
+                        placements=[Placement(item.canonical_sku, 1, item.padded_dimensions, (0, 0, 0), item.weight_kg)],
+                        unplaced_items=[],
+                    ),
+                )
+            ],
+            unplaced_items=[],
+        )
+
+    monkeypatch.setattr("box_optimizer.workflow.split_order_into_cartons", fake_split_order_into_cartons)
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"packing_mode": "balanced", "max_optimization_seconds": 180, "preserve_region_sheets": False},
+    )
+
+    assert calls[:2] == [("COMMON", "balanced"), ("RARE", "balanced")]
+
+
+def test_balanced_workflow_uses_fast_for_uncached_combo_when_budget_is_low(tmp_path, monkeypatch):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "A", "Product Name": "A", "Length": "10", "Width": "8", "Height": "4", "Weight kg": "1"},
+            {"SKU": "B", "Product Name": "B", "Length": "10", "Width": "8", "Height": "4", "Weight kg": "1"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "A", "Quantity": "1"},
+            {"Order ID": "2", "SKU": "B", "Quantity": "1"},
+        ],
+    )
+    calls = []
+    ticks = iter([0, 0, 100, 100, 100, 100, 100, 100, 100, 100])
+
+    def fake_perf_counter():
+        return next(ticks, 100)
+
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+        calls.append(packing_mode)
+        item = items[0]
+        return SplitResult(
+            success=True,
+            box_qty=1,
+            cartons=[
+                SplitCarton(
+                    box_number=1,
+                    result=OptimizedCartonResult(
+                        success=True,
+                        length_cm=10,
+                        width_cm=8,
+                        height_cm=4,
+                        chargeable_weight_kg=1,
+                        volume_cm3=320,
+                        placements=[Placement(item.canonical_sku, 1, item.padded_dimensions, (0, 0, 0), item.weight_kg)],
+                        unplaced_items=[],
+                    ),
+                )
+            ],
+            unplaced_items=[],
+        )
+
+    monkeypatch.setattr("box_optimizer.workflow.time.perf_counter", fake_perf_counter)
+    monkeypatch.setattr("box_optimizer.workflow.split_order_into_cartons", fake_split_order_into_cartons)
+
+    summary = optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"packing_mode": "balanced", "max_optimization_seconds": 1, "preserve_region_sheets": False},
+    )
+
+    assert summary["orders_processed"] == 2
+    assert output_path.read_bytes()[:2] == b"PK"
+    assert calls == ["fast", "fast"]
+

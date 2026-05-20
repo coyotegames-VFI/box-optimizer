@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "debug": False,
     "max_orders": None,
     "packing_mode": "normal",
+    "max_optimization_seconds": 180,
     "output_granularity": "order_summary",
 }
 
@@ -80,6 +81,19 @@ class CachedPackingPlan:
 
     split_result: SplitResult
     group_warnings: tuple[WorkflowWarning, ...] = ()
+
+
+@dataclass(frozen=True)
+class PackingOrderContext:
+    """Precomputed packing inputs for one order in the workflow cache loop."""
+
+    order_id: str
+    lines: list[OrderLine]
+    combo: str
+    items: list[PackedItem]
+    groups: list[RuleSplitGroup]
+    cache_key: str
+    first_index: int
 
 
 @dataclass(frozen=True)
@@ -1211,6 +1225,7 @@ def _group_cache_signature(group: RuleSplitGroup) -> dict:
 def _config_cache_signature(cfg: dict) -> dict:
     return {
         "packing_mode": cfg.get("packing_mode"),
+        "max_optimization_seconds": cfg.get("max_optimization_seconds"),
         "standardization_tolerance_cm": cfg.get("standardization_tolerance_cm"),
         "use_vendor_box_menu": cfg.get("use_vendor_box_menu"),
         "billing_band_kg": cfg.get("billing_band_kg"),
@@ -1825,14 +1840,75 @@ def optimize_workbook(
 
     packing_mode = cfg.get("packing_mode", "normal")
     _log_event("packing_started", order_count=len(grouped_orders), packing_mode=packing_mode)
-    for order_id, lines in grouped_orders.items():
+    order_contexts: list[PackingOrderContext] = []
+    for first_index, (order_id, lines) in enumerate(grouped_orders.items()):
         order_started = time.perf_counter()
         combo = _sku_breakdown(lines)
-        _log_event("order_packing_started", order_id=order_id, line_count=len(lines))
         try:
             items = _packed_items_for_order(lines, sku_items, sku_rules)
             groups = _split_rule_group_records(lines, sku_rules, cfg)
             cache_key = _packing_cache_key(combo, lines, items, groups, sku_rules, cfg)
+            order_contexts.append(
+                PackingOrderContext(
+                    order_id=order_id,
+                    lines=lines,
+                    combo=combo,
+                    items=items,
+                    groups=groups,
+                    cache_key=cache_key,
+                    first_index=first_index,
+                )
+            )
+        except Exception as exc:
+            failed_orders.append(order_id)
+            message = f"Order packing setup failed and was skipped: {exc}"
+            warning_rows.append(
+                WorkflowWarning(
+                    order_id=order_id,
+                    stage="packing",
+                    error_type=type(exc).__name__,
+                    message=message,
+                    sku_breakdown=combo,
+                )
+            )
+            _log_event(
+                "order_packing_failed",
+                order_id=order_id,
+                error_type=type(exc).__name__,
+                elapsed_seconds=round(time.perf_counter() - order_started, 3),
+            )
+
+    cache_key_counts = Counter(context.cache_key for context in order_contexts)
+    if packing_mode == "balanced":
+        packing_order = sorted(
+            order_contexts,
+            key=lambda context: (-cache_key_counts[context.cache_key], context.first_index),
+        )
+    else:
+        packing_order = order_contexts
+
+    packing_budget_start = time.perf_counter()
+    packing_budget_seconds = (
+        float(cfg.get("max_optimization_seconds") or DEFAULT_CONFIG["max_optimization_seconds"])
+        if packing_mode == "balanced"
+        else None
+    )
+
+    for context in packing_order:
+        order_started = time.perf_counter()
+        order_id = context.order_id
+        lines = context.lines
+        combo = context.combo
+        items = context.items
+        groups = context.groups
+        cache_key = context.cache_key
+        _log_event(
+            "order_packing_started",
+            order_id=order_id,
+            line_count=len(lines),
+            pledge_count=cache_key_counts[cache_key],
+        )
+        try:
             cached_plan = packing_cache.get(cache_key)
             if cached_plan is not None:
                 split_result = _clone_split_result(cached_plan.split_result)
@@ -1840,6 +1916,21 @@ def optimize_workbook(
                     _materialize_cached_warnings(cached_plan.group_warnings, order_id, combo)
                 )
             else:
+                effective_packing_mode = packing_mode
+                if packing_mode == "balanced" and packing_budget_seconds is not None:
+                    elapsed_budget = time.perf_counter() - packing_budget_start
+                    remaining_budget = packing_budget_seconds - elapsed_budget
+                    low_budget_threshold = max(1.0, packing_budget_seconds * 0.1)
+                    if remaining_budget <= low_budget_threshold:
+                        effective_packing_mode = "fast"
+                        _log_event(
+                            "balanced_budget_fallback",
+                            order_id=order_id,
+                            pledge_count=cache_key_counts[cache_key],
+                            elapsed_seconds=round(elapsed_budget, 3),
+                            remaining_seconds=round(max(remaining_budget, 0), 3),
+                        )
+
                 group_results = []
                 group_warnings_for_cache = []
                 for group_record in groups:
@@ -1849,7 +1940,7 @@ def optimize_workbook(
                         group,
                         group_items,
                         sku_rules,
-                        packing_mode,
+                        effective_packing_mode,
                     )
                     group_results.append(group_result)
                     group_warnings_for_cache.extend(group_warnings)
@@ -1933,6 +2024,11 @@ def optimize_workbook(
                 error_type=type(exc).__name__,
                 elapsed_seconds=round(time.perf_counter() - order_started, 3),
             )
+
+    if packing_mode == "balanced":
+        split_results = {order_id: split_results[order_id] for order_id in grouped_orders if order_id in split_results}
+        combo_by_order = {order_id: combo_by_order[order_id] for order_id in grouped_orders if order_id in combo_by_order}
+        items_by_order = {order_id: items_by_order[order_id] for order_id in grouped_orders if order_id in items_by_order}
 
     if failed_orders:
         warnings.append(f"{len(failed_orders)} orders could not be packed.")
