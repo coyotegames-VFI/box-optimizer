@@ -298,159 +298,81 @@ def _standardize_to_vendor_boxes(
     custom_box_min_units: int,
     non_preferred_box_min_units: int,
 ) -> list[StandardizedBoxAssignment]:
-    preferred_boxes = tuple(
-        box for box in VENDOR_BOXES if box.vendor_id in PREFERRED_VENDOR_BOX_IDS
-    )
-    non_preferred_boxes = tuple(
-        box for box in VENDOR_BOXES if box.vendor_id not in PREFERRED_VENDOR_BOX_IDS
-    )
     demand_by_dimensions = Counter(
         _dimensions_key(carton.optimized_dimensions)
         for carton in optimized_cartons
     )
-    preferred_fallback_by_order: dict[str, tuple[float, float, float, VendorBox]] = {}
-    non_preferred_fallback_by_order: dict[str, tuple[float, float, float, VendorBox]] = {}
-    non_preferred_fallback_demand: Counter[str] = Counter()
-    for carton in optimized_cartons:
-        preferred_candidates = _vendor_candidates(
-            carton,
-            preferred_boxes,
-            band_size_kg=band_size_kg,
-            same_band_only=False,
-        )
-        if preferred_candidates:
-            preferred_fallback_by_order[carton.order_id] = preferred_candidates[0]
-        non_preferred_candidates = _vendor_candidates(
-            carton,
-            non_preferred_boxes,
-            band_size_kg=band_size_kg,
-            same_band_only=False,
-        )
-        if non_preferred_candidates:
-            candidate = non_preferred_candidates[0]
-            non_preferred_fallback_by_order[carton.order_id] = candidate
-            non_preferred_fallback_demand[candidate[3].vendor_id] += 1
     custom_names: dict[tuple[float, float, float], int] = {}
     assignments = []
     for carton in optimized_cartons:
-        for decision, pool, same_band_only, note_template in [
-            (
-                "preferred_same_band",
-                preferred_boxes,
-                True,
-                "Assigned preferred vendor Box {id} within 1 kg billing band.",
-            ),
-            (
-                "available_same_band",
-                VENDOR_BOXES,
-                True,
-                "Assigned vendor Box {id} from full list within 1 kg billing band.",
-            ),
-        ]:
-            candidates = _vendor_candidates(
-                carton,
-                pool,
-                band_size_kg=band_size_kg,
-                same_band_only=same_band_only,
-            )
-            if candidates:
-                _billed, _chargeable, _volume, vendor_box = candidates[0]
-                assignments.append(
-                    _vendor_assignment(
-                        carton,
-                        f"Vendor Box {vendor_box.vendor_id}",
-                        vendor_box,
-                        note_template.format(id=vendor_box.vendor_id),
-                        decision,
-                    )
-                )
-                break
-        else:
-            dimensions_key = _dimensions_key(carton.optimized_dimensions)
-            demand = demand_by_dimensions[dimensions_key]
-            if demand >= custom_box_min_units:
-                custom_names.setdefault(dimensions_key, len(custom_names) + 1)
-                assignments.append(
-                    _custom_assignment(
-                        carton,
-                        custom_names[dimensions_key],
-                        demand,
-                    )
-                )
-                continue
-
-            non_preferred_candidate = non_preferred_fallback_by_order.get(carton.order_id)
-            if (
-                non_preferred_candidate
-                and non_preferred_fallback_demand[non_preferred_candidate[3].vendor_id] >= non_preferred_box_min_units
-            ):
-                _billed, _chargeable, _volume, vendor_box = non_preferred_candidate
-                assignments.append(
-                    _vendor_assignment(
-                        carton,
-                        f"Vendor Box {vendor_box.vendor_id}",
-                        vendor_box,
-                        (
-                            f"Assigned non-preferred vendor Box {vendor_box.vendor_id}; "
-                            f"demand {non_preferred_fallback_demand[vendor_box.vendor_id]} meets "
-                            f"{non_preferred_box_min_units} carton threshold."
-                        ),
-                        "non_preferred_threshold_met",
-                    )
-                )
-                continue
-
-            preferred_candidate = preferred_fallback_by_order.get(carton.order_id)
-            if preferred_candidate:
-                _billed, _chargeable, _volume, vendor_box = preferred_candidate
-                assignments.append(
-                    _vendor_assignment(
-                        carton,
-                        f"Vendor Box {vendor_box.vendor_id}",
-                        vendor_box,
-                        (
-                            f"Assigned preferred vendor Box {vendor_box.vendor_id}; no same-band preferred/full-list box, "
-                            f"no 400+ custom demand, and non-preferred demand is below {non_preferred_box_min_units}."
-                        ),
-                        "preferred_fallback_higher_band",
-                    )
-                )
-                continue
-
-            if non_preferred_candidate:
-                _billed, _chargeable, _volume, vendor_box = non_preferred_candidate
-                assignments.append(
-                    _vendor_assignment(
-                        carton,
-                        f"Vendor Box {vendor_box.vendor_id}",
-                        vendor_box,
-                        (
-                            f"Assigned vendor Box {vendor_box.vendor_id} from full list; no preferred vendor box can fit "
-                            f"and demand is below {non_preferred_box_min_units}."
-                        ),
-                        "available_fallback_higher_band",
-                    )
-                )
-                continue
-
+        same_band_candidates = _vendor_candidates(
+            carton,
+            VENDOR_BOXES,
+            band_size_kg=band_size_kg,
+            same_band_only=True,
+        )
+        if same_band_candidates:
+            _billed, _chargeable, _volume, vendor_box = same_band_candidates[0]
             assignments.append(
-                StandardizedBoxAssignment(
-                    order_id=carton.order_id,
-                    combination_key=carton.combination_key,
-                    box_type="NO-VENDOR-BOX",
-                    optimized_length_cm=carton.optimized_dimensions.length,
-                    optimized_width_cm=carton.optimized_dimensions.width,
-                    optimized_height_cm=carton.optimized_dimensions.height,
-                    assigned_length_cm=carton.optimized_dimensions.length,
-                    assigned_width_cm=carton.optimized_dimensions.width,
-                    assigned_height_cm=carton.optimized_dimensions.height,
-                    box_standardization_note="No vendor box can fit optimized carton dimensions.",
-                    placements=carton.placements,
-                    selection_decision="no_vendor_fit",
+                _vendor_assignment(
+                    carton,
+                    f"Vendor Box {vendor_box.vendor_id}",
+                    vendor_box,
+                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit within billing band.",
+                    "vendor_smallest_safe_same_band",
                 )
             )
-    return assignments
+            continue
 
+        all_vendor_candidates = _vendor_candidates(
+            carton,
+            VENDOR_BOXES,
+            band_size_kg=band_size_kg,
+            same_band_only=False,
+        )
+        if all_vendor_candidates:
+            _billed, _chargeable, _volume, vendor_box = all_vendor_candidates[0]
+            assignments.append(
+                _vendor_assignment(
+                    carton,
+                    f"Vendor Box {vendor_box.vendor_id}",
+                    vendor_box,
+                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit.",
+                    "vendor_smallest_safe_fit",
+                )
+            )
+            continue
+
+        dimensions_key = _dimensions_key(carton.optimized_dimensions)
+        demand = demand_by_dimensions[dimensions_key]
+        if demand >= custom_box_min_units:
+            custom_names.setdefault(dimensions_key, len(custom_names) + 1)
+            assignments.append(
+                _custom_assignment(
+                    carton,
+                    custom_names[dimensions_key],
+                    demand,
+                )
+            )
+            continue
+
+        assignments.append(
+            StandardizedBoxAssignment(
+                order_id=carton.order_id,
+                combination_key=carton.combination_key,
+                box_type="NO-VENDOR-BOX",
+                optimized_length_cm=carton.optimized_dimensions.length,
+                optimized_width_cm=carton.optimized_dimensions.width,
+                optimized_height_cm=carton.optimized_dimensions.height,
+                assigned_length_cm=carton.optimized_dimensions.length,
+                assigned_width_cm=carton.optimized_dimensions.width,
+                assigned_height_cm=carton.optimized_dimensions.height,
+                box_standardization_note="No vendor box can fit optimized carton dimensions.",
+                placements=carton.placements,
+                selection_decision="no_vendor_fit",
+            )
+        )
+    return assignments
 
 def _box_type_members(
     ordered: list[OptimizedOrderCarton],

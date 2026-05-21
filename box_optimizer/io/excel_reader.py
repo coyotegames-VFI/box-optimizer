@@ -327,6 +327,8 @@ def _read_sku_master_with_mappings(path: str) -> tuple[list[SKUItem], list[dict]
                 length = _parse_number(row.get(mapping["length"]))
                 width = _parse_number(row.get(mapping["width"]))
                 height = _parse_number(row.get(height_header)) if height_header else None
+                if length <= 0 or width <= 0 or (height_header and (height is None or height <= 0)):
+                    continue
                 dimension_unit = infer_dimension_unit(mapping["length"])
                 dimensions = normalize_dimensions(length, width, height, unit=dimension_unit)
                 is_flat = height is None
@@ -531,3 +533,4 @@ def read_intake(sku_master_path: str, orders_path: str) -> IntakeResult:
             "unmatched": len(unmatched),
         },
     )
+

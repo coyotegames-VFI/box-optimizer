@@ -178,6 +178,27 @@ def test_read_xlsx_processes_all_useful_sheets(tmp_path):
     assert {item.metadata["_source_sheet"] for item in items} == {"Products A", "Products B"}
 
 
+def test_read_sku_master_supports_vfi_short_cm_dimension_headers(tmp_path):
+    path = tmp_path / "vfi_sku_master.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "VFI Intake form": [
+                ["SKU", "Item name", "SKU/ UPC", "Weight/g", "L-cm", "W-cm", "H-cm"],
+                ["SKU description", "Product description", "Barcode", "Weight", "Length", "Width", "Height"],
+                ["OPR_GEN_A_002", "One Page Rules Tokens Set (70)", "", "121", "28.5", "14.5", "1"],
+            ]
+        },
+    )
+
+    items = read_sku_master(str(path))
+
+    assert len(items) == 1
+    assert items[0].canonical_sku == "OPR_GEN_A_002"
+    assert items[0].product_name == "One Page Rules Tokens Set (70)"
+    assert (items[0].length_cm, items[0].width_cm, items[0].height_cm) == (28.5, 14.5, 1)
+    assert items[0].weight_kg == 0.121
+
 def test_combined_dimension_parsing_supports_three_dimension_formats(tmp_path):
     path = tmp_path / "sku_master.csv"
     _write_csv(
@@ -329,3 +350,4 @@ def test_real_example_files_parse_nonzero_skus_and_order_lines():
     assert result.debug["order_lines_created"] > 0
     assert result.debug["wide_product_columns_detected"] > 0
     assert result.debug["matched"] > 0
+

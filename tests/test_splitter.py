@@ -1,7 +1,7 @@
 from collections import Counter
 
 from box_optimizer.models import Dimensions, PackedItem
-from box_optimizer.packing.packer import MAX_CARTON_DIMENSIONS
+from box_optimizer.packing.packer import MAX_CARTON_DIMENSIONS, OptimizedCartonResult
 from box_optimizer.packing.splitter import split_items, split_order_into_cartons
 
 
@@ -94,3 +94,166 @@ def test_fast_mode_uses_simple_split_without_combinatorial_search(monkeypatch):
 
     assert result.success is True
     assert result.box_qty == 3
+
+
+def test_fast_split_refines_final_group_dimensions(monkeypatch):
+    def result_for(items, dimensions, success=True):
+        return OptimizedCartonResult(
+            success=success,
+            length_cm=dimensions.length if success else None,
+            width_cm=dimensions.width if success else None,
+            height_cm=dimensions.height if success else None,
+            chargeable_weight_kg=1 if success else None,
+            volume_cm3=dimensions.length * dimensions.width * dimensions.height if success else None,
+            placements=[] if not success else [
+                type(
+                    "PlacementStub",
+                    (),
+                    {
+                        "canonical_sku": item.canonical_sku,
+                        "quantity": 1,
+                        "dimensions": dimensions,
+                        "origin": (0, 0, 0),
+                    },
+                )()
+                for item in items
+            ],
+            unplaced_items=[] if success else list(items),
+        )
+
+    def fast_optimizer(items):
+        skus = {item.canonical_sku for item in items}
+        if skus == {"large", "small"}:
+            return result_for(items, MAX_CARTON_DIMENSIONS, success=False)
+        return result_for(items, MAX_CARTON_DIMENSIONS)
+
+    def tight_optimizer(items):
+        sku = items[0].canonical_sku
+        dimensions = Dimensions(70, 35, 40) if sku == "large" else Dimensions(12, 10, 5)
+        return result_for(items, dimensions)
+
+    monkeypatch.setattr("box_optimizer.packing.splitter.optimize_carton_dimensions_fast", fast_optimizer)
+    monkeypatch.setattr("box_optimizer.packing.splitter.optimize_carton_dimensions", tight_optimizer)
+
+    result = split_order_into_cartons(
+        [
+            _item("large", Dimensions(70, 35, 40), 2),
+            _item("small", Dimensions(12, 10, 5), 0.2),
+        ],
+        packing_mode="fast",
+    )
+
+    assert result.success is True
+    assert result.box_qty == 2
+    small_carton = next(
+        carton for carton in result.cartons
+        if any(placement.canonical_sku == "small" for placement in carton.result.placements)
+    )
+    assert small_carton.result.length_cm == 12
+    assert small_carton.result.width_cm == 10
+    assert small_carton.result.height_cm == 5
+
+
+def test_balanced_mode_tries_alternate_orderings_without_changing_fast(monkeypatch):
+    def result_for(items, success=True):
+        dimensions = Dimensions(10 * len(items), 10, 5)
+        return OptimizedCartonResult(
+            success=success,
+            length_cm=dimensions.length if success else None,
+            width_cm=dimensions.width if success else None,
+            height_cm=dimensions.height if success else None,
+            chargeable_weight_kg=len(items) if success else None,
+            volume_cm3=dimensions.length * dimensions.width * dimensions.height if success else None,
+            placements=[] if not success else [
+                type(
+                    "PlacementStub",
+                    (),
+                    {
+                        "canonical_sku": item.canonical_sku,
+                        "quantity": 1,
+                        "dimensions": dimensions,
+                        "origin": (0, 0, 0),
+                    },
+                )()
+                for item in items
+            ],
+            unplaced_items=[] if success else list(items),
+        )
+
+    def normal_optimizer(items):
+        return result_for(items, success=len(items) < 3)
+
+    def greedy_groups(items):
+        by_sku = {item.canonical_sku: item for item in items}
+        if items[0].canonical_sku == "A":
+            return [[by_sku["A"]], [by_sku["B"]], [by_sku["C"]]], []
+        return [[by_sku["B"], by_sku["C"]], [by_sku["A"]]], []
+
+    monkeypatch.setattr("box_optimizer.packing.splitter.optimize_carton_dimensions", normal_optimizer)
+    monkeypatch.setattr("box_optimizer.packing.splitter.optimize_carton_dimensions_fast", lambda items: result_for(items, success=len(items) < 3))
+    monkeypatch.setattr("box_optimizer.packing.splitter._greedy_groups", greedy_groups)
+    monkeypatch.setattr(
+        "box_optimizer.packing.splitter._balanced_orderings",
+        lambda items: [items, [items[1], items[2], items[0]]],
+    )
+
+    items = [
+        _item("A", Dimensions(10, 10, 5), 1),
+        _item("B", Dimensions(10, 10, 5), 1),
+        _item("C", Dimensions(10, 10, 5), 1),
+    ]
+
+    fast_result = split_order_into_cartons(items, packing_mode="fast")
+    balanced_result = split_order_into_cartons(items, packing_mode="balanced")
+
+    assert fast_result.success is True
+    assert fast_result.box_qty == 3
+    assert balanced_result.success is True
+    assert balanced_result.box_qty == 2
+
+
+def test_balanced_high_complexity_combo_uses_fast_baseline_without_deep_search(monkeypatch):
+    normal_calls = []
+
+    def fast_optimizer(items):
+        return OptimizedCartonResult(
+            success=True,
+            length_cm=20,
+            width_cm=10,
+            height_cm=5,
+            chargeable_weight_kg=1,
+            volume_cm3=1000,
+            placements=[
+                type(
+                    "PlacementStub",
+                    (),
+                    {
+                        "canonical_sku": item.canonical_sku,
+                        "quantity": 1,
+                        "dimensions": item.padded_dimensions,
+                        "origin": (0, 0, 0),
+                        "weight_kg": item.weight_kg,
+                    },
+                )()
+                for item in items
+            ],
+            unplaced_items=[],
+        )
+
+    def normal_optimizer(items):
+        normal_calls.append(len(items))
+        raise AssertionError("high-complexity balanced run should not start deep search")
+
+    monkeypatch.setattr("box_optimizer.packing.splitter.optimize_carton_dimensions_fast", fast_optimizer)
+    monkeypatch.setattr("box_optimizer.packing.splitter.optimize_carton_dimensions", normal_optimizer)
+
+    result = split_order_into_cartons(
+        [_item(f"SKU-{index}", Dimensions(5, 5, 5), 0.1) for index in range(20)],
+        packing_mode="balanced",
+        balanced_max_items_for_deep_search=10,
+    )
+
+    assert result.success is True
+    assert result.box_qty == 1
+    assert normal_calls == []
+

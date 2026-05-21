@@ -184,7 +184,7 @@ def test_standardization_never_assigns_box_larger_than_cap():
         )
 
 
-def test_vendor_box_menu_prefers_highlighted_box_with_one_kg_band():
+def test_vendor_box_menu_uses_smallest_safe_vendor_box_without_preference_override():
     assignments = standardize_optimized_cartons(
         [_optimized("order-1", "Large x1", Dimensions(74, 36, 31), chargeable_weight_kg=17)],
         use_vendor_box_menu=True,
@@ -196,7 +196,7 @@ def test_vendor_box_menu_prefers_highlighted_box_with_one_kg_band():
     assert assignments[0].assigned_length_cm == 74
     assert assignments[0].assigned_width_cm == 36
     assert assignments[0].assigned_height_cm == 42
-    assert assignments[0].selection_decision == "preferred_fallback_higher_band"
+    assert assignments[0].selection_decision == "vendor_smallest_safe_fit"
 
 
 def test_vendor_box_menu_can_use_full_list_beyond_old_cap():
@@ -215,7 +215,7 @@ def test_vendor_box_menu_can_use_full_list_beyond_old_cap():
 
 
 
-def test_vendor_box_menu_uses_preferred_fallback_when_non_preferred_demand_is_below_threshold():
+def test_vendor_box_menu_uses_smallest_safe_full_list_box_even_below_non_preferred_threshold():
     assignments = standardize_optimized_cartons(
         [_optimized("order-1", "Combo x1", Dimensions(54.3, 36.6, 10.3), chargeable_weight_kg=5)],
         use_vendor_box_menu=True,
@@ -223,10 +223,10 @@ def test_vendor_box_menu_uses_preferred_fallback_when_non_preferred_demand_is_be
         non_preferred_box_min_units=100,
     )
 
-    assert assignments[0].box_type == "Vendor Box 36"
-    assert assignments[0].vendor_box_id == "36"
-    assert assignments[0].selection_decision == "preferred_fallback_higher_band"
-    assert "non-preferred demand is below 100" in assignments[0].box_standardization_note
+    assert assignments[0].box_type == "Vendor Box 42"
+    assert assignments[0].vendor_box_id == "42"
+    assert assignments[0].selection_decision == "vendor_smallest_safe_fit"
+    assert "smallest safe vendor fit" in assignments[0].box_standardization_note
 
 
 def test_vendor_box_menu_uses_non_preferred_box_when_threshold_is_met():
@@ -244,10 +244,24 @@ def test_vendor_box_menu_uses_non_preferred_box_when_threshold_is_met():
 
     assert {assignment.box_type for assignment in assignments} == {"Vendor Box 42"}
     assert {assignment.vendor_box_id for assignment in assignments} == {"42"}
-    assert {assignment.selection_decision for assignment in assignments} == {"non_preferred_threshold_met"}
-    assert all("demand 100 meets 100 carton threshold" in assignment.box_standardization_note for assignment in assignments)
+    assert {assignment.selection_decision for assignment in assignments} == {"vendor_smallest_safe_fit"}
+    assert all("smallest safe vendor fit" in assignment.box_standardization_note for assignment in assignments)
 
-def test_vendor_box_menu_uses_custom_box_when_400_carton_minimum_is_met():
+
+
+def test_vendor_box_menu_assigns_small_addon_carton_to_smallest_safe_box_not_vb36():
+    assignments = standardize_optimized_cartons(
+        [_optimized("order-1", "Dice Tray x1 | Sleeve Pack 1 x1 | Sleeve Pack 2 x1", Dimensions(26, 36, 14), chargeable_weight_kg=3)],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+    )
+
+    assert assignments[0].vendor_box_id != "36"
+    assert assignments[0].vendor_box_id == "16"
+    assert assignments[0].box_type == "Vendor Box 16"
+    assert assignments[0].selection_decision == "vendor_smallest_safe_fit"
+
+def test_vendor_box_menu_uses_vendor_box_even_when_400_custom_minimum_is_met():
     cartons = [
         _optimized(f"order-{index}", "Same x1", Dimensions(74, 37, 38), chargeable_weight_kg=21)
         for index in range(400)
@@ -260,9 +274,9 @@ def test_vendor_box_menu_uses_custom_box_when_400_carton_minimum_is_met():
         custom_box_min_units=400,
     )
 
-    assert {assignment.box_type for assignment in assignments} == {"Custom Box 1"}
-    assert {assignment.selection_decision for assignment in assignments} == {"custom_minimum_met"}
-    assert {assignment.assigned_length_cm for assignment in assignments} == {74}
+    assert {assignment.box_type for assignment in assignments} == {"Vendor Box 41"}
+    assert {assignment.vendor_box_id for assignment in assignments} == {"41"}
+    assert {assignment.selection_decision for assignment in assignments} == {"vendor_smallest_safe_fit"}
 
 
 def test_optimize_and_standardize_orders_returns_required_output_fields():

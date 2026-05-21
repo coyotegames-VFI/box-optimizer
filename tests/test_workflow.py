@@ -1,4 +1,5 @@
 import csv
+import logging
 import zipfile
 from pathlib import Path
 
@@ -815,7 +816,7 @@ def test_small_split_carton_uses_smaller_vendor_box_across_workbook_tabs(tmp_pat
         ],
     )
 
-    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False, **kwargs):
         by_sku = {item.canonical_sku: item for item in items}
         large = by_sku["LARGE"]
         small = by_sku["SMALL ADDONS"]
@@ -1502,7 +1503,7 @@ def test_identical_sku_combinations_reuse_packing_plan_and_preserve_metadata(tmp
     )
     calls = {"count": 0}
 
-    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False, **kwargs):
         calls["count"] += 1
         length = 20 + calls["count"]
         placements = [
@@ -1854,7 +1855,7 @@ def test_balanced_workflow_prioritizes_high_volume_pledge_combinations(tmp_path,
     )
     calls = []
 
-    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False, **kwargs):
         calls.append((items[0].canonical_sku, packing_mode))
         item = items[0]
         return SplitResult(
@@ -1914,7 +1915,7 @@ def test_balanced_workflow_uses_fast_for_uncached_combo_when_budget_is_low(tmp_p
     def fake_perf_counter():
         return next(ticks, 100)
 
-    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False):
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False, **kwargs):
         calls.append(packing_mode)
         item = items[0]
         return SplitResult(
@@ -1951,4 +1952,26 @@ def test_balanced_workflow_uses_fast_for_uncached_combo_when_budget_is_low(tmp_p
     assert summary["orders_processed"] == 2
     assert output_path.read_bytes()[:2] == b"PK"
     assert calls == ["fast", "fast"]
+
+
+def test_workflow_log_event_includes_plain_message_fields(caplog):
+    from box_optimizer import workflow as workflow_module
+
+    with caplog.at_level(logging.INFO, logger="box_optimizer"):
+        workflow_module._log_event(
+            "order_packing_started",
+            order_id="2572092W",
+            combo_rank=3,
+            pledge_count=84,
+            mode="balanced",
+            item_count=16,
+        )
+
+    message = caplog.records[-1].getMessage()
+    assert "order_packing_started" in message
+    assert "order_id=2572092W" in message
+    assert "combo_rank=3" in message
+    assert "pledge_count=84" in message
+    assert "mode=balanced" in message
+    assert "item_count=16" in message
 

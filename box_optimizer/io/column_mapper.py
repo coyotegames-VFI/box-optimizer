@@ -20,9 +20,9 @@ _COLUMN_ALIASES = {
         "description",
         "productdescription",
     },
-    "length": {"length", "lengthcm", "lengthin", "l"},
-    "width": {"width", "widthcm", "widthin", "w"},
-    "height": {"height", "heightcm", "heightin", "h", "depth", "depthcm", "depthin"},
+    "length": {"length", "lengthcm", "lengthin", "l", "lcm", "lin"},
+    "width": {"width", "widthcm", "widthin", "w", "wcm", "win"},
+    "height": {"height", "heightcm", "heightin", "h", "hcm", "hin", "depth", "depthcm", "depthin"},
     "dimensions": {
         "dimensions",
         "dimension",
@@ -219,3 +219,4 @@ def is_metadata_column(header: str) -> bool:
         if word
     }
     return bool(words & _METADATA_WORD_HINTS)
+

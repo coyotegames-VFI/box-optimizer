@@ -6,3 +6,10 @@ __pycache__/
 *.pyc
 .env
 output.xlsx
+
+/config-5.json
+/config-us-full.json
+/orders.xlsx
+/sku_master.xlsx
+/optimized_shipping_plan.xlsx
+/test-output-5.xlsx

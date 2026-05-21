@@ -1,5 +1,6 @@
 """Top-level workbook optimization workflow."""
 
+import hashlib
 import json
 import logging
 import math
@@ -46,6 +47,9 @@ DEFAULT_CONFIG = {
     "max_orders": None,
     "packing_mode": "normal",
     "max_optimization_seconds": 180,
+    "balanced_max_items_for_deep_search": 18,
+    "balanced_max_item_quantity_for_recombine": 10,
+    "balanced_min_remaining_seconds": 3,
     "output_granularity": "order_summary",
 }
 
@@ -684,7 +688,9 @@ def _match_sku_rules(
 
 
 def _log_event(event: str, **fields) -> None:
-    logger.info(event, extra={"box_optimizer": {"event": event, **fields}})
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    message = f"{event} {details}" if details else event
+    logger.info(message, extra={"box_optimizer": {"event": event, **fields}})
 
 
 def _limited_order_ids(lines: list[OrderLine], max_orders: int | None) -> set[str] | None:
@@ -1226,6 +1232,9 @@ def _config_cache_signature(cfg: dict) -> dict:
     return {
         "packing_mode": cfg.get("packing_mode"),
         "max_optimization_seconds": cfg.get("max_optimization_seconds"),
+        "balanced_max_items_for_deep_search": cfg.get("balanced_max_items_for_deep_search"),
+        "balanced_max_item_quantity_for_recombine": cfg.get("balanced_max_item_quantity_for_recombine"),
+        "balanced_min_remaining_seconds": cfg.get("balanced_min_remaining_seconds"),
         "standardization_tolerance_cm": cfg.get("standardization_tolerance_cm"),
         "use_vendor_box_menu": cfg.get("use_vendor_box_menu"),
         "billing_band_kg": cfg.get("billing_band_kg"),
@@ -1240,6 +1249,10 @@ def _config_cache_signature(cfg: dict) -> dict:
         "carton_cap_cm": _dimensions_cache_tuple(MAX_CARTON_DIMENSIONS),
     }
 
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
 
 def _packing_cache_key(
     combo: str,
@@ -1290,7 +1303,10 @@ def _pack_group(
     items: list[PackedItem],
     sku_rules: dict[str, SKUCampaignRule],
     packing_mode: str,
+    cfg: dict | None = None,
+    remaining_budget_seconds: float | None = None,
 ) -> tuple[SplitResult, list[WorkflowWarning]]:
+    cfg = cfg or DEFAULT_CONFIG
     warnings = []
     group_rule = sku_rules.get(group[0].canonical_sku) if len(group) == 1 else None
     if group_rule and group_rule.forced_box_cm:
@@ -1349,6 +1365,10 @@ def _pack_group(
         items,
         packing_mode=packing_mode,
         force_simple_split=False,
+        balanced_max_items_for_deep_search=int(cfg.get("balanced_max_items_for_deep_search", 18)),
+        balanced_max_item_quantity_for_recombine=int(cfg.get("balanced_max_item_quantity_for_recombine", 10)),
+        balanced_min_remaining_seconds=float(cfg.get("balanced_min_remaining_seconds", 3)),
+        remaining_budget_seconds=remaining_budget_seconds,
     )
     if result.success and group_rules:
         box_type = " + ".join(
@@ -1879,10 +1899,18 @@ def optimize_workbook(
             )
 
     cache_key_counts = Counter(context.cache_key for context in order_contexts)
+    first_index_by_cache_key: dict[str, int] = {}
+    for context in order_contexts:
+        first_index_by_cache_key.setdefault(context.cache_key, context.first_index)
+    ranked_cache_keys = sorted(
+        cache_key_counts,
+        key=lambda key: (-cache_key_counts[key], first_index_by_cache_key[key]),
+    )
+    cache_key_rank = {key: index + 1 for index, key in enumerate(ranked_cache_keys)}
     if packing_mode == "balanced":
         packing_order = sorted(
             order_contexts,
-            key=lambda context: (-cache_key_counts[context.cache_key], context.first_index),
+            key=lambda context: (cache_key_rank[context.cache_key], context.first_index),
         )
     else:
         packing_order = order_contexts
@@ -1902,11 +1930,19 @@ def optimize_workbook(
         items = context.items
         groups = context.groups
         cache_key = context.cache_key
+        combo_rank = cache_key_rank.get(cache_key, context.first_index + 1)
+        item_count = sum(item.quantity for item in items)
+        requested_mode = packing_mode
+        effective_packing_mode = "cached"
         _log_event(
             "order_packing_started",
             order_id=order_id,
+            combo_rank=combo_rank,
+            combo_hash=_short_hash(cache_key),
             line_count=len(lines),
             pledge_count=cache_key_counts[cache_key],
+            mode=requested_mode,
+            item_count=item_count,
         )
         try:
             cached_plan = packing_cache.get(cache_key)
@@ -1917,18 +1953,32 @@ def optimize_workbook(
                 )
             else:
                 effective_packing_mode = packing_mode
+                fallback_reason = ""
+                remaining_budget = None
                 if packing_mode == "balanced" and packing_budget_seconds is not None:
                     elapsed_budget = time.perf_counter() - packing_budget_start
                     remaining_budget = packing_budget_seconds - elapsed_budget
-                    low_budget_threshold = max(1.0, packing_budget_seconds * 0.1)
+                    min_remaining = float(cfg.get("balanced_min_remaining_seconds", 3))
+                    low_budget_threshold = max(min_remaining, packing_budget_seconds * 0.1)
+                    max_deep_items = int(cfg.get("balanced_max_items_for_deep_search", 18))
                     if remaining_budget <= low_budget_threshold:
                         effective_packing_mode = "fast"
+                        fallback_reason = "budget_exhausted"
+                    elif item_count > max_deep_items:
+                        effective_packing_mode = "fast"
+                        fallback_reason = "combo_too_complex"
+                    if fallback_reason:
                         _log_event(
-                            "balanced_budget_fallback",
+                            "balanced_fallback_fast",
                             order_id=order_id,
+                            combo_rank=combo_rank,
+                            combo_hash=_short_hash(cache_key),
                             pledge_count=cache_key_counts[cache_key],
+                            reason=fallback_reason,
                             elapsed_seconds=round(elapsed_budget, 3),
                             remaining_seconds=round(max(remaining_budget, 0), 3),
+                            item_count=item_count,
+                            mode="balanced_fallback_fast",
                         )
 
                 group_results = []
@@ -1941,6 +1991,8 @@ def optimize_workbook(
                         group_items,
                         sku_rules,
                         effective_packing_mode,
+                        cfg=cfg,
+                        remaining_budget_seconds=remaining_budget,
                     )
                     group_results.append(group_result)
                     group_warnings_for_cache.extend(group_warnings)
@@ -1980,6 +2032,10 @@ def optimize_workbook(
             _log_event(
                 "order_packing_finished",
                 order_id=order_id,
+                combo_rank=combo_rank,
+                combo_hash=_short_hash(cache_key),
+                mode=effective_packing_mode or requested_mode,
+                cartons=split_result.box_qty,
                 success=split_result.success,
                 elapsed_seconds=round(time.perf_counter() - order_started, 3),
             )

@@ -38,6 +38,12 @@ logger = logging.getLogger("box_optimizer")
 
 DEFAULT_UPLOAD_CONFIG = {
     "debug": True,
+    "packing_mode": "fast",
+    "output_granularity": "order_summary",
+    "preserve_region_sheets": False,
+}
+POWER_UPLOAD_CONFIG = {
+    "debug": True,
     "packing_mode": "balanced",
     "max_optimization_seconds": 180,
     "output_granularity": "order_summary",
@@ -239,6 +245,13 @@ def _parse_config(config_json: str | dict[str, Any] | None) -> dict:
     if "max_optimization_seconds" in parsed and parsed["max_optimization_seconds"] is not None:
         if not isinstance(parsed["max_optimization_seconds"], (int, float)) or parsed["max_optimization_seconds"] <= 0:
             raise HTTPException(status_code=400, detail="max_optimization_seconds must be a positive number")
+    for field in ["balanced_max_items_for_deep_search", "balanced_max_item_quantity_for_recombine"]:
+        if field in parsed and parsed[field] is not None:
+            if not isinstance(parsed[field], int) or parsed[field] < 1:
+                raise HTTPException(status_code=400, detail=f"{field} must be a positive integer")
+    if "balanced_min_remaining_seconds" in parsed and parsed["balanced_min_remaining_seconds"] is not None:
+        if not isinstance(parsed["balanced_min_remaining_seconds"], (int, float)) or parsed["balanced_min_remaining_seconds"] < 0:
+            raise HTTPException(status_code=400, detail="balanced_min_remaining_seconds must be a non-negative number")
     if "output_granularity" in parsed and parsed["output_granularity"] not in {"order_summary", "box_detail"}:
         raise HTTPException(status_code=400, detail='output_granularity must be "order_summary" or "box_detail"')
     if "sku_rules" in parsed and not isinstance(parsed["sku_rules"], dict):
@@ -350,6 +363,14 @@ def _default_upload_config_text() -> str:
     return json.dumps(DEFAULT_UPLOAD_CONFIG, indent=2)
 
 
+def _power_upload_config_text() -> str:
+    return json.dumps(POWER_UPLOAD_CONFIG, indent=2)
+
+
+def _power_upload_enabled() -> bool:
+    return os.getenv("BOX_OPTIMIZER_ENABLE_POWER_UPLOAD", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _html_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
     return HTMLResponse(
         status_code=status_code,
@@ -378,17 +399,29 @@ def _html_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
     )
 
 
-def _upload_form_html(config_text: str, upload_token: str | None = None, error: str | None = None) -> HTMLResponse:
+def _upload_form_html(
+    config_text: str,
+    upload_token: str | None = None,
+    error: str | None = None,
+    *,
+    title: str = "Box Optimizer Upload",
+    action: str = "/upload",
+    intro: str = "Upload the two campaign files, then run the optimizer. The file names do not need to follow a special pattern.",
+    notice: str = "",
+) -> HTMLResponse:
     safe_config = html.escape(config_text or _default_upload_config_text())
     hidden_token = html.escape(upload_token or "")
     error_html = f'<div class="error"><strong>Something needs attention:</strong> {html.escape(error)}</div>' if error else ""
+    notice_html = f'<div class="summary"><strong>{html.escape(notice)}</strong></div>' if notice else ""
+    safe_action = html.escape(action)
     return _html_page(
-        "Box Optimizer Upload",
+        title,
         f"""
-<h1>Box Optimizer Upload</h1>
-<p class="muted">Upload the two campaign files, then run the optimizer. The file names do not need to follow a special pattern.</p>
+<h1>{html.escape(title)}</h1>
+<p class="muted">{html.escape(intro)}</p>
+{notice_html}
 {error_html}
-<form action="/upload" method="post" enctype="multipart/form-data">
+<form action="{safe_action}" method="post" enctype="multipart/form-data">
   <input type="hidden" name="upload_token" value="{hidden_token}">
   <label for="sku_master_file">Put your SKU file here</label>
   <input id="sku_master_file" name="sku_master_file" type="file" accept=".csv,.xlsx" required>
@@ -402,8 +435,8 @@ def _upload_form_html(config_text: str, upload_token: str | None = None, error: 
     <div class="summary">
       <p><strong>Packing Mode options</strong></p>
       <ul>
-        <li><code>"balanced"</code> is recommended for real quotes. It is slower, but usually lowers chargeable weight.</li>
-        <li><code>"fast"</code> is best for quick test runs.</li>
+        <li><code>"fast"</code> is recommended for Railway uploads and guaranteed completion.</li>
+        <li><code>"balanced"</code> gives better quote accuracy, but is slower and best for local runs or smaller files.</li>
       </ul>
       <p><strong>Optional testing limit</strong></p>
       <ul>
@@ -412,8 +445,8 @@ def _upload_form_html(config_text: str, upload_token: str | None = None, error: 
       </ul>
       <p><strong>Optimization time</strong></p>
       <ul>
-        <li><code>"max_optimization_seconds": 180</code> is recommended for real quotes.</li>
-        <li>Lower this number for quicker testing if needed.</li>
+        <li>For balanced on Railway, use <code>"max_optimization_seconds": 30</code> or <code>60</code>.</li>
+        <li>For local/offline balanced runs, <code>"max_optimization_seconds": 180</code> is useful for quote accuracy.</li>
       </ul>
       <p><strong>Output granularity</strong></p>
       <ul>
@@ -462,13 +495,18 @@ def _result_page(record: dict, upload_token: str | None = None, status_code: int
     )
 
 
-def _error_page(message: str, upload_token: str | None = None, status_code: int = 400) -> HTMLResponse:
+def _error_page(
+    message: str,
+    upload_token: str | None = None,
+    status_code: int = 400,
+    return_path: str = "/upload",
+) -> HTMLResponse:
     return _html_page(
         "Box Optimizer Error",
         f"""
 <h1>Optimization could not finish</h1>
 <div class="error">{html.escape(message)}</div>
-<p><a href="/upload{html.escape(_token_query(upload_token))}">Return to upload page</a></p>
+<p><a href="{html.escape(return_path + _token_query(upload_token))}">Return to upload page</a></p>
 """,
         status_code=status_code,
     )
@@ -524,14 +562,15 @@ def upload_page(
     return _upload_form_html(config_text=config_text, upload_token=provided_token)
 
 
-@app.post("/upload", response_class=HTMLResponse, include_in_schema=False)
-def upload_workbooks(
-    sku_master_file: UploadFile = File(...),
-    orders_file: UploadFile = File(...),
-    config_json: str | None = Form(default=None),
-    upload_token: str | None = Form(default=None),
-):
-    """Run the existing optimizer from the employee upload page and return an HTML result."""
+def _run_upload_job(
+    *,
+    sku_master_file: UploadFile,
+    orders_file: UploadFile,
+    config_json: str | None,
+    upload_token: str | None,
+    default_config: dict[str, Any],
+    return_path: str,
+) -> HTMLResponse:
     started = time.perf_counter()
     job_id = uuid4().hex
     created_seconds = time.time()
@@ -539,12 +578,12 @@ def upload_workbooks(
     try:
         provided_token = _require_upload_access(upload_token=upload_token)
     except HTTPException as exc:
-        return _error_page(str(exc.detail), status_code=exc.status_code)
+        return _error_page(str(exc.detail), upload_token=upload_token, status_code=exc.status_code, return_path=return_path)
 
     try:
         _cleanup_expired_jobs()
         job_dir.mkdir(parents=True, exist_ok=False)
-        config = _parse_config(config_json or DEFAULT_UPLOAD_CONFIG)
+        config = _parse_config(config_json or default_config)
         if config.get("debug"):
             logger.setLevel(logging.DEBUG)
 
@@ -583,29 +622,110 @@ def upload_workbooks(
             "status": "failed",
             "created_at": datetime.fromtimestamp(created_seconds, timezone.utc).isoformat(),
             "expires_at": _job_expiration(created_seconds),
-            "summary": None,
+            "summary": {},
             "download_url": None,
             "error": str(exc.detail),
         }
-        job_dir.mkdir(parents=True, exist_ok=True)
-        _write_job_record(job_dir, record)
-        return _error_page(str(exc.detail), upload_token=provided_token, status_code=exc.status_code)
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            _write_job_record(job_dir, record)
+        except OSError:
+            pass
+        return _error_page(str(exc.detail), upload_token=provided_token, status_code=exc.status_code, return_path=return_path)
     except Exception as exc:
         logger.exception("upload optimization failed")
-        message = f"The optimizer could not finish this job: {exc}"
+        message = str(exc) or "Optimization failed."
         record = {
             "job_id": job_id,
             "status": "failed",
             "created_at": datetime.fromtimestamp(created_seconds, timezone.utc).isoformat(),
             "expires_at": _job_expiration(created_seconds),
-            "summary": None,
+            "summary": {},
             "download_url": None,
             "error": message,
         }
-        job_dir.mkdir(parents=True, exist_ok=True)
-        _write_job_record(job_dir, record)
-        return _error_page(message, upload_token=provided_token, status_code=500)
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            _write_job_record(job_dir, record)
+        except OSError:
+            pass
+        return _error_page(message, upload_token=provided_token, status_code=500, return_path=return_path)
 
+
+@app.post("/upload", response_class=HTMLResponse, include_in_schema=False)
+def upload_workbooks(
+    sku_master_file: UploadFile = File(...),
+    orders_file: UploadFile = File(...),
+    config_json: str | None = Form(default=None),
+    upload_token: str | None = Form(default=None),
+):
+    """Run the existing optimizer from the employee upload page and return an HTML result."""
+    return _run_upload_job(
+        sku_master_file=sku_master_file,
+        orders_file=orders_file,
+        config_json=config_json,
+        upload_token=upload_token,
+        default_config=DEFAULT_UPLOAD_CONFIG,
+        return_path="/upload",
+    )
+
+
+@app.get("/power-upload", response_class=HTMLResponse, include_in_schema=False)
+def power_upload_page(
+    upload_token: str | None = None,
+    token: str | None = None,
+    job_config: str | None = None,
+):
+    """Return a local-only power page for high-accuracy balanced runs."""
+    if not _power_upload_enabled():
+        return _html_page(
+            "Power Upload Disabled",
+            """
+<h1>Power Upload Disabled</h1>
+<p>This local power page is disabled. Enable it on your computer with <code>BOX_OPTIMIZER_ENABLE_POWER_UPLOAD=true</code>.</p>
+""",
+            status_code=404,
+        )
+    try:
+        provided_token = _require_upload_access(upload_token=upload_token, token=token)
+    except HTTPException as exc:
+        return _error_page(str(exc.detail), status_code=exc.status_code, return_path="/power-upload")
+    config_text = job_config or _power_upload_config_text()
+    return _upload_form_html(
+        config_text=config_text,
+        upload_token=provided_token,
+        title="Box Optimizer Power Upload",
+        action="/power-upload",
+        intro="Run higher-accuracy balanced optimizations on this computer.",
+        notice="Power Balanced Mode is intended for local runs. It may take several minutes. Railway daily default remains fast.",
+    )
+
+
+@app.post("/power-upload", response_class=HTMLResponse, include_in_schema=False)
+def power_upload_workbooks(
+    sku_master_file: UploadFile = File(...),
+    orders_file: UploadFile = File(...),
+    config_json: str | None = Form(default=None),
+    upload_token: str | None = Form(default=None),
+):
+    """Run the existing upload job workflow with local power balanced defaults."""
+    if not _power_upload_enabled():
+        return _html_page(
+            "Power Upload Disabled",
+            """
+<h1>Power Upload Disabled</h1>
+<p>This local power page is disabled. Enable it on your computer with <code>BOX_OPTIMIZER_ENABLE_POWER_UPLOAD=true</code>.</p>
+""",
+            status_code=404,
+        )
+    return _run_upload_job(
+        sku_master_file=sku_master_file,
+        orders_file=orders_file,
+        config_json=config_json,
+        upload_token=upload_token,
+        default_config=POWER_UPLOAD_CONFIG,
+        return_path="/power-upload",
+    )
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 def job_status(job_id: str, upload_token: str | None = None, token: str | None = None):
