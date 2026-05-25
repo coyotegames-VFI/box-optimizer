@@ -13,11 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copyfileobj, rmtree
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from box_optimizer.models import (
@@ -45,7 +45,7 @@ DEFAULT_UPLOAD_CONFIG = {
 POWER_UPLOAD_CONFIG = {
     "debug": True,
     "packing_mode": "balanced",
-    "max_optimization_seconds": 180,
+    "max_optimization_seconds": 300,
     "output_granularity": "order_summary",
     "preserve_region_sheets": False,
 }
@@ -127,6 +127,7 @@ class OptimizeSummaryResponse(BaseModel):
     warning_count: int | None = None
     multi_box_order_count: int | None = None
     rules_applied_count: int | None = None
+    chargeable_weight_plan_selected_count: int | None = None
     elapsed_seconds: float | None = None
 
 
@@ -252,6 +253,86 @@ def _parse_config(config_json: str | dict[str, Any] | None) -> dict:
     if "balanced_min_remaining_seconds" in parsed and parsed["balanced_min_remaining_seconds"] is not None:
         if not isinstance(parsed["balanced_min_remaining_seconds"], (int, float)) or parsed["balanced_min_remaining_seconds"] < 0:
             raise HTTPException(status_code=400, detail="balanced_min_remaining_seconds must be a non-negative number")
+    if "bundle_footprint_tolerance_cm" in parsed and parsed["bundle_footprint_tolerance_cm"] is not None:
+        if not isinstance(parsed["bundle_footprint_tolerance_cm"], (int, float)) or parsed["bundle_footprint_tolerance_cm"] < 0:
+            raise HTTPException(status_code=400, detail="bundle_footprint_tolerance_cm must be a non-negative number")
+    if "chargeable_weight_split_savings_threshold_kg" in parsed and parsed["chargeable_weight_split_savings_threshold_kg"] is not None:
+        if not isinstance(parsed["chargeable_weight_split_savings_threshold_kg"], (int, float)) or parsed["chargeable_weight_split_savings_threshold_kg"] < 0:
+            raise HTTPException(status_code=400, detail="chargeable_weight_split_savings_threshold_kg must be a non-negative number")
+    if "chargeable_weight_split_savings_threshold_pct" in parsed and parsed["chargeable_weight_split_savings_threshold_pct"] is not None:
+        if not isinstance(parsed["chargeable_weight_split_savings_threshold_pct"], (int, float)) or parsed["chargeable_weight_split_savings_threshold_pct"] < 0:
+            raise HTTPException(status_code=400, detail="chargeable_weight_split_savings_threshold_pct must be a non-negative number")
+    if "chargeable_weight_split_two_extra_box_threshold_kg" in parsed and parsed["chargeable_weight_split_two_extra_box_threshold_kg"] is not None:
+        if not isinstance(parsed["chargeable_weight_split_two_extra_box_threshold_kg"], (int, float)) or parsed["chargeable_weight_split_two_extra_box_threshold_kg"] < 0:
+            raise HTTPException(status_code=400, detail="chargeable_weight_split_two_extra_box_threshold_kg must be a non-negative number")
+    if "max_extra_boxes_per_order" in parsed and parsed["max_extra_boxes_per_order"] is not None:
+        if not isinstance(parsed["max_extra_boxes_per_order"], int) or parsed["max_extra_boxes_per_order"] < 0:
+            raise HTTPException(status_code=400, detail="max_extra_boxes_per_order must be a non-negative integer")
+    if "oversized_vendor_box_ids" in parsed and parsed["oversized_vendor_box_ids"] is not None:
+        if not isinstance(parsed["oversized_vendor_box_ids"], list):
+            raise HTTPException(status_code=400, detail="oversized_vendor_box_ids must be a JSON array")
+    if "oversized_vendor_box_chargeable_threshold_kg" in parsed and parsed["oversized_vendor_box_chargeable_threshold_kg"] is not None:
+        if not isinstance(parsed["oversized_vendor_box_chargeable_threshold_kg"], (int, float)) or parsed["oversized_vendor_box_chargeable_threshold_kg"] < 0:
+            raise HTTPException(status_code=400, detail="oversized_vendor_box_chargeable_threshold_kg must be a non-negative number")
+    if "oversized_max_extra_boxes_per_order" in parsed and parsed["oversized_max_extra_boxes_per_order"] is not None:
+        if not isinstance(parsed["oversized_max_extra_boxes_per_order"], int) or parsed["oversized_max_extra_boxes_per_order"] < 0:
+            raise HTTPException(status_code=400, detail="oversized_max_extra_boxes_per_order must be a non-negative integer")
+    for field in [
+        "non_preferred_extra_box_savings_threshold_kg",
+        "non_preferred_extra_box_savings_threshold_pct",
+        "non_preferred_two_extra_box_savings_threshold_kg",
+        "non_preferred_two_extra_box_savings_threshold_pct",
+        "company_protection_max_rate_weight_kg",
+        "company_protection_min_margin_delta",
+        "repeat_retail_min_optimization_seconds",
+        "repeat_retail_min_savings_threshold_kg",
+        "repeat_retail_min_savings_threshold_pct",
+        "repeat_retail_max_margin_giveback",
+        "repeat_retail_min_customer_savings",
+        "vendor_box_fit_tolerance_cm",
+        "vendor_box_fit_tolerance_max_cm",
+        "vendor_box_fit_tolerance_max_chargeable_increase_kg",
+    ]:
+        if field in parsed and parsed[field] is not None:
+            if not isinstance(parsed[field], (int, float)) or parsed[field] < 0:
+                raise HTTPException(status_code=400, detail=f"{field} must be a non-negative number")
+    if "vendor_box_fit_tolerance_guardrail" in parsed and not isinstance(parsed["vendor_box_fit_tolerance_guardrail"], bool):
+        raise HTTPException(status_code=400, detail="vendor_box_fit_tolerance_guardrail must be true or false")
+    if "vendor_box_fit_mode" in parsed and parsed["vendor_box_fit_mode"] not in {"auto", "off", "on"}:
+        raise HTTPException(status_code=400, detail='vendor_box_fit_mode must be "auto", "off", or "on"')
+    if (
+        "vendor_box_fit_tolerance_max_cm" in parsed
+        and parsed["vendor_box_fit_tolerance_max_cm"] is not None
+        and parsed["vendor_box_fit_tolerance_max_cm"] > 2
+    ):
+        raise HTTPException(status_code=400, detail="vendor_box_fit_tolerance_max_cm must be 2 cm or less")
+    for field in [
+        "repeat_retail_min_repeated_units",
+        "repeat_retail_max_extra_boxes_per_order",
+        "repeat_retail_max_candidate_boxes",
+    ]:
+        if field in parsed and parsed[field] is not None:
+            if not isinstance(parsed[field], int) or parsed[field] < 0:
+                raise HTTPException(status_code=400, detail=f"{field} must be a non-negative integer")
+    if "repeat_retail_batch_planning_enabled" in parsed and not isinstance(parsed["repeat_retail_batch_planning_enabled"], bool):
+        raise HTTPException(status_code=400, detail="repeat_retail_batch_planning_enabled must be true or false")
+    if "repeat_retail_batch_sizes" in parsed and parsed["repeat_retail_batch_sizes"] is not None:
+        if (
+            not isinstance(parsed["repeat_retail_batch_sizes"], list)
+            or any(not isinstance(size, int) or size < 1 for size in parsed["repeat_retail_batch_sizes"])
+        ):
+            raise HTTPException(status_code=400, detail="repeat_retail_batch_sizes must be a JSON array of positive integers")
+    if "company_protection_extra_box_guardrail" in parsed and not isinstance(parsed["company_protection_extra_box_guardrail"], bool):
+        raise HTTPException(status_code=400, detail="company_protection_extra_box_guardrail must be true or false")
+    if "company_protection_rate_bands" in parsed and parsed["company_protection_rate_bands"] is not None:
+        if not isinstance(parsed["company_protection_rate_bands"], dict):
+            raise HTTPException(status_code=400, detail="company_protection_rate_bands must be a JSON object")
+    if "company_protection_zone_markups" in parsed and parsed["company_protection_zone_markups"] is not None:
+        if not isinstance(parsed["company_protection_zone_markups"], dict):
+            raise HTTPException(status_code=400, detail="company_protection_zone_markups must be a JSON object")
+    if "company_protection_country_zones" in parsed and parsed["company_protection_country_zones"] is not None:
+        if not isinstance(parsed["company_protection_country_zones"], dict):
+            raise HTTPException(status_code=400, detail="company_protection_country_zones must be a JSON object")
     if "output_granularity" in parsed and parsed["output_granularity"] not in {"order_summary", "box_detail"}:
         raise HTTPException(status_code=400, detail='output_granularity must be "order_summary" or "box_detail"')
     if "sku_rules" in parsed and not isinstance(parsed["sku_rules"], dict):
@@ -262,6 +343,115 @@ def _parse_config(config_json: str | dict[str, Any] | None) -> dict:
         raise HTTPException(status_code=400, detail="order_rules must be a JSON array")
     return parsed
 
+
+def _form_lines(value: str | None) -> list[str]:
+    return [line.strip() for line in (value or "").splitlines() if line.strip()]
+
+
+def _form_float(value: str | float | int | None, default: float) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _base_config_for_packing_choice(choice: str | None) -> dict[str, Any]:
+    mode = (choice or "railway_fast").strip()
+    if mode == "local_power_300":
+        mode = "local_power_balanced_300"
+    config: dict[str, Any] = {
+        "debug": True,
+        "output_granularity": "order_summary",
+        "preserve_region_sheets": False,
+    }
+    if mode == "railway_balanced_30":
+        config.update({"packing_mode": "balanced", "max_optimization_seconds": 30})
+    elif mode == "railway_balanced_60":
+        config.update({"packing_mode": "balanced", "max_optimization_seconds": 60})
+    elif mode == "local_power_balanced_300":
+        config.update({"packing_mode": "balanced", "max_optimization_seconds": 300})
+    else:
+        config["packing_mode"] = "fast"
+    return config
+
+
+def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _structured_upload_config(
+    *,
+    campaign_name: str | None = None,
+    campaign_code: str | None = None,
+    campaign_notes: str | None = None,
+    packing_mode_choice: str | None = None,
+    ship_as_is_skus: str | None = None,
+    no_padding_skus: str | None = None,
+    wrap_around_skus: str | None = None,
+    wrapped_height_cm: str | float | int | None = None,
+    compressible_skus: str | None = None,
+    compressed_height_ratio: str | float | int | None = None,
+    compressed_volume_ratio: str | float | int | None = None,
+) -> dict[str, Any]:
+    config = _base_config_for_packing_choice(packing_mode_choice)
+    campaign = {}
+    if campaign_name and campaign_name.strip():
+        campaign["name"] = campaign_name.strip()
+    if campaign_code and campaign_code.strip():
+        campaign["code"] = campaign_code.strip()
+    if campaign_notes and campaign_notes.strip():
+        campaign["notes"] = campaign_notes.strip()
+    if campaign:
+        config["campaign"] = campaign
+
+    sku_rules: dict[str, dict[str, Any]] = {}
+    for sku in _form_lines(ship_as_is_skus):
+        sku_rules[sku] = {
+            "prepacked": True,
+            "no_padding": True,
+            "ships_alone": True,
+            "can_mix_with_other_items": False,
+            "box_type": f"{sku} shipping carton",
+        }
+    for sku in _form_lines(no_padding_skus):
+        sku_rules[sku] = _merge_config(sku_rules.get(sku, {}), {"no_padding": True})
+    wrapped_height = _form_float(wrapped_height_cm, 4.0)
+    for sku in _form_lines(wrap_around_skus):
+        sku_rules[sku] = _merge_config(
+            sku_rules.get(sku, {}),
+            {
+                "wrap_around_largest_item": True,
+                "wrapped_height_cm": wrapped_height,
+                "no_padding": True,
+            },
+        )
+    height_ratio = _form_float(compressed_height_ratio, 0.6)
+    volume_ratio = _form_float(compressed_volume_ratio, 0.75)
+    for sku in _form_lines(compressible_skus):
+        sku_rules[sku] = _merge_config(
+            sku_rules.get(sku, {}),
+            {
+                "compressible": True,
+                "compressed_height_ratio": height_ratio,
+                "compressed_volume_ratio": volume_ratio,
+            },
+        )
+    if sku_rules:
+        config["sku_rules"] = sku_rules
+    return config
+
+
+def _final_upload_config(manual_config_json: str | None, structured_config: dict[str, Any]) -> dict[str, Any]:
+    manual_config = _parse_config(manual_config_json) if manual_config_json and manual_config_json.strip() else {}
+    return _parse_config(_merge_config(structured_config, manual_config))
 
 def _json_error(exc: Exception, stage: str, status_code: int = 500) -> JSONResponse:
     detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
@@ -381,14 +571,21 @@ def _html_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 2rem; max-width: 880px; line-height: 1.4; }}
+    body {{ font-family: Arial, sans-serif; margin: 2rem; max-width: 980px; line-height: 1.4; }}
     label {{ display: block; font-weight: 700; margin-top: 1rem; }}
-    input[type=file], textarea {{ display: block; width: 100%; margin-top: .35rem; }}
+    input[type=file], input[type=text], input[type=number], select, textarea {{ display: block; width: 100%; margin-top: .35rem; box-sizing: border-box; }}
+    input[type=checkbox] {{ margin-right: .35rem; }}
     textarea {{ min-height: 9rem; font-family: Consolas, monospace; }}
+    .short {{ max-width: 14rem; }}
     button, .button {{ display: inline-block; margin-top: 1.25rem; padding: .65rem 1rem; background: #174ea6; color: white; border: 0; border-radius: 4px; text-decoration: none; cursor: pointer; }}
     .summary {{ border: 1px solid #ddd; padding: 1rem; border-radius: 6px; background: #fafafa; }}
+    .section {{ border-top: 1px solid #ddd; margin-top: 1.25rem; padding-top: 1rem; }}
     .error {{ border: 1px solid #b00020; padding: 1rem; border-radius: 6px; background: #fff4f4; color: #7a0015; }}
+    .hidden {{ display: none; }}
     .muted {{ color: #555; }}
+    .help {{ color: #555; font-size: .95rem; margin: .25rem 0 .75rem; }}
+    .inline-label {{ display: flex; align-items: center; gap: .35rem; font-weight: 400; margin-top: .5rem; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }}
     li {{ margin-bottom: .25rem; }}
   </style>
 </head>
@@ -396,6 +593,226 @@ def _html_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
 {body}
 </body>
 </html>""",
+    )
+
+
+def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> str:
+    selected = {
+        "railway_fast": "",
+        "railway_balanced_30": "",
+        "railway_balanced_60": "",
+        "local_power_balanced_300": "",
+    }
+    if default_packing_mode_choice == "local_power_300":
+        default_packing_mode_choice = "local_power_balanced_300"
+    selected[default_packing_mode_choice if default_packing_mode_choice in selected else "railway_fast"] = " selected"
+    html_text = """
+  <div class="section" id="campaign_intake">
+    <h2>Campaign setup</h2>
+    <p class="help">Use these fields for common campaign rules. The page will generate Advanced settings JSON below. SKU entries must match standardized uploaded SKUs or item names; language variants must be listed as separate SKUs.</p>
+
+    <div class="grid">
+      <div>
+        <label for="campaign_name">Campaign Name</label>
+        <input id="campaign_name" name="campaign_name" type="text" placeholder="Example: Vanguard US">
+      </div>
+      <div>
+        <label for="campaign_code">Campaign Code / Project Name</label>
+        <input id="campaign_code" name="campaign_code" type="text" placeholder="Optional">
+      </div>
+    </div>
+    <label for="campaign_notes">Notes</label>
+    <textarea id="campaign_notes" name="campaign_notes" placeholder="Optional internal notes for this run."></textarea>
+
+    <h3>Packing mode</h3>
+    <label for="packing_mode_choice">Run type</label>
+    <select id="packing_mode_choice" name="packing_mode_choice">
+      <option value="railway_fast"__SEL_RAILWAY_FAST__>Railway Fast - recommended for daily team use</option>
+      <option value="railway_balanced_30"__SEL_RAILWAY_BALANCED_30__>Railway Balanced - 30 second accuracy mode</option>
+      <option value="railway_balanced_60"__SEL_RAILWAY_BALANCED_60__>Railway Balanced - 60 second accuracy mode</option>
+      <option value="local_power_balanced_300"__SEL_LOCAL_POWER_300__>Local Power Balanced - 300 second local run</option>
+    </select>
+    <p class="help">Local Power Balanced is intended for a local machine. The optimization seconds value is a search budget, not a guaranteed total page runtime.</p>
+
+    <h3>Common SKU rules</h3>
+    <p class="help">Enter one standardized SKU or exact item name per line. Do not combine English/German versions under one rule unless the uploaded file uses the same SKU for both.</p>
+
+    <label for="ship_as_is_skus">Ship-as-is / do not touch packages</label>
+    <p class="help">Use when the item is already in its final shipping carton. The optimizer will not place it inside another box or combine it with add-ons.</p>
+    <textarea id="ship_as_is_skus" name="ship_as_is_skus" placeholder="SKU-001&#10;SKU-002"></textarea>
+    <label for="ship_as_is_box_type">Friendly box type label for ship-as-is items</label>
+    <input id="ship_as_is_box_type" name="ship_as_is_box_type" type="text" placeholder="Example: Final factory shipping carton">
+
+    <label for="no_padding_skus">No-padding items</label>
+    <p class="help">Use when the item does not need item-level padding. It may still share a box with other items unless another rule prevents mixing.</p>
+    <textarea id="no_padding_skus" name="no_padding_skus" placeholder="SKU-003"></textarea>
+
+    <label for="wrap_skus">Foldable / wrap-around items</label>
+    <p class="help">Use for playmats or similar flat items that can fold or wrap around the largest item in the order. These items also receive no item-level padding by default. This reduces the item footprint and uses a wrapped height.</p>
+    <textarea id="wrap_skus" name="wrap_around_skus" placeholder="PLAYMAT-001"></textarea>
+    <label for="wrapped_height_cm">Wrapped height cm</label>
+    <input id="wrapped_height_cm" name="wrapped_height_cm" class="short" type="number" min="1" step="0.5" value="4">
+    <label class="inline-label" for="wrap_no_padding"><input id="wrap_no_padding" name="wrap_no_padding" type="checkbox" checked> Do not add padding to foldable / wrap-around items</label>
+
+    <label for="compressible_skus">Compressible items</label>
+    <p class="help">Use for soft goods such as plush, blankets, fabric, or foam items that can safely compress. This reduces modeled packed size and may lower dimensional weight.</p>
+    <textarea id="compressible_skus" name="compressible_skus" placeholder="PLUSH-001"></textarea>
+    <div class="grid">
+      <div>
+        <label for="compressed_height_ratio">Compressed height ratio</label>
+        <input id="compressed_height_ratio" name="compressed_height_ratio" class="short" type="number" min="0.1" max="1" step="0.05" value="0.6">
+      </div>
+      <div>
+        <label for="compressed_volume_ratio">Compressed volume ratio</label>
+        <input id="compressed_volume_ratio" name="compressed_volume_ratio" class="short" type="number" min="0.1" max="1" step="0.05" value="0.75">
+      </div>
+    </div>
+
+
+    <button type="button" id="generate_config_button">Update Advanced settings from form</button>
+  </div>
+  <script>
+    (function () {
+      function lines(id) {
+        return (document.getElementById(id).value || "")
+          .split(/\r?\n/)
+          .map(function (line) { return line.trim(); })
+          .filter(Boolean);
+      }
+
+      function numberValue(id, fallback) {
+        var value = parseFloat(document.getElementById(id).value);
+        return Number.isFinite(value) ? value : fallback;
+      }
+
+      function applyRule(config, sku, rule) {
+        config.sku_rules = config.sku_rules || {};
+        config.sku_rules[sku] = Object.assign({}, config.sku_rules[sku] || {}, rule);
+      }
+
+      function applyPackingMode(config) {
+        var choice = document.getElementById("packing_mode_choice").value;
+        config.debug = true;
+        config.output_granularity = "order_summary";
+        config.preserve_region_sheets = false;
+        if (choice === "railway_fast") {
+          config.packing_mode = "fast";
+          delete config.max_optimization_seconds;
+          return;
+        }
+        config.packing_mode = "balanced";
+        if (choice === "railway_balanced_30") {
+          config.max_optimization_seconds = 30;
+        } else if (choice === "railway_balanced_60") {
+          config.max_optimization_seconds = 60;
+        } else {
+          config.max_optimization_seconds = 300;
+        }
+      }
+
+      function showConfigError(message) {
+        var errorBox = document.getElementById("config_generation_error");
+        if (!errorBox) return;
+        errorBox.textContent = message;
+        errorBox.classList.remove("hidden");
+      }
+
+      function clearConfigError() {
+        var errorBox = document.getElementById("config_generation_error");
+        if (!errorBox) return;
+        errorBox.textContent = "";
+        errorBox.classList.add("hidden");
+      }
+
+      function updateConfig() {
+        clearConfigError();
+        var configBox = document.getElementById("config_json");
+        var config = {};
+        try {
+          config = JSON.parse(configBox.value || "{}");
+        } catch (error) {
+          console.error("Advanced settings JSON parse failed", error);
+          showConfigError("Advanced settings JSON is not valid. Fix it before running optimization.");
+          return false;
+        }
+
+        try {
+          applyPackingMode(config);
+
+          var campaignName = document.getElementById("campaign_name").value.trim();
+          var campaignCode = document.getElementById("campaign_code").value.trim();
+          var campaignNotes = document.getElementById("campaign_notes").value.trim();
+          if (campaignName || campaignCode || campaignNotes) {
+            config.campaign = {};
+            if (campaignName) config.campaign.name = campaignName;
+            if (campaignCode) config.campaign.code = campaignCode;
+            if (campaignNotes) config.campaign.notes = campaignNotes;
+          }
+
+          var shipBoxType = document.getElementById("ship_as_is_box_type").value.trim();
+          lines("ship_as_is_skus").forEach(function (sku) {
+            var rule = {
+              prepacked: true,
+              no_padding: true,
+              ships_alone: true,
+              can_mix_with_other_items: false
+            };
+            if (shipBoxType) rule.box_type = shipBoxType;
+            applyRule(config, sku, rule);
+          });
+
+          lines("no_padding_skus").forEach(function (sku) {
+            applyRule(config, sku, { no_padding: true });
+          });
+
+          var wrapRule = {
+            wrap_around_largest_item: true,
+            wrapped_height_cm: numberValue("wrapped_height_cm", 4)
+          };
+          if (document.getElementById("wrap_no_padding").checked) {
+            wrapRule.no_padding = true;
+          }
+          lines("wrap_skus").forEach(function (sku) {
+            applyRule(config, sku, wrapRule);
+          });
+
+          var compressibleRule = {
+            compressible: true,
+            compressed_height_ratio: numberValue("compressed_height_ratio", 0.6),
+            compressed_volume_ratio: numberValue("compressed_volume_ratio", 0.75)
+          };
+          lines("compressible_skus").forEach(function (sku) {
+            applyRule(config, sku, compressibleRule);
+          });
+
+
+          configBox.value = JSON.stringify(config, null, 2);
+          return true;
+        } catch (error) {
+          console.error("Advanced settings generation failed", error);
+          showConfigError("Advanced settings could not be generated from the form. The upload will continue with the current Advanced settings text.");
+          return true;
+        }
+      }
+      document.getElementById("generate_config_button").addEventListener("click", function () {
+        updateConfig();
+      });
+      document.querySelector("form").addEventListener("submit", function (event) {
+        if (document.getElementById("campaign_intake")) {
+          var canSubmit = updateConfig();
+          if (!canSubmit) {
+            event.preventDefault();
+          }
+        }
+      });    })();
+  </script>
+"""
+    return (
+        html_text
+        .replace("__SEL_RAILWAY_FAST__", selected["railway_fast"])
+        .replace("__SEL_RAILWAY_BALANCED_30__", selected["railway_balanced_30"])
+        .replace("__SEL_RAILWAY_BALANCED_60__", selected["railway_balanced_60"])
+        .replace("__SEL_LOCAL_POWER_300__", selected["local_power_balanced_300"])
     )
 
 
@@ -408,12 +825,19 @@ def _upload_form_html(
     action: str = "/upload",
     intro: str = "Upload the two campaign files, then run the optimizer. The file names do not need to follow a special pattern.",
     notice: str = "",
+    show_campaign_intake: bool = False,
+    default_packing_mode_choice: str = "railway_fast",
 ) -> HTMLResponse:
     safe_config = html.escape(config_text or _default_upload_config_text())
     hidden_token = html.escape(upload_token or "")
     error_html = f'<div class="error"><strong>Something needs attention:</strong> {html.escape(error)}</div>' if error else ""
     notice_html = f'<div class="summary"><strong>{html.escape(notice)}</strong></div>' if notice else ""
-    safe_action = html.escape(action)
+    campaign_intake_html = _campaign_intake_html(default_packing_mode_choice) if show_campaign_intake else ""
+    action_target = action
+    if upload_token:
+        separator = "&" if "?" in action_target else "?"
+        action_target = f"{action_target}{separator}upload_token={quote(upload_token)}"
+    safe_action = html.escape(action_target)
     return _html_page(
         title,
         f"""
@@ -421,6 +845,7 @@ def _upload_form_html(
 <p class="muted">{html.escape(intro)}</p>
 {notice_html}
 {error_html}
+<div id="config_generation_error" class="error hidden" role="alert"></div>
 <form action="{safe_action}" method="post" enctype="multipart/form-data">
   <input type="hidden" name="upload_token" value="{hidden_token}">
   <label for="sku_master_file">Put your SKU file here</label>
@@ -428,6 +853,8 @@ def _upload_form_html(
 
   <label for="orders_file">Put your orders file here</label>
   <input id="orders_file" name="orders_file" type="file" accept=".csv,.xlsx" required>
+
+{campaign_intake_html}
 
   <details>
     <summary>Advanced settings</summary>
@@ -446,7 +873,7 @@ def _upload_form_html(
       <p><strong>Optimization time</strong></p>
       <ul>
         <li>For balanced on Railway, use <code>"max_optimization_seconds": 30</code> or <code>60</code>.</li>
-        <li>For local/offline balanced runs, <code>"max_optimization_seconds": 180</code> is useful for quote accuracy.</li>
+        <li>For local/offline balanced runs, <code>"max_optimization_seconds": 300</code> is useful for quote accuracy.</li>
       </ul>
       <p><strong>Output granularity</strong></p>
       <ul>
@@ -468,18 +895,40 @@ def _summary_value(summary: dict, key: str) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
+def _format_elapsed_seconds(value: object) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    minutes = int(seconds // 60)
+    remaining_seconds = int(round(seconds % 60))
+    if remaining_seconds == 60:
+        minutes += 1
+        remaining_seconds = 0
+    return f"{minutes} min {remaining_seconds:02d} sec"
+
+
 def _result_page(record: dict, upload_token: str | None = None, status_code: int = 200) -> HTMLResponse:
     summary = record.get("summary") or {}
     warnings = summary.get("warnings") or []
     warning_items = "".join(f"<li>{html.escape(str(warning))}</li>" for warning in warnings) or "<li>No workflow warnings.</li>"
     download_url = f"/jobs/{record['job_id']}/download{_token_query(upload_token)}"
     status_url = f"/jobs/{record['job_id']}{_token_query(upload_token)}"
+    completed_time = _format_elapsed_seconds(summary.get("elapsed_seconds"))
+    completed_time_html = (
+        f"  <p><strong>Time to completed:</strong> {html.escape(completed_time)}</p>\n"
+        if completed_time
+        else ""
+    )
     return _html_page(
         "Box Optimizer Results",
         f"""
 <h1>Optimization Results</h1>
 <div class="summary">
   <p><strong>Job ID:</strong> {html.escape(record['job_id'])}</p>
+{completed_time_html}  <p><strong>Status:</strong> {html.escape(str(record.get('status') or ''))}</p>
   <p><strong>Orders processed:</strong> {_summary_value(summary, 'orders_processed')}</p>
   <p><strong>Boxes created:</strong> {_summary_value(summary, 'boxes_created')}</p>
   <p><strong>Box types used:</strong> {_summary_value(summary, 'box_types')}</p>
@@ -500,12 +949,17 @@ def _error_page(
     upload_token: str | None = None,
     status_code: int = 400,
     return_path: str = "/upload",
+    received_post: bool | None = None,
 ) -> HTMLResponse:
+    received_post_html = ""
+    if received_post is not None:
+        received_post_html = f"<p><strong>FastAPI received POST:</strong> {'yes' if received_post else 'no'}</p>"
     return _html_page(
         "Box Optimizer Error",
         f"""
 <h1>Optimization could not finish</h1>
 <div class="error">{html.escape(message)}</div>
+{received_post_html}
 <p><a href="{html.escape(return_path + _token_query(upload_token))}">Return to upload page</a></p>
 """,
         status_code=status_code,
@@ -552,14 +1006,21 @@ def upload_page(
     upload_token: str | None = None,
     token: str | None = None,
     job_config: str | None = None,
+    mode: str | None = None,
 ):
-    """Return an employee-friendly upload page for daily optimizer use."""
+    """Return the single employee-friendly upload page for Railway and local use."""
     try:
         provided_token = _require_upload_access(upload_token=upload_token, token=token)
     except HTTPException as exc:
         return _error_page(str(exc.detail), status_code=exc.status_code)
-    config_text = job_config or _default_upload_config_text()
-    return _upload_form_html(config_text=config_text, upload_token=provided_token)
+    selected_mode = mode if mode in {"railway_fast", "railway_balanced_30", "railway_balanced_60", "local_power_300", "local_power_balanced_300"} else "railway_fast"
+    config_text = job_config or (_power_upload_config_text() if selected_mode in {"local_power_300", "local_power_balanced_300"} else _default_upload_config_text())
+    return _upload_form_html(
+        config_text=config_text,
+        upload_token=provided_token,
+        show_campaign_intake=True,
+        default_packing_mode_choice=selected_mode,
+    )
 
 
 def _run_upload_job(
@@ -569,6 +1030,7 @@ def _run_upload_job(
     config_json: str | None,
     upload_token: str | None,
     default_config: dict[str, Any],
+    final_config: dict[str, Any] | None = None,
     return_path: str,
 ) -> HTMLResponse:
     started = time.perf_counter()
@@ -583,7 +1045,11 @@ def _run_upload_job(
     try:
         _cleanup_expired_jobs()
         job_dir.mkdir(parents=True, exist_ok=False)
-        config = _parse_config(config_json or default_config)
+        if final_config is None:
+            submitted_config = _parse_config(config_json) if config_json is not None else {}
+            config = {**default_config, **submitted_config}
+        else:
+            config = final_config
         if config.get("debug"):
             logger.setLevel(logging.DEBUG)
 
@@ -631,7 +1097,7 @@ def _run_upload_job(
             _write_job_record(job_dir, record)
         except OSError:
             pass
-        return _error_page(str(exc.detail), upload_token=provided_token, status_code=exc.status_code, return_path=return_path)
+        return _error_page(str(exc.detail), upload_token=provided_token, status_code=exc.status_code, return_path=return_path, received_post=True)
     except Exception as exc:
         logger.exception("upload optimization failed")
         message = str(exc) or "Optimization failed."
@@ -649,83 +1115,89 @@ def _run_upload_job(
             _write_job_record(job_dir, record)
         except OSError:
             pass
-        return _error_page(message, upload_token=provided_token, status_code=500, return_path=return_path)
+        return _error_page(message, upload_token=provided_token, status_code=500, return_path=return_path, received_post=True)
 
 
 @app.post("/upload", response_class=HTMLResponse, include_in_schema=False)
 def upload_workbooks(
-    sku_master_file: UploadFile = File(...),
-    orders_file: UploadFile = File(...),
+    sku_master_file: UploadFile | None = File(default=None),
+    orders_file: UploadFile | None = File(default=None),
     config_json: str | None = Form(default=None),
     upload_token: str | None = Form(default=None),
+    campaign_name: str | None = Form(default=None),
+    campaign_code: str | None = Form(default=None),
+    campaign_notes: str | None = Form(default=None),
+    packing_mode_choice: str | None = Form(default="railway_fast"),
+    ship_as_is_skus: str | None = Form(default=None),
+    no_padding_skus: str | None = Form(default=None),
+    wrap_around_skus: str | None = Form(default=None),
+    wrapped_height_cm: str | None = Form(default=None),
+    compressible_skus: str | None = Form(default=None),
+    compressed_height_ratio: str | None = Form(default=None),
+    compressed_volume_ratio: str | None = Form(default=None),
 ):
-    """Run the existing optimizer from the employee upload page and return an HTML result."""
+    """Run the optimizer from the single upload page and build structured rules server-side."""
+    if sku_master_file is None or orders_file is None:
+        return _error_page(
+            "FastAPI received the upload request, but both SKU and orders files are required.",
+            upload_token=upload_token,
+            status_code=400,
+            return_path="/upload",
+            received_post=True,
+        )
+    structured_config = _structured_upload_config(
+        campaign_name=campaign_name,
+        campaign_code=campaign_code,
+        campaign_notes=campaign_notes,
+        packing_mode_choice=packing_mode_choice,
+        ship_as_is_skus=ship_as_is_skus,
+        no_padding_skus=no_padding_skus,
+        wrap_around_skus=wrap_around_skus,
+        wrapped_height_cm=wrapped_height_cm,
+        compressible_skus=compressible_skus,
+        compressed_height_ratio=compressed_height_ratio,
+        compressed_volume_ratio=compressed_volume_ratio,
+    )
+    try:
+        final_config = _final_upload_config(config_json, structured_config)
+    except HTTPException as exc:
+        return _error_page(
+            str(exc.detail),
+            upload_token=upload_token,
+            status_code=exc.status_code,
+            return_path="/upload",
+            received_post=True,
+        )
     return _run_upload_job(
         sku_master_file=sku_master_file,
         orders_file=orders_file,
         config_json=config_json,
         upload_token=upload_token,
         default_config=DEFAULT_UPLOAD_CONFIG,
+        final_config=final_config,
         return_path="/upload",
     )
 
-
-@app.get("/power-upload", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/power-upload", include_in_schema=False)
 def power_upload_page(
     upload_token: str | None = None,
     token: str | None = None,
     job_config: str | None = None,
 ):
-    """Return a local-only power page for high-accuracy balanced runs."""
-    if not _power_upload_enabled():
-        return _html_page(
-            "Power Upload Disabled",
-            """
-<h1>Power Upload Disabled</h1>
-<p>This local power page is disabled. Enable it on your computer with <code>BOX_OPTIMIZER_ENABLE_POWER_UPLOAD=true</code>.</p>
-""",
-            status_code=404,
-        )
-    try:
-        provided_token = _require_upload_access(upload_token=upload_token, token=token)
-    except HTTPException as exc:
-        return _error_page(str(exc.detail), status_code=exc.status_code, return_path="/power-upload")
-    config_text = job_config or _power_upload_config_text()
-    return _upload_form_html(
-        config_text=config_text,
-        upload_token=provided_token,
-        title="Box Optimizer Power Upload",
-        action="/power-upload",
-        intro="Run higher-accuracy balanced optimizations on this computer.",
-        notice="Power Balanced Mode is intended for local runs. It may take several minutes. Railway daily default remains fast.",
-    )
+    """Compatibility shortcut to the single upload page with local power defaults."""
+    params = {"mode": "local_power_balanced_300"}
+    provided_token = upload_token or token
+    if provided_token:
+        params["upload_token"] = provided_token
+    if job_config:
+        params["job_config"] = job_config
+    return RedirectResponse(url=f"/upload?{urlencode(params)}", status_code=303)
 
 
-@app.post("/power-upload", response_class=HTMLResponse, include_in_schema=False)
-def power_upload_workbooks(
-    sku_master_file: UploadFile = File(...),
-    orders_file: UploadFile = File(...),
-    config_json: str | None = Form(default=None),
-    upload_token: str | None = Form(default=None),
-):
-    """Run the existing upload job workflow with local power balanced defaults."""
-    if not _power_upload_enabled():
-        return _html_page(
-            "Power Upload Disabled",
-            """
-<h1>Power Upload Disabled</h1>
-<p>This local power page is disabled. Enable it on your computer with <code>BOX_OPTIMIZER_ENABLE_POWER_UPLOAD=true</code>.</p>
-""",
-            status_code=404,
-        )
-    return _run_upload_job(
-        sku_master_file=sku_master_file,
-        orders_file=orders_file,
-        config_json=config_json,
-        upload_token=upload_token,
-        default_config=POWER_UPLOAD_CONFIG,
-        return_path="/power-upload",
-    )
+@app.post("/power-upload", include_in_schema=False)
+def power_upload_workbooks():
+    """Deprecated compatibility route; use /upload for all local runs."""
+    return RedirectResponse(url="/upload", status_code=307)
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 def job_status(job_id: str, upload_token: str | None = None, token: str | None = None):

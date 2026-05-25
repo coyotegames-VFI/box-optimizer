@@ -1,8 +1,13 @@
 import pytest
 
 from box_optimizer.models import Dimensions
+from box_optimizer.packing.packer import Placement
 from box_optimizer.standardization import (
     OptimizedOrderCarton,
+    VENDOR_BOXES,
+    VendorBox,
+    _guarded_vendor_fit_candidates,
+    _vendor_candidates,
     optimize_and_standardize_orders,
     sort_dimensions,
     standardize_optimized_cartons,
@@ -13,13 +18,20 @@ def test_sort_dimensions_largest_to_smallest():
     assert sort_dimensions(Dimensions(2, 5, 3)) == Dimensions(5, 3, 2)
 
 
-def _optimized(order_id: str, combo: str, dimensions: Dimensions, chargeable_weight_kg: float = 1):
+def _optimized(
+    order_id: str,
+    combo: str,
+    dimensions: Dimensions,
+    chargeable_weight_kg: float = 1,
+    allow_vendor_box_fit_tolerance: bool = False,
+):
     return OptimizedOrderCarton(
         order_id=order_id,
         combination_key=combo,
         optimized_dimensions=dimensions,
         chargeable_weight_kg=chargeable_weight_kg,
         placements=[],
+        allow_vendor_box_fit_tolerance=allow_vendor_box_fit_tolerance,
     )
 
 
@@ -260,6 +272,132 @@ def test_vendor_box_menu_assigns_small_addon_carton_to_smallest_safe_box_not_vb3
     assert assignments[0].vendor_box_id == "16"
     assert assignments[0].box_type == "Vendor Box 16"
     assert assignments[0].selection_decision == "vendor_smallest_safe_fit"
+
+
+def test_vendor_box_candidates_score_cut_down_height_before_billing_band_filter():
+    carton = OptimizedOrderCarton(
+        order_id="order-1",
+        combination_key="Flat x1",
+        optimized_dimensions=Dimensions(43, 30, 13),
+        chargeable_weight_kg=3.4,
+        placements=[
+            Placement(
+                canonical_sku="Flat",
+                quantity=1,
+                dimensions=Dimensions(43, 30, 8),
+                origin=(0, 0, 0),
+                weight_kg=1,
+            )
+        ],
+    )
+
+    candidates = _vendor_candidates(
+        carton,
+        VENDOR_BOXES,
+        band_size_kg=1.0,
+        same_band_only=True,
+    )
+
+    assert candidates
+    billed, chargeable, volume_cm3, vendor_box, assigned_dimensions = candidates[0]
+    assert vendor_box.vendor_id == "39"
+    assert billed == 4
+    assert chargeable < 4
+    assert volume_cm3 == vendor_box.dimensions.length * vendor_box.dimensions.width * 10
+    assert assigned_dimensions.height == 10
+
+
+def test_vendor_box_fit_tolerance_allows_small_real_world_carton_flex():
+    assignments = standardize_optimized_cartons(
+        [
+            _optimized(
+                "order-1",
+                "Soft Combo x1",
+                Dimensions(36.2, 34.8, 20),
+                chargeable_weight_kg=5,
+                allow_vendor_box_fit_tolerance=True,
+            )
+        ],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        vendor_box_fit_tolerance_cm=1.5,
+    )
+
+    assert assignments[0].vendor_box_id == "21"
+    assert assignments[0].assigned_length_cm == 36.2
+    assert assignments[0].assigned_width_cm == 35
+    assert assignments[0].assigned_height_cm == 21
+    assert "fit tolerance" in assignments[0].box_standardization_note
+
+
+def test_vendor_box_fit_tolerance_requires_carton_eligibility():
+    assignments = standardize_optimized_cartons(
+        [_optimized("order-1", "Rigid Combo x1", Dimensions(36.2, 34.8, 20), chargeable_weight_kg=5)],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        vendor_box_fit_tolerance_cm=1.5,
+    )
+
+    assert assignments[0].vendor_box_id != "21"
+    assert "fit tolerance" not in assignments[0].box_standardization_note
+
+
+def test_vendor_box_fit_tolerance_is_capped_at_two_cm():
+    assignments = standardize_optimized_cartons(
+        [_optimized("order-1", "Too Big x1", Dimensions(37.2, 35, 20), chargeable_weight_kg=5)],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        vendor_box_fit_tolerance_cm=3,
+    )
+
+    assert assignments[0].vendor_box_id != "21"
+
+
+def test_vendor_box_fit_guardrail_rejects_flex_when_chargeable_increase_is_too_high():
+    flex_box = VendorBox("FLEX", Dimensions(34, 34, 21))
+    baseline_box = VendorBox("BASE", Dimensions(40, 27, 21))
+    flex_candidate = (
+        6.0,
+        5.6,
+        35.5 * 34 * 21,
+        flex_box,
+        Dimensions(35.5, 34, 21),
+    )
+    baseline_candidate = (
+        6.0,
+        4.6,
+        40 * 27 * 21,
+        baseline_box,
+        Dimensions(40, 27, 21),
+    )
+
+    guarded = _guarded_vendor_fit_candidates([flex_candidate], [baseline_candidate], 0.25)
+
+    assert guarded == []
+
+
+def test_vendor_box_fit_guardrail_allows_flex_when_it_keeps_billed_weight_lower():
+    flex_box = VendorBox("FLEX", Dimensions(34, 34, 21))
+    baseline_box = VendorBox("BASE", Dimensions(40, 27, 21))
+    flex_candidate = (
+        5.0,
+        5.6,
+        35.5 * 34 * 21,
+        flex_box,
+        Dimensions(35.5, 34, 21),
+    )
+    baseline_candidate = (
+        6.0,
+        4.6,
+        40 * 27 * 21,
+        baseline_box,
+        Dimensions(40, 27, 21),
+    )
+
+    guarded = _guarded_vendor_fit_candidates([flex_candidate], [baseline_candidate], 0.25)
+
+    assert guarded == [flex_candidate]
+
 
 def test_vendor_box_menu_uses_vendor_box_even_when_400_custom_minimum_is_met():
     cartons = [

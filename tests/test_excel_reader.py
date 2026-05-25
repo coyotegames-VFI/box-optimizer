@@ -255,6 +255,31 @@ def test_wide_format_order_parsing_creates_order_lines(tmp_path):
     assert all(line.country == "US" for line in lines)
 
 
+def test_wide_format_vfi_backer_metadata_columns_are_not_product_columns(tmp_path):
+    path = tmp_path / "backers.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "Backer Data": [
+                ["VFI #", "Shipping name", "phone", "email", "add 1", "add 2", "Shipping City", "Shipping State", "Shipping Postal Code", "Ship to Country Code", "SKU-A", "SKU-B"],
+                ["1", "Garrett Hunter", "2507556593", "person@example.com", "1124 2 Avenue", "", "Ladysmith", "British Columbia", "V9G1J5", "CA", "1", "0"],
+                ["2", "Jordan Horn", "6048192565", "j@example.com", "45640 alma avenue", "408", "Chilliwack", "British Columbia", "V2R0P8", "CA", "0", "2"],
+            ]
+        },
+    )
+
+    lines = read_orders(str(path))
+
+    assert [(line.order_id, line.raw_sku, line.quantity) for line in lines] == [
+        ("1", "SKU-A", 1),
+        ("2", "SKU-B", 2),
+    ]
+    assert all(line.raw_sku not in {"VFI #", "add 2"} for line in lines)
+    assert lines[0].country == "CA"
+    assert lines[0].metadata["Shipping name"] == "Garrett Hunter"
+    assert lines[1].metadata["add 2"] == "408"
+
+
 def test_wide_format_metadata_columns_are_not_product_columns(tmp_path):
     path = tmp_path / "orders.csv"
     _write_csv(
@@ -323,6 +348,118 @@ def test_xlsx_reader_merges_row_one_product_headers_with_row_two_metadata_header
     assert lines[0].metadata["Backer Number"] == "B-100"
     assert lines[0].metadata["Email"] == "grace@example.com"
 
+
+def test_wide_format_skips_total_row_without_backer_identity(tmp_path):
+    path = tmp_path / "backers.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "Backer Data": [
+                ["VFI #", "Backer ID", "Shipping name", "email", "Country", "SKU-A", "SKU-B"],
+                ["1", "B-1", "Ada", "ada@example.com", "US", "1", "0"],
+                ["", "", "", "", "", "12", "8"],
+            ]
+        },
+    )
+
+    lines = read_orders(str(path))
+
+    assert [(line.order_id, line.raw_sku, line.quantity) for line in lines] == [("1", "SKU-A", 1)]
+
+
+
+
+def test_sku_master_expands_merged_dimension_header_and_mm_units(tmp_path):
+    sku_path = tmp_path / "sku_master.xlsx"
+    _write_xlsx(
+        sku_path,
+        {
+            "SKU INFORMATION": [
+                ["SKU", "Total Units Arriving to Warehouse", "Individual Unit Dimensions (mm)", "", "", "Unit Weight (g)", "Unit Weight (kg)"],
+                ["MOONCOLBOX", "38", "408", "280", "127", "6700", "6.7"],
+            ]
+        },
+    )
+
+    items = read_sku_master(str(sku_path))
+
+    assert len(items) == 1
+    assert items[0].canonical_sku == "MOONCOLBOX"
+    assert round(items[0].length_cm, 1) == 40.8
+    assert round(items[0].width_cm, 1) == 28.0
+    assert round(items[0].height_cm, 1) == 12.7
+    assert items[0].weight_kg == 6.7
+
+
+def test_wide_backer_list_uses_sku_columns_after_merged_dimension_sku_parse(tmp_path):
+    sku_path = tmp_path / "sku_master.xlsx"
+    orders_path = tmp_path / "orders.xlsx"
+    _write_xlsx(
+        sku_path,
+        {
+            "SKU INFORMATION": [
+                ["SKU", "Total Units Arriving to Warehouse", "Individual Unit Dimensions (mm)", "", "", "Unit Weight (g)", "Unit Weight (kg)"],
+                ["MOONCOLBOX", "38", "408", "280", "127", "6700", "6.7"],
+            ]
+        },
+    )
+    _write_xlsx(
+        orders_path,
+        {
+            "PHYSICAL FULFILLMENT": [
+                ["Id", "Name", "Email", "Address State", "Address Country", "Order ID", "MOONCOLBOX"],
+                ["37043809", "Harry", "harry@example.com", "VIC", "AU", "25150171", "1"],
+            ]
+        },
+    )
+
+    result = read_intake(str(sku_path), str(orders_path))
+
+    assert len(result.sku_items) == 1
+    assert len(result.matched_order_lines) == 1
+    line = result.matched_order_lines[0]
+    assert line.order_id == "25150171"
+    assert line.canonical_sku == "MOONCOLBOX"
+    assert line.quantity == 1
+    assert line.country == "AU"
+    assert line.state_province == "VIC"
+    assert line.metadata["Name"] == "Harry"
+    assert result.unmatched_skus == []
+
+def test_intake_ignores_non_order_sheets_and_only_uses_sku_master_product_columns(tmp_path):
+    sku_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.xlsx"
+    _write_csv(
+        sku_path,
+        [
+            {"SKU": "SKU-A", "Product Name": "Core Game", "Dimensions": "10 x 5 x 3", "Weight kg": "1"},
+            {"SKU": "SKU-B", "Product Name": "Expansion", "Dimensions": "8 x 4 x 2", "Weight kg": "0.5"},
+        ],
+    )
+    _write_xlsx(
+        orders_path,
+        {
+            "Backer Data": [
+                ["VFI #", "Backer ID", "Shipping name", "email", "Country", "SKU-A", "SKU-B"],
+                ["1", "B-1", "Ada", "ada@example.com", "US", "1", "2"],
+                ["", "", "", "", "", "20", "30"],
+            ],
+            "SF Asia": [
+                ["Order Id", "Name", "Phone Number", "Email", "Country", "Item Total", "Declared Name", "Unit Price", "No. of Packages"],
+                ["0104BIOS1", "Ada", "123", "ada@example.com", "CN", "99", "Board Game", "10", "1"],
+                ["0104BIOS", "0", "0", "0", "0", "#REF!", "Board Game", "#REF!", "3"],
+            ],
+        },
+    )
+
+    result = read_intake(str(sku_path), str(orders_path))
+
+    assert [(line.order_id, line.raw_sku, line.quantity) for line in result.order_lines] == [
+        ("1", "SKU-A", 1),
+        ("1", "SKU-B", 2),
+    ]
+    assert result.unmatched_skus == []
+    assert result.debug["detected_product_quantity_columns"] == ["SKU-A", "SKU-B"]
 
 def test_wide_format_product_header_matches_sku_master_product_name(tmp_path):
     sku_path = tmp_path / "sku_master.csv"

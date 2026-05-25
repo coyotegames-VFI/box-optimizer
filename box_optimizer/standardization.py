@@ -31,6 +31,7 @@ class OptimizedOrderCarton:
     optimized_dimensions: Dimensions
     chargeable_weight_kg: float
     placements: list = None
+    allow_vendor_box_fit_tolerance: bool = False
 
 
 @dataclass(frozen=True)
@@ -206,11 +207,80 @@ def _box_volume(dimensions: Dimensions) -> float:
     return dimensions.length * dimensions.width * dimensions.height
 
 
-def _fits_with_rotation(item: Dimensions, carton: Dimensions) -> bool:
+def _ceil_cm(value: float) -> int:
+    return int(value) if float(value).is_integer() else int(value) + 1
+
+
+def _placement_top_height(placements: list | None) -> float:
+    if not placements:
+        return 0.0
+    return max(
+        (
+            (placement.origin[2] if placement.origin else 0)
+            + placement.dimensions.height
+            for placement in placements
+        ),
+        default=0.0,
+    )
+
+
+def _vendor_score_dimensions(
+    carton: OptimizedOrderCarton,
+    vendor_box: VendorBox,
+    tolerance_cm: float = 0,
+) -> Dimensions:
+    packed_height = _placement_top_height(carton.placements)
+    if not packed_height:
+        score_dimensions = vendor_box.dimensions
+    else:
+        cut_height = min(vendor_box.dimensions.height, _ceil_cm(packed_height + 2))
+        score_dimensions = Dimensions(
+            length=vendor_box.dimensions.length,
+            width=vendor_box.dimensions.width,
+            height=cut_height,
+        )
+    if tolerance_cm <= 0:
+        return score_dimensions
+    return Dimensions(
+        length=max(score_dimensions.length, carton.optimized_dimensions.length),
+        width=max(score_dimensions.width, carton.optimized_dimensions.width),
+        height=max(score_dimensions.height, carton.optimized_dimensions.height),
+    )
+
+
+def _uses_vendor_fit_tolerance(assigned_dimensions: Dimensions, vendor_dimensions: Dimensions) -> bool:
+    return (
+        assigned_dimensions.length > vendor_dimensions.length
+        or assigned_dimensions.width > vendor_dimensions.width
+        or assigned_dimensions.height > vendor_dimensions.height
+    )
+
+
+def _vendor_fit_tolerance_note(assigned_dimensions: Dimensions, vendor_box: VendorBox) -> str:
+    if not _uses_vendor_fit_tolerance(assigned_dimensions, vendor_box.dimensions):
+        return ""
+    overages = []
+    for label, assigned, nominal in [
+        ("L", assigned_dimensions.length, vendor_box.dimensions.length),
+        ("W", assigned_dimensions.width, vendor_box.dimensions.width),
+        ("H", assigned_dimensions.height, vendor_box.dimensions.height),
+    ]:
+        if assigned > nominal:
+            overages.append(f"{label}+{assigned - nominal:.1f} cm")
+    return " Uses measured fit tolerance for real-world carton flex: " + ", ".join(overages) + "."
+
+
+def _vendor_height_cutdown_note(assigned_dimensions: Dimensions, vendor_box: VendorBox) -> str:
+    if assigned_dimensions.height >= vendor_box.dimensions.height:
+        return ""
+    return f" Vendor box height cut down to {int(assigned_dimensions.height)} cm."
+
+
+def _fits_with_rotation(item: Dimensions, carton: Dimensions, tolerance_cm: float = 0) -> bool:
     return any(
-        rotation.length <= carton.length
-        and rotation.width <= carton.width
-        and rotation.height <= carton.height
+        rotation.length <= carton.length + tolerance_cm
+        and rotation.width <= carton.width + tolerance_cm
+        and rotation.height <= carton.height + tolerance_cm
         for rotation in {
             Dimensions(*values)
             for values in itertools.permutations(
@@ -221,18 +291,43 @@ def _fits_with_rotation(item: Dimensions, carton: Dimensions) -> bool:
     )
 
 
+def _fits_effective_vendor_dimensions(
+    item: Dimensions,
+    vendor_dimensions: Dimensions,
+    assigned_dimensions: Dimensions,
+    tolerance_cm: float,
+) -> bool:
+    if not _fits_with_rotation(item, vendor_dimensions, tolerance_cm=tolerance_cm):
+        return False
+    return (
+        assigned_dimensions.length <= vendor_dimensions.length + tolerance_cm + 1e-9
+        and assigned_dimensions.width <= vendor_dimensions.width + tolerance_cm + 1e-9
+        and assigned_dimensions.height <= vendor_dimensions.height + tolerance_cm + 1e-9
+    )
+
+
 def _vendor_candidates(
     carton: OptimizedOrderCarton,
     vendor_boxes: tuple[VendorBox, ...],
     band_size_kg: float,
     same_band_only: bool,
-) -> list[tuple[float, float, float, VendorBox]]:
+    vendor_box_fit_tolerance_cm: float = 0,
+) -> list[tuple[float, float, float, VendorBox, Dimensions]]:
     optimized_billed = _billed_weight_kg(carton.chargeable_weight_kg, band_size_kg)
+    tolerance_cm = max(0.0, min(float(vendor_box_fit_tolerance_cm or 0), 2.0))
     candidates = []
     for vendor_box in vendor_boxes:
-        if not _fits_with_rotation(carton.optimized_dimensions, vendor_box.dimensions):
+        if not _fits_with_rotation(carton.optimized_dimensions, vendor_box.dimensions, tolerance_cm=tolerance_cm):
             continue
-        vendor_dimensional_weight = dimensional_weight_kg(vendor_box.dimensions)
+        score_dimensions = _vendor_score_dimensions(carton, vendor_box, tolerance_cm=tolerance_cm)
+        if not _fits_effective_vendor_dimensions(
+            carton.optimized_dimensions,
+            vendor_box.dimensions,
+            score_dimensions,
+            tolerance_cm,
+        ):
+            continue
+        vendor_dimensional_weight = dimensional_weight_kg(score_dimensions)
         vendor_chargeable_weight = max(carton.chargeable_weight_kg, vendor_dimensional_weight)
         vendor_billed_weight = _billed_weight_kg(vendor_chargeable_weight, band_size_kg)
         if same_band_only and vendor_billed_weight > optimized_billed:
@@ -241,11 +336,35 @@ def _vendor_candidates(
             (
                 vendor_billed_weight,
                 vendor_chargeable_weight,
-                _box_volume(vendor_box.dimensions),
+                _box_volume(score_dimensions),
                 vendor_box,
+                score_dimensions,
             )
         )
     return sorted(candidates, key=lambda candidate: candidate[:3])
+
+
+def _guarded_vendor_fit_candidates(
+    candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
+    baseline_candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
+    max_chargeable_increase_kg: float,
+) -> list[tuple[float, float, float, VendorBox, Dimensions]]:
+    if not candidates or not baseline_candidates:
+        return candidates
+    baseline_billed, baseline_chargeable, _baseline_volume, _baseline_box, _baseline_dimensions = baseline_candidates[0]
+    guarded = []
+    for candidate in candidates:
+        billed, chargeable, _volume, vendor_box, assigned_dimensions = candidate
+        if _uses_vendor_fit_tolerance(assigned_dimensions, vendor_box.dimensions):
+            if billed > baseline_billed + 1e-9:
+                continue
+            if (
+                billed >= baseline_billed - 1e-9
+                and chargeable > baseline_chargeable + max_chargeable_increase_kg + 1e-9
+            ):
+                continue
+        guarded.append(candidate)
+    return guarded
 
 
 def _vendor_assignment(
@@ -254,7 +373,9 @@ def _vendor_assignment(
     vendor_box: VendorBox,
     note: str,
     decision: str,
+    assigned_dimensions: Dimensions | None = None,
 ) -> StandardizedBoxAssignment:
+    assigned = assigned_dimensions or vendor_box.dimensions
     return StandardizedBoxAssignment(
         order_id=carton.order_id,
         combination_key=carton.combination_key,
@@ -262,9 +383,9 @@ def _vendor_assignment(
         optimized_length_cm=carton.optimized_dimensions.length,
         optimized_width_cm=carton.optimized_dimensions.width,
         optimized_height_cm=carton.optimized_dimensions.height,
-        assigned_length_cm=vendor_box.dimensions.length,
-        assigned_width_cm=vendor_box.dimensions.width,
-        assigned_height_cm=vendor_box.dimensions.height,
+        assigned_length_cm=assigned.length,
+        assigned_width_cm=assigned.width,
+        assigned_height_cm=assigned.height,
         box_standardization_note=note,
         placements=carton.placements,
         vendor_box_id=vendor_box.vendor_id,
@@ -297,6 +418,9 @@ def _standardize_to_vendor_boxes(
     band_size_kg: float,
     custom_box_min_units: int,
     non_preferred_box_min_units: int,
+    vendor_box_fit_tolerance_cm: float = 0,
+    vendor_box_fit_tolerance_guardrail: bool = True,
+    vendor_box_fit_tolerance_max_chargeable_increase_kg: float = 1.0,
 ) -> list[StandardizedBoxAssignment]:
     demand_by_dimensions = Counter(
         _dimensions_key(carton.optimized_dimensions)
@@ -305,21 +429,41 @@ def _standardize_to_vendor_boxes(
     custom_names: dict[tuple[float, float, float], int] = {}
     assignments = []
     for carton in optimized_cartons:
+        effective_vendor_box_fit_tolerance_cm = (
+            vendor_box_fit_tolerance_cm if carton.allow_vendor_box_fit_tolerance else 0
+        )
+        baseline_vendor_candidates = _vendor_candidates(
+            carton,
+            VENDOR_BOXES,
+            band_size_kg=band_size_kg,
+            same_band_only=False,
+            vendor_box_fit_tolerance_cm=0,
+        )
         same_band_candidates = _vendor_candidates(
             carton,
             VENDOR_BOXES,
             band_size_kg=band_size_kg,
             same_band_only=True,
+            vendor_box_fit_tolerance_cm=effective_vendor_box_fit_tolerance_cm,
         )
+        if vendor_box_fit_tolerance_guardrail:
+            same_band_candidates = _guarded_vendor_fit_candidates(
+                same_band_candidates,
+                baseline_vendor_candidates,
+                vendor_box_fit_tolerance_max_chargeable_increase_kg,
+            )
         if same_band_candidates:
-            _billed, _chargeable, _volume, vendor_box = same_band_candidates[0]
+            _billed, _chargeable, _volume, vendor_box, assigned_dimensions = same_band_candidates[0]
             assignments.append(
                 _vendor_assignment(
                     carton,
                     f"Vendor Box {vendor_box.vendor_id}",
                     vendor_box,
-                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit within billing band.",
+                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit within billing band."
+                    + _vendor_height_cutdown_note(assigned_dimensions, vendor_box)
+                    + _vendor_fit_tolerance_note(assigned_dimensions, vendor_box),
                     "vendor_smallest_safe_same_band",
+                    assigned_dimensions=assigned_dimensions,
                 )
             )
             continue
@@ -329,16 +473,26 @@ def _standardize_to_vendor_boxes(
             VENDOR_BOXES,
             band_size_kg=band_size_kg,
             same_band_only=False,
+            vendor_box_fit_tolerance_cm=effective_vendor_box_fit_tolerance_cm,
         )
+        if vendor_box_fit_tolerance_guardrail:
+            all_vendor_candidates = _guarded_vendor_fit_candidates(
+                all_vendor_candidates,
+                baseline_vendor_candidates,
+                vendor_box_fit_tolerance_max_chargeable_increase_kg,
+            ) or baseline_vendor_candidates
         if all_vendor_candidates:
-            _billed, _chargeable, _volume, vendor_box = all_vendor_candidates[0]
+            _billed, _chargeable, _volume, vendor_box, assigned_dimensions = all_vendor_candidates[0]
             assignments.append(
                 _vendor_assignment(
                     carton,
                     f"Vendor Box {vendor_box.vendor_id}",
                     vendor_box,
-                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit.",
+                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit."
+                    + _vendor_height_cutdown_note(assigned_dimensions, vendor_box)
+                    + _vendor_fit_tolerance_note(assigned_dimensions, vendor_box),
                     "vendor_smallest_safe_fit",
+                    assigned_dimensions=assigned_dimensions,
                 )
             )
             continue
@@ -393,6 +547,9 @@ def standardize_optimized_cartons(
     billing_band_kg: float = 0.5,
     custom_box_min_units: int = 400,
     non_preferred_box_min_units: int = 100,
+    vendor_box_fit_tolerance_cm: float = 0,
+    vendor_box_fit_tolerance_guardrail: bool = True,
+    vendor_box_fit_tolerance_max_chargeable_increase_kg: float = 1.0,
 ) -> list[StandardizedBoxAssignment]:
     """Group optimized cartons into a practical shared campaign box menu."""
     if use_vendor_box_menu:
@@ -401,6 +558,9 @@ def standardize_optimized_cartons(
             band_size_kg=billing_band_kg,
             custom_box_min_units=custom_box_min_units,
             non_preferred_box_min_units=non_preferred_box_min_units,
+            vendor_box_fit_tolerance_cm=vendor_box_fit_tolerance_cm,
+            vendor_box_fit_tolerance_guardrail=vendor_box_fit_tolerance_guardrail,
+            vendor_box_fit_tolerance_max_chargeable_increase_kg=vendor_box_fit_tolerance_max_chargeable_increase_kg,
         )
 
     ordered = sorted(

@@ -208,14 +208,57 @@ def _header_score(values: list[object]) -> int:
     return len(mapping) * 4 + metadata_count * 3 + min(len(nonblank), 3)
 
 
+
+
+def _dimension_header_indices(headers: list[str]) -> tuple[int, int, int] | None:
+    for index, header in enumerate(headers):
+        normalized = re.sub(r"[^a-z0-9]+", "", str(header or "").lower())
+        if "dimension" not in normalized and "dims" not in normalized:
+            continue
+        if index + 2 >= len(headers):
+            continue
+        next_headers = [str(headers[index + offset] or "").strip() for offset in range(3)]
+        if all(next_headers):
+            continue
+        return index, index + 1, index + 2
+    return None
+
+
+def _expand_merged_dimension_headers(headers: list[str], table: list[list[object]]) -> list[str]:
+    expanded = list(headers)
+    indices = _dimension_header_indices(expanded)
+    if indices is None:
+        return expanded
+    length_index, width_index, height_index = indices
+    base = expanded[length_index]
+    if not base:
+        return expanded
+    sample_rows = table[1:6]
+    has_three_numeric_columns = all(
+        any(str(row[column] if column < len(row) else "").strip() for row in sample_rows)
+        for column in indices
+    )
+    if not has_three_numeric_columns:
+        return expanded
+    expanded[length_index] = f"Length {base}"
+    expanded[width_index] = f"Width {base}"
+    expanded[height_index] = f"Height {base}"
+    return expanded
+
 def _headers_and_data_start(table: list[list[object]]) -> tuple[list[str], int]:
-    first_headers = [str(value).strip() for value in table[0]]
-    first_score = _header_score(table[0])
+    first_headers = _expand_merged_dimension_headers(
+        [str(value).strip() for value in table[0]],
+        table,
+    )
+    first_score = _header_score(first_headers)
     if len(table) < 2:
         return first_headers, 1
 
-    second_headers = [str(value).strip() for value in table[1]]
-    second_score = _header_score(table[1])
+    second_headers = _expand_merged_dimension_headers(
+        [str(value).strip() for value in table[1]],
+        table[1:],
+    )
+    second_score = _header_score(second_headers)
     second_mapping = infer_columns(second_headers)
     second_has_header_signal = (
         any(is_metadata_column(header) for header in second_headers)
@@ -362,11 +405,30 @@ def read_sku_master(path: str) -> list[SKUItem]:
     return sku_items
 
 
-def _wide_product_columns(rows: list[dict], headers: list[str], explicit_mapping: dict) -> list[str]:
+def _product_header_keys(value: object) -> set[str]:
+    text = str(value or "").strip()
+    return {
+        key
+        for key in {
+            normalize_sku(text),
+            re.sub(r"[\\W_]+", "", text.lower()),
+        }
+        if key
+    }
+
+
+def _wide_product_columns(
+    rows: list[dict],
+    headers: list[str],
+    explicit_mapping: dict,
+    allowed_product_keys: set[str] | None = None,
+) -> list[str]:
     excluded = set(explicit_mapping.values())
     product_columns = []
     for header in headers:
         if header in excluded or is_metadata_column(header):
+            continue
+        if allowed_product_keys is not None and not (_product_header_keys(header) & allowed_product_keys):
             continue
         values = [row.get(header) for row in rows]
         nonblank = [value for value in values if str(value or "").strip()]
@@ -378,7 +440,30 @@ def _wide_product_columns(rows: list[dict], headers: list[str], explicit_mapping
     return product_columns
 
 
-def _read_orders_with_mappings(path: str) -> tuple[list[OrderLine], list[dict], int, int]:
+def _has_order_identity(row: dict, mapping: dict, metadata_columns: list[str]) -> bool:
+    order_header = mapping.get("order_id")
+    if order_header:
+        value = str(row.get(order_header, "") or "").strip()
+        if value and value.lower() not in {"0", "0.0", "none", "nan", "total", "totals"}:
+            return True
+    identity_headers = [
+        header
+        for header in metadata_columns
+        if is_metadata_column(header)
+        and re.search(r"backer|order|vfi|name|email|phone|address|add1|shipping|country|city|postal|zip", header, re.I)
+    ]
+    meaningful = 0
+    for header in identity_headers:
+        value = str(row.get(header, "") or "").strip()
+        if value and value.lower() not in {"0", "0.0", "none", "nan", "#ref!", "#value!"}:
+            meaningful += 1
+    return meaningful >= 2
+
+
+def _read_orders_with_mappings(
+    path: str,
+    allowed_product_keys: set[str] | None = None,
+) -> tuple[list[OrderLine], list[dict], int, int]:
     order_lines = []
     mappings = []
     rows_read = 0
@@ -396,7 +481,7 @@ def _read_orders_with_mappings(path: str) -> tuple[list[OrderLine], list[dict], 
             metadata_columns = [header for header in headers if header not in set(mapping.values())]
         else:
             detected_format = "wide-format"
-            product_columns = _wide_product_columns(source.rows, headers, mapping)
+            product_columns = _wide_product_columns(source.rows, headers, mapping, allowed_product_keys)
             wide_product_column_count += len(product_columns)
             metadata_columns = [header for header in headers if header not in product_columns]
             if not product_columns:
@@ -432,6 +517,8 @@ def _read_orders_with_mappings(path: str) -> tuple[list[OrderLine], list[dict], 
                 )
                 continue
 
+            if not _has_order_identity(row, mapping, metadata_columns):
+                continue
             metadata = {
                 header: row.get(header)
                 for header in metadata_columns
@@ -476,23 +563,53 @@ def _match_key(value: object) -> str:
     return re.sub(r"[\W_]+", "", text)
 
 
+def _soft_match_key(value: object, *, drop_pack: bool = False) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("â€œ", "\"").replace("â€", "\"").replace("â€™", "'").replace("Ã—", "x")
+    text = re.sub(r"\[[^\]]+\]", " ", text)
+    text = re.sub(
+        r"\((english|german|french|spanish|italian|polish|portuguese|russian|chinese|japanese|korean)\)",
+        " ",
+        text,
+    )
+    if drop_pack:
+        text = re.sub(r"\bpack\b", " ", text)
+    return re.sub(r"[\W_]+", "", text)
+
+
+def _match_keys(value: object) -> list[str]:
+    keys = [
+        normalize_sku(value),
+        _match_key(value),
+        _soft_match_key(value),
+        _soft_match_key(value, drop_pack=True),
+    ]
+    return [key for key in dict.fromkeys(keys) if key]
+
+
 def match_orders_to_sku_master(
     order_lines: list[OrderLine],
     sku_items: list[SKUItem],
 ) -> tuple[list[OrderLine], list[UnmatchedSKURecord]]:
     """Match order lines to SKU master records while preserving unmatched SKUs."""
     known_skus = {}
+    collisions = set()
     for item in sku_items:
         candidates = [item.canonical_sku, item.raw_sku, item.product_name, *item.aliases]
         for candidate in candidates:
             if candidate:
-                known_skus[normalize_sku(candidate)] = item.canonical_sku
-                known_skus[_match_key(candidate)] = item.canonical_sku
+                for key in _match_keys(candidate):
+                    if key in known_skus and known_skus[key] != item.canonical_sku:
+                        collisions.add(key)
+                        continue
+                    known_skus[key] = item.canonical_sku
+    for key in collisions:
+        known_skus.pop(key, None)
 
     matched = []
     unmatched = []
     for line in order_lines:
-        canonical = known_skus.get(line.canonical_sku) or known_skus.get(_match_key(line.raw_sku))
+        canonical = next((known_skus[key] for key in _match_keys(line.raw_sku) if key in known_skus), None)
         if canonical:
             matched.append(replace(line, canonical_sku=canonical))
         else:
@@ -509,7 +626,16 @@ def match_orders_to_sku_master(
 def read_intake(sku_master_path: str, orders_path: str) -> IntakeResult:
     """Read SKU and order files and return matched plus unmatched records."""
     sku_items, sku_mappings, sku_rows_read = _read_sku_master_with_mappings(sku_master_path)
-    order_lines, order_mappings, order_rows_read, wide_product_column_count = _read_orders_with_mappings(orders_path)
+    allowed_product_keys = {
+        key
+        for item in sku_items
+        for candidate in [item.canonical_sku, item.raw_sku, item.product_name, *item.aliases]
+        for key in _match_keys(candidate)
+    }
+    order_lines, order_mappings, order_rows_read, wide_product_column_count = _read_orders_with_mappings(
+        orders_path,
+        allowed_product_keys=allowed_product_keys,
+    )
     matched, unmatched = match_orders_to_sku_master(order_lines, sku_items)
     product_columns = []
     for mapping in order_mappings:

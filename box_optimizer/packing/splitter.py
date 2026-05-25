@@ -13,6 +13,7 @@ from box_optimizer.packing.packer import (
     _sort_items,
     optimize_carton_dimensions,
     optimize_carton_dimensions_fast,
+    pack_items,
 )
 from box_optimizer.standardization import (
     OptimizedOrderCarton,
@@ -205,7 +206,7 @@ def _vendor_score(result: OptimizedCartonResult) -> tuple[float, float, float, s
     if not candidates:
         candidates = _vendor_candidates(carton, VENDOR_BOXES, band_size_kg=1.0, same_band_only=False)
     if candidates:
-        billed, chargeable, box_volume, vendor_box = candidates[0]
+        billed, chargeable, box_volume, vendor_box, _assigned_dimensions = candidates[0]
         return (billed, chargeable, box_volume, vendor_box.vendor_id)
     return (
         result.chargeable_weight_kg or 0,
@@ -224,6 +225,66 @@ def _split_score(split_result: SplitResult) -> tuple[float, float, float, int, f
     vendor_volume = sum(score[2] for score in vendor_scores)
     local_box_types = len({score[3] for score in vendor_scores})
     return (split_result.box_qty, billed, chargeable, local_box_types, vendor_volume)
+
+
+def _placement_dimensions(placements) -> Dimensions:
+    return Dimensions(
+        length=max(placement.origin[0] + placement.dimensions.length for placement in placements),
+        width=max(placement.origin[1] + placement.dimensions.width for placement in placements),
+        height=max(placement.origin[2] + placement.dimensions.height for placement in placements),
+    )
+
+
+def _result_from_vendor_shaped_pack(items: list[PackedItem], vendor_dimensions: Dimensions) -> OptimizedCartonResult | None:
+    # Vendor boxes are outside dimensions; keep the existing +2 cm final exterior allowance
+    # by packing into the usable interior candidate for this quick warehouse-style pass.
+    interior = Dimensions(
+        length=vendor_dimensions.length - 2,
+        width=vendor_dimensions.width - 2,
+        height=vendor_dimensions.height - 2,
+    )
+    if interior.length <= 0 or interior.width <= 0 or interior.height <= 0:
+        return None
+    packed = pack_items(items, interior)
+    if not packed.success:
+        return None
+    dimensions = _placement_dimensions(packed.placements)
+    total_weight_kg = sum(item.weight_kg for item in items)
+    return OptimizedCartonResult(
+        success=True,
+        length_cm=dimensions.length,
+        width_cm=dimensions.width,
+        height_cm=dimensions.height,
+        chargeable_weight_kg=chargeable_weight_kg(dimensions, total_weight_kg),
+        volume_cm3=dimensions.length * dimensions.width * dimensions.height,
+        placements=packed.placements,
+        unplaced_items=[],
+    )
+
+
+def _vendor_shaped_fast_result(items: list[PackedItem], baseline: OptimizedCartonResult) -> OptimizedCartonResult:
+    expanded_items = _sort_items(_expand_items(items))
+    if len(expanded_items) < 2 or len(expanded_items) > 8:
+        return baseline
+
+    candidates = [SplitResult(True, 1, [SplitCarton(box_number=1, result=baseline)], [])]
+    for vendor_box in sorted(
+        VENDOR_BOXES,
+        key=lambda box: (
+            box.dimensions.length * box.dimensions.width * box.dimensions.height,
+            box.dimensions.length,
+            box.dimensions.width,
+            box.dimensions.height,
+            box.vendor_id,
+        ),
+    ):
+        candidate = _result_from_vendor_shaped_pack(expanded_items, vendor_box.dimensions)
+        if candidate is None:
+            continue
+        candidates.append(SplitResult(True, 1, [SplitCarton(box_number=1, result=candidate)], []))
+
+    best = min(candidates, key=_split_score)
+    return best.cartons[0].result
 
 
 def _item_volume(item: PackedItem) -> float:
@@ -430,6 +491,7 @@ def split_order_into_cartons(
     budget_is_low = remaining_budget_seconds is not None and remaining_budget_seconds <= balanced_min_remaining_seconds
 
     if packing_mode == "balanced" and single_box.success:
+        single_box = _vendor_shaped_fast_result(expanded_items, single_box)
         fast_single = SplitResult(
             success=True,
             box_qty=1,
@@ -449,6 +511,8 @@ def split_order_into_cartons(
             return min([fast_single, normal_single], key=_split_score)
         return fast_single
     if single_box.success:
+        if packing_mode == "fast":
+            single_box = _vendor_shaped_fast_result(expanded_items, single_box)
         return SplitResult(
             success=True,
             box_qty=1,
@@ -468,6 +532,10 @@ def split_order_into_cartons(
             min_remaining_seconds=balanced_min_remaining_seconds,
             remaining_budget_seconds=remaining_budget_seconds,
         )
+        return result if result.success else SplitResult(False, 0, [], result.unplaced_items or best_failure)
+
+    if len(expanded_items) > 8:
+        result = _fast_greedy_split(expanded_items)
         return result if result.success else SplitResult(False, 0, [], result.unplaced_items or best_failure)
 
     for box_count in range(2, len(expanded_items) + 1):

@@ -12,27 +12,12 @@ def _sorted_dimensions(dimensions: Dimensions) -> Dimensions:
 
 
 def add_padding(dimensions: Dimensions) -> Dimensions:
-    """Add per-item tiered padding after normalization and bundling."""
+    """Add normal per-item or per-bundle padding after normalization."""
     normalized = _sorted_dimensions(dimensions)
-
-    is_small = normalized.length <= 7 and normalized.width <= 7 and normalized.height <= 3
-    is_medium = (
-        normalized.length <= 22
-        and normalized.width <= 22
-        and normalized.height <= 5
-    )
-
-    if is_small:
-        padding = Dimensions(length=2, width=2, height=2)
-    elif is_medium:
-        padding = Dimensions(length=3, width=2, height=2)
-    else:
-        padding = Dimensions(length=3, width=3, height=2)
-
     return Dimensions(
-        length=normalized.length + padding.length,
-        width=normalized.width + padding.width,
-        height=normalized.height + padding.height,
+        length=normalized.length + 2,
+        width=normalized.width + 2,
+        height=normalized.height + 2,
     )
 
 

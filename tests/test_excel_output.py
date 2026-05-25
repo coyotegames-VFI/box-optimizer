@@ -43,13 +43,17 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[:4] == [
+    assert sheet_names[:8] == [
         "Summary",
-        "Order Volume Weights",
+        "Cost Summary",
+        "VFI Intake Form",
         "Optimized to Pack",
+        "Label generator",
+        "Labels",
+        "Order Volume Weights",
         "Box Size Summary",
     ]
-    assert sheet_names[4:] == ["Unmatched SKUs"]
+    assert sheet_names[8:] == ["Unmatched SKUs"]
 
 
 def test_write_workbook_freezes_headers_applies_filters_and_widths(tmp_path):
@@ -74,6 +78,33 @@ def test_write_workbook_includes_units_in_headers(tmp_path):
     assert rows == [{"Length (cm)": "10", "Width (cm)": "8", "Volume (cm3)": "800"}]
 
 
+
+
+def test_write_workbook_rounds_measure_outputs_to_one_decimal_without_touching_money(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        vfi_intake_form_rows=[
+            {
+                "Length Individual Unit Dimensions (mm)": 40.800000000000004,
+                "Unit Weight (kg)": 0.16250000000000001,
+                "Customer Shipping Fee": 120.83,
+                "Backer ID": "37043626",
+            }
+        ],
+        packing_detail_rows=[{"Placement X cm": 31.400000000000002}],
+    )
+
+    intake_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "VFI Intake Form")
+    packing_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Packing Detail")
+
+    assert intake_rows[0]["Length Individual Unit Dimensions (mm)"] == "40.8"
+    assert intake_rows[0]["Unit Weight (kg)"] == "0.2"
+    assert intake_rows[0]["Customer Shipping Fee"] == "120.83"
+    assert intake_rows[0]["Backer ID"] == "37043626"
+    assert packing_rows[0]["Placement X cm"] == "31.4"
+
 def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
     path = tmp_path / "report.xlsx"
 
@@ -87,8 +118,12 @@ def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
 
     assert _workbook_sheet_names(path) == [
         "Summary",
-        "Order Volume Weights",
+        "Cost Summary",
+        "VFI Intake Form",
         "Optimized to Pack",
+        "Label generator",
+        "Labels",
+        "Order Volume Weights",
         "Box Size Summary",
         "Multi Box Detail",
         "Packing Detail",
@@ -114,12 +149,13 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
         ],
     )
 
-    rows = read_workbook(str(path))[1].rows
+    rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Order Volume Weights")
     headers = list(rows[0].keys())
 
-    assert headers[:14] == [
+    assert headers[:18] == [
         "Region",
         "Order ID",
+        "VFI #",
         "Country",
         "State/Province",
         "US State Abbreviation",
@@ -127,13 +163,16 @@ def test_order_volume_weights_leads_with_required_columns_then_metadata(tmp_path
         "Dimensional Weight kg (/5000)",
         "Chargeable Weight kg",
         "Chargeable Weight g",
+        "Customer Cost",
+        "Estimated VFI Cost",
+        "Margin",
         "Total Units",
         "Box Qty",
         "Box Plan",
         "Per-Box Chargeable Weight",
         "SKU Breakdown",
     ]
-    assert headers[14:] == ["Pledge Level", "Shipping Notes"]
+    assert headers[18:] == ["Pledge Level", "Shipping Notes"]
     assert rows[0]["Pledge Level"] == "Deluxe"
     assert rows[0]["Shipping Notes"] == "Leave at door"
 
@@ -143,8 +182,10 @@ def test_empty_order_volume_weights_still_has_required_headers(tmp_path):
 
     write_workbook(str(path))
 
+    sheet_names = _workbook_sheet_names(path)
+    order_sheet_index = sheet_names.index("Order Volume Weights") + 1
     with zipfile.ZipFile(path) as archive:
-        xml = archive.read("xl/worksheets/sheet2.xml").decode("utf-8")
+        xml = archive.read(f"xl/worksheets/sheet{order_sheet_index}.xml").decode("utf-8")
 
     assert "Region" in xml
     assert "SKU Breakdown" in xml

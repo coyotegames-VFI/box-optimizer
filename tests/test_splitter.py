@@ -2,7 +2,7 @@ from collections import Counter
 
 from box_optimizer.models import Dimensions, PackedItem
 from box_optimizer.packing.packer import MAX_CARTON_DIMENSIONS, OptimizedCartonResult
-from box_optimizer.packing.splitter import split_items, split_order_into_cartons
+from box_optimizer.packing.splitter import _display_candidate_dimensions, _vendor_score, split_items, split_order_into_cartons
 
 
 def test_split_items_chunks_items():
@@ -80,6 +80,20 @@ def test_split_order_total_packed_skus_equal_original_ordered_skus():
     assert result.success is True
     assert _packed_sku_counts(result) == expected
 
+
+def test_large_normal_mode_order_falls_back_without_combinatorial_search(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("large normal mode should not run combinatorial assignment search")
+
+    monkeypatch.setattr("box_optimizer.packing.splitter._canonical_assignments", fail_if_called)
+
+    result = split_order_into_cartons(
+        [_item("large-panel", Dimensions(45, 35, 30), 2, quantity=9)],
+        packing_mode="normal",
+    )
+
+    assert result.success is True
+    assert result.box_qty == 9
 
 def test_fast_mode_uses_simple_split_without_combinatorial_search(monkeypatch):
     def fail_if_called(*args, **kwargs):
@@ -256,4 +270,47 @@ def test_balanced_high_complexity_combo_uses_fast_baseline_without_deep_search(m
     assert result.success is True
     assert result.box_qty == 1
     assert normal_calls == []
+
+def test_fast_mode_uses_vendor_shaped_cube_candidate_for_medium_rectangles():
+    result = split_order_into_cartons(
+        [
+            _item("A", Dimensions(30, 25, 6.5), 0),
+            _item("B", Dimensions(25, 25, 9.5), 0),
+        ],
+        packing_mode="fast",
+    )
+
+    assert result.success is True
+    assert result.box_qty == 1
+    carton = result.cartons[0].result
+    assert (carton.length_cm, carton.width_cm, carton.height_cm) == (30, 25, 16.0)
+    assert _display_candidate_dimensions(Dimensions(carton.length_cm, carton.width_cm, carton.height_cm)) == Dimensions(32, 27, 18)
+    assert _vendor_score(carton)[3] == "17"
+
+
+def test_balanced_single_box_baseline_uses_vendor_shaped_fast_candidate():
+    result = split_order_into_cartons(
+        [
+            _item("A", Dimensions(30, 25, 6.5), 0),
+            _item("B", Dimensions(25, 25, 9.5), 0),
+        ],
+        packing_mode="balanced",
+    )
+
+    assert result.success is True
+    assert result.box_qty == 1
+    assert _vendor_score(result.cartons[0].result)[3] == "17"
+
+
+def test_fast_mode_preserves_long_box_pattern_for_large_anchor_items():
+    result = split_order_into_cartons(
+        [_item(f"large-{index}", Dimensions(37, 35, 12), 0) for index in range(3)],
+        packing_mode="fast",
+    )
+
+    assert result.success is True
+    assert result.box_qty == 1
+    carton = result.cartons[0].result
+    assert (carton.length_cm, carton.width_cm, carton.height_cm) == (74, 35, 24)
+    assert _vendor_score(carton)[3] == "36"
 

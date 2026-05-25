@@ -20,9 +20,9 @@ _COLUMN_ALIASES = {
         "description",
         "productdescription",
     },
-    "length": {"length", "lengthcm", "lengthin", "l", "lcm", "lin"},
-    "width": {"width", "widthcm", "widthin", "w", "wcm", "win"},
-    "height": {"height", "heightcm", "heightin", "h", "hcm", "hin", "depth", "depthcm", "depthin"},
+    "length": {"length", "lengthcm", "lengthmm", "lengthin", "l", "lcm", "lmm", "lin"},
+    "width": {"width", "widthcm", "widthmm", "widthin", "w", "wcm", "wmm", "win"},
+    "height": {"height", "heightcm", "heightmm", "heightin", "h", "hcm", "hmm", "hin", "depth", "depthcm", "depthmm", "depthin"},
     "dimensions": {
         "dimensions",
         "dimension",
@@ -52,16 +52,30 @@ _COLUMN_ALIASES = {
         "backernumber",
         "backer",
         "backerid",
+        "vfi",
+        "vfiid",
+        "vfinumber",
     },
     "quantity": {"quantity", "qty", "count"},
     "region": {"region"},
-    "country": {"country", "shipcountry", "shippingcountry"},
+    "country": {
+        "country",
+        "countrycode",
+        "shipcountry",
+        "shippingcountry",
+        "shiptocountry",
+        "shiptocountrycode",
+        "addresscountry",
+        "fullcountry",
+    },
     "state_province": {
         "state",
         "province",
         "stateprovince",
         "shipstate",
         "shippingstate",
+        "addressstate",
+        "addressprovince",
     },
 }
 
@@ -80,21 +94,34 @@ METADATA_COLUMN_ALIASES = {
     "email",
     "phone",
     "company",
+    "vfi",
+    "vfiid",
+    "vfinumber",
+    "shippingname",
     "address",
+    "add1",
+    "add2",
     "address1",
     "address2",
     "addressline1",
     "addressline2",
     "city",
+    "shippingcity",
     "state",
     "province",
     "stateprovince",
     "country",
     "postal",
     "postalcode",
+    "shippingpostalcode",
     "zipcode",
     "zip",
     "shippingservice",
+    "servicetype",
+    "declaredname",
+    "itemtotal",
+    "unitprice",
+    "noofpackages",
     "shippingmethod",
     "shipservice",
     "shipmethod",
@@ -102,6 +129,8 @@ METADATA_COLUMN_ALIASES = {
     "shippingaddress",
     "shippingaddress1",
     "shippingaddress2",
+    "shiptocountry",
+    "shiptocountrycode",
     "shipaddress",
     "shipaddress1",
     "shipaddress2",
@@ -175,6 +204,20 @@ def infer_columns(headers: list[str]) -> dict[str, str]:
         for header, normalized in normalized_headers:
             if normalized in aliases and canonical not in mapping:
                 mapping[canonical] = header
+                break
+
+    for canonical in ["length", "width", "height"]:
+        if canonical in mapping:
+            continue
+        for header, normalized in normalized_headers:
+            if normalized.startswith(canonical) and ("dimension" in normalized or "dims" in normalized):
+                mapping[canonical] = header
+                break
+
+    if "weight" not in mapping:
+        for header, normalized in normalized_headers:
+            if "weight" in normalized and any(unit in normalized for unit in ["kg", "g", "lb", "lbs", "oz"]):
+                mapping["weight"] = header
                 break
 
     return mapping

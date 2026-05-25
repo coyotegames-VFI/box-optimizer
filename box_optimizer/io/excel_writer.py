@@ -7,8 +7,12 @@ import zipfile
 
 REQUIRED_SHEETS = [
     "Summary",
-    "Order Volume Weights",
+    "Cost Summary",
+    "VFI Intake Form",
     "Optimized to Pack",
+    "Label generator",
+    "Labels",
+    "Order Volume Weights",
     "Box Size Summary",
 ]
 
@@ -16,6 +20,7 @@ OPTIONAL_SHEETS = [
     "Unmatched SKUs",
     "Multi Box Detail",
     "Pledge Combination Summary",
+    "Debug Summary",
     "Packing Detail",
     "Input Column Mapping",
     "Errors and Warnings",
@@ -24,6 +29,7 @@ OPTIONAL_SHEETS = [
 ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Region",
     "Order ID",
+    "VFI #",
     "Country",
     "State/Province",
     "US State Abbreviation",
@@ -31,6 +37,9 @@ ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Dimensional Weight kg (/5000)",
     "Chargeable Weight kg",
     "Chargeable Weight g",
+    "Customer Cost",
+    "Estimated VFI Cost",
+    "Margin",
     "Total Units",
     "Box Qty",
     "Box Plan",
@@ -117,6 +126,46 @@ def _headers_for_sheet(sheet_name: str, rows: list[dict]) -> list[str]:
     return headers
 
 
+
+
+def _is_one_decimal_measure_column(header: str) -> bool:
+    normalized = header.lower()
+    if any(token in normalized for token in ["fee", "cost", "margin", "price", "rate"]):
+        return False
+    if normalized.endswith(" g") or normalized.endswith("g") and "kg" not in normalized:
+        return False
+    measure_tokens = [
+        " cm",
+        "kg",
+        " lb",
+        "weight",
+        "dimension",
+        "placement",
+        "length",
+        "width",
+        "height",
+    ]
+    return any(token in normalized for token in measure_tokens)
+
+
+def _format_measure_value(header: str, value: object) -> object:
+    if not _is_one_decimal_measure_column(header):
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        rounded = round(float(value), 1)
+        return int(rounded) if rounded.is_integer() else rounded
+    text = str(value).strip()
+    if not text:
+        return value
+    try:
+        number = float(text)
+    except ValueError:
+        return value
+    rounded = round(number, 1)
+    return int(rounded) if rounded.is_integer() else rounded
+
 def _rows_to_table(sheet_name: str, rows: list[dict]) -> tuple[list[str], list[list[object]]]:
     if not rows:
         if sheet_name == "Order Volume Weights":
@@ -125,7 +174,10 @@ def _rows_to_table(sheet_name: str, rows: list[dict]) -> tuple[list[str], list[l
 
     headers = _headers_for_sheet(sheet_name, rows)
     display_headers = [_header_with_units(header) for header in headers]
-    values = [[row.get(header, "") for header in headers] for row in rows]
+    values = [
+        [_format_measure_value(header, row.get(header, "")) for header in headers]
+        for row in rows
+    ]
     return display_headers, values
 
 
@@ -276,13 +328,18 @@ def _build_sheet_payloads(
 
     aliases = {
         "summary_rows": "Summary",
-        "order_volume_weights_rows": "Order Volume Weights",
+        "cost_summary_rows": "Cost Summary",
+        "vfi_intake_form_rows": "VFI Intake Form",
         "optimized_to_pack_rows": "Optimized to Pack",
+        "label_generator_rows": "Label generator",
+        "labels_rows": "Labels",
+        "order_volume_weights_rows": "Order Volume Weights",
         "box_size_summary_rows": "Box Size Summary",
         "unmatched_skus_rows": "Unmatched SKUs",
         "packing_detail_rows": "Packing Detail",
         "multi_box_detail_rows": "Multi Box Detail",
         "pledge_combination_summary_rows": "Pledge Combination Summary",
+        "debug_summary_rows": "Debug Summary",
         "input_column_mapping_rows": "Input Column Mapping",
         "errors_and_warnings_rows": "Errors and Warnings",
     }
@@ -291,12 +348,17 @@ def _build_sheet_payloads(
             payloads[sheet_name] = named_rows[key]
 
     ordered = [(name, payloads.get(name, [])) for name in REQUIRED_SHEETS]
+    required_and_optional = {*REQUIRED_SHEETS, *OPTIONAL_SHEETS}
+    for name, sheet_rows in payloads.items():
+        if name.startswith("Cost Summary -") and sheet_rows:
+            ordered[1] = (name, sheet_rows)
+            break
     for name in OPTIONAL_SHEETS:
         if payloads.get(name):
             ordered.append((name, payloads[name]))
 
     for name, sheet_rows in payloads.items():
-        if name not in REQUIRED_SHEETS and name not in OPTIONAL_SHEETS and sheet_rows:
+        if name not in required_and_optional and not name.startswith("Cost Summary -") and sheet_rows:
             ordered.append((name, sheet_rows))
 
     return ordered
