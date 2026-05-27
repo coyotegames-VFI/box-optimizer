@@ -217,6 +217,32 @@ def test_combined_dimension_parsing_supports_three_dimension_formats(tmp_path):
     ]
 
 
+def test_combined_dimension_header_unit_applies_to_bare_values(tmp_path):
+    path = tmp_path / "sku_master.csv"
+    _write_csv(
+        path,
+        [{"SKU": "MM", "Dimensions (mm)": "294 x 294 x 78", "Weight kg": "1"}],
+    )
+
+    item = read_sku_master(str(path))[0]
+
+    assert round(item.length_cm, 1) == 29.4
+    assert round(item.width_cm, 1) == 29.4
+    assert round(item.height_cm, 1) == 7.8
+
+
+def test_sku_weight_parses_scientific_notation(tmp_path):
+    path = tmp_path / "sku_master.csv"
+    _write_csv(
+        path,
+        [{"SKU": "DICE", "Dimensions (mm)": "10 x 10 x 10", "Weight (KG)": "4.4999999999999998E-2"}],
+    )
+
+    item = read_sku_master(str(path))[0]
+
+    assert item.weight_kg == 0.045
+
+
 def test_combined_dimension_parsing_treats_two_dimensions_as_flat(tmp_path):
     path = tmp_path / "sku_master.csv"
     _write_csv(

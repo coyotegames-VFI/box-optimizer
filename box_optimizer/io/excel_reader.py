@@ -48,7 +48,10 @@ _NS = {
 def _parse_number(value: object, default: float = 0.0) -> float:
     if value is None or value == "":
         return default
-    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    match = re.search(
+        r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+        str(value).replace(",", ""),
+    )
     if not match:
         return default
     return float(match.group(0))
@@ -361,7 +364,11 @@ def _read_sku_master_with_mappings(path: str) -> tuple[list[SKUItem], list[dict]
                 continue
 
             if has_combined_dimensions:
-                dimensions = _parse_dimensions(row.get(mapping["dimensions"]))
+                dimension_unit = infer_dimension_unit(mapping["dimensions"])
+                dimensions = _parse_dimensions(
+                    row.get(mapping["dimensions"]),
+                    default_unit=dimension_unit,
+                )
                 if dimensions is None:
                     continue
                 is_flat = len(dimensions.original_dimensions) == 2
