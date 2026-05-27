@@ -224,6 +224,20 @@ def _placement_top_height(placements: list | None) -> float:
     )
 
 
+def _placement_bounds(placements: list | None) -> Dimensions | None:
+    if not placements:
+        return None
+    return Dimensions(
+        length=max((placement.origin[0] if placement.origin else 0) + placement.dimensions.length for placement in placements),
+        width=max((placement.origin[1] if placement.origin else 0) + placement.dimensions.width for placement in placements),
+        height=max((placement.origin[2] if placement.origin else 0) + placement.dimensions.height for placement in placements),
+    )
+
+
+def _required_fit_dimensions(carton: OptimizedOrderCarton) -> Dimensions:
+    return _placement_bounds(carton.placements) or carton.optimized_dimensions
+
+
 def _vendor_score_dimensions(
     carton: OptimizedOrderCarton,
     vendor_box: VendorBox,
@@ -306,6 +320,18 @@ def _fits_effective_vendor_dimensions(
     )
 
 
+def _fits_final_assigned_dimensions(
+    required_dimensions: Dimensions,
+    assigned_dimensions: Dimensions,
+    tolerance_cm: float,
+) -> bool:
+    return _fits_with_rotation(
+        required_dimensions,
+        assigned_dimensions,
+        tolerance_cm=tolerance_cm,
+    )
+
+
 def _vendor_candidates(
     carton: OptimizedOrderCarton,
     vendor_boxes: tuple[VendorBox, ...],
@@ -316,13 +342,20 @@ def _vendor_candidates(
     optimized_billed = _billed_weight_kg(carton.chargeable_weight_kg, band_size_kg)
     tolerance_cm = max(0.0, min(float(vendor_box_fit_tolerance_cm or 0), 2.0))
     candidates = []
+    required_dimensions = _required_fit_dimensions(carton)
     for vendor_box in vendor_boxes:
-        if not _fits_with_rotation(carton.optimized_dimensions, vendor_box.dimensions, tolerance_cm=tolerance_cm):
+        if not _fits_with_rotation(required_dimensions, vendor_box.dimensions, tolerance_cm=tolerance_cm):
             continue
         score_dimensions = _vendor_score_dimensions(carton, vendor_box, tolerance_cm=tolerance_cm)
         if not _fits_effective_vendor_dimensions(
-            carton.optimized_dimensions,
+            required_dimensions,
             vendor_box.dimensions,
+            score_dimensions,
+            tolerance_cm,
+        ):
+            continue
+        if not _fits_final_assigned_dimensions(
+            required_dimensions,
             score_dimensions,
             tolerance_cm,
         ):

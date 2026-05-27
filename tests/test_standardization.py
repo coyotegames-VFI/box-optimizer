@@ -278,13 +278,13 @@ def test_vendor_box_candidates_score_cut_down_height_before_billing_band_filter(
     carton = OptimizedOrderCarton(
         order_id="order-1",
         combination_key="Flat x1",
-        optimized_dimensions=Dimensions(43, 30, 13),
+        optimized_dimensions=Dimensions(30, 26, 13),
         chargeable_weight_kg=3.4,
         placements=[
             Placement(
                 canonical_sku="Flat",
                 quantity=1,
-                dimensions=Dimensions(43, 30, 8),
+                dimensions=Dimensions(30, 26, 8),
                 origin=(0, 0, 0),
                 weight_kg=1,
             )
@@ -300,11 +300,131 @@ def test_vendor_box_candidates_score_cut_down_height_before_billing_band_filter(
 
     assert candidates
     billed, chargeable, volume_cm3, vendor_box, assigned_dimensions = candidates[0]
-    assert vendor_box.vendor_id == "39"
+    assert vendor_box.vendor_id == "52"
     assert billed == 4
-    assert chargeable < 4
+    assert chargeable == 3.4
     assert volume_cm3 == vendor_box.dimensions.length * vendor_box.dimensions.width * 10
     assert assigned_dimensions.height == 10
+
+
+def test_vendor_box_candidates_reject_cut_down_that_cannot_fit_rigid_packed_bounds():
+    carton = OptimizedOrderCarton(
+        order_id="order-1",
+        combination_key="Rigid Square x1",
+        optimized_dimensions=Dimensions(34, 34, 12),
+        chargeable_weight_kg=2.8,
+        placements=[
+            Placement(
+                canonical_sku="Rigid Square",
+                quantity=1,
+                dimensions=Dimensions(31.4, 31.4, 9.8),
+                origin=(0, 0, 0),
+                weight_kg=1.95,
+            )
+        ],
+    )
+
+    candidates = _vendor_candidates(
+        carton,
+        VENDOR_BOXES,
+        band_size_kg=1.0,
+        same_band_only=True,
+    )
+
+    assert candidates
+    assert all(candidate[3].vendor_id != "39" for candidate in candidates)
+    assert candidates[0][3].vendor_id == "15"
+    assert candidates[0][4] == Dimensions(35.4, 32.4, 12)
+
+
+def test_rigid_packed_bounds_fit_vb15_before_cut_down():
+    carton = OptimizedOrderCarton(
+        order_id="order-1",
+        combination_key="Rigid Square x1",
+        optimized_dimensions=Dimensions(34, 34, 12),
+        chargeable_weight_kg=2.8,
+        placements=[
+            Placement(
+                canonical_sku="Rigid Square",
+                quantity=1,
+                dimensions=Dimensions(31.4, 31.4, 9.8),
+                origin=(0, 0, 0),
+                weight_kg=1.95,
+            )
+        ],
+    )
+    vb15 = tuple(box for box in VENDOR_BOXES if box.vendor_id == "15")
+
+    candidates = _vendor_candidates(
+        carton,
+        vb15,
+        band_size_kg=1.0,
+        same_band_only=False,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0][3].vendor_id == "15"
+    assert candidates[0][4] == Dimensions(35.4, 32.4, 12)
+
+
+def test_no_padding_rigid_item_still_cannot_fit_cut_down_box_with_too_small_side():
+    carton = OptimizedOrderCarton(
+        order_id="order-1",
+        combination_key="Rigid Square x1",
+        optimized_dimensions=Dimensions(32, 32, 10),
+        chargeable_weight_kg=2.1,
+        placements=[
+            Placement(
+                canonical_sku="Rigid Square",
+                quantity=1,
+                dimensions=Dimensions(29.4, 29.4, 7.8),
+                origin=(0, 0, 0),
+                weight_kg=1.95,
+            )
+        ],
+    )
+    vb39 = tuple(box for box in VENDOR_BOXES if box.vendor_id == "39")
+
+    candidates = _vendor_candidates(
+        carton,
+        vb39,
+        band_size_kg=1.0,
+        same_band_only=False,
+    )
+
+    assert candidates == []
+
+
+def test_final_vendor_assignment_dimensions_fit_rigid_placement_bounds():
+    assignments = standardize_optimized_cartons(
+        [
+            OptimizedOrderCarton(
+                order_id="order-1",
+                combination_key="Rigid Square x1",
+                optimized_dimensions=Dimensions(34, 34, 12),
+                chargeable_weight_kg=2.8,
+                placements=[
+                    Placement(
+                        canonical_sku="Rigid Square",
+                        quantity=1,
+                        dimensions=Dimensions(31.4, 31.4, 9.8),
+                        origin=(0, 0, 0),
+                        weight_kg=1.95,
+                    )
+                ],
+            )
+        ],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+    )
+
+    assignment = assignments[0]
+    assert assignment.vendor_box_id == "15"
+    assert (
+        assignment.assigned_length_cm,
+        assignment.assigned_width_cm,
+        assignment.assigned_height_cm,
+    ) == (35.4, 32.4, 12)
 
 
 def test_vendor_box_fit_tolerance_allows_small_real_world_carton_flex():

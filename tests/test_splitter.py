@@ -285,7 +285,7 @@ def test_fast_mode_uses_vendor_shaped_cube_candidate_for_medium_rectangles():
     carton = result.cartons[0].result
     assert (carton.length_cm, carton.width_cm, carton.height_cm) == (30, 25, 16.0)
     assert _display_candidate_dimensions(Dimensions(carton.length_cm, carton.width_cm, carton.height_cm)) == Dimensions(32, 27, 18)
-    assert _vendor_score(carton)[3] == "17"
+    assert _vendor_score(carton)[3] == "52"
 
 
 def test_balanced_single_box_baseline_uses_vendor_shaped_fast_candidate():
@@ -299,7 +299,7 @@ def test_balanced_single_box_baseline_uses_vendor_shaped_fast_candidate():
 
     assert result.success is True
     assert result.box_qty == 1
-    assert _vendor_score(result.cartons[0].result)[3] == "17"
+    assert _vendor_score(result.cartons[0].result)[3] == "52"
 
 
 def test_fast_mode_preserves_long_box_pattern_for_large_anchor_items():
