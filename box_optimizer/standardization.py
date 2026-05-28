@@ -381,6 +381,8 @@ def _guarded_vendor_fit_candidates(
     candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
     baseline_candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
     max_chargeable_increase_kg: float,
+    band_size_kg: float = 1.0,
+    preferred_tolerance_max_chargeable_increase_kg: float = 1.5,
 ) -> list[tuple[float, float, float, VendorBox, Dimensions]]:
     if not candidates or not baseline_candidates:
         return candidates
@@ -389,13 +391,20 @@ def _guarded_vendor_fit_candidates(
     for candidate in candidates:
         billed, chargeable, _volume, vendor_box, assigned_dimensions = candidate
         if _uses_vendor_fit_tolerance(assigned_dimensions, vendor_box.dimensions):
-            if billed > baseline_billed + 1e-9:
-                continue
-            if (
-                billed >= baseline_billed - 1e-9
-                and chargeable > baseline_chargeable + max_chargeable_increase_kg + 1e-9
-            ):
-                continue
+            is_preferred = vendor_box.vendor_id in PREFERRED_VENDOR_BOX_IDS
+            if is_preferred:
+                if billed > baseline_billed + band_size_kg + 1e-9:
+                    continue
+                if chargeable > baseline_chargeable + preferred_tolerance_max_chargeable_increase_kg + 1e-9:
+                    continue
+            else:
+                if billed > baseline_billed + 1e-9:
+                    continue
+                if (
+                    billed >= baseline_billed - 1e-9
+                    and chargeable > baseline_chargeable + max_chargeable_increase_kg + 1e-9
+                ):
+                    continue
         guarded.append(candidate)
     return guarded
 
@@ -484,6 +493,7 @@ def _standardize_to_vendor_boxes(
                 same_band_candidates,
                 baseline_vendor_candidates,
                 vendor_box_fit_tolerance_max_chargeable_increase_kg,
+                band_size_kg=band_size_kg,
             )
         if same_band_candidates:
             _billed, _chargeable, _volume, vendor_box, assigned_dimensions = same_band_candidates[0]
@@ -513,6 +523,7 @@ def _standardize_to_vendor_boxes(
                 all_vendor_candidates,
                 baseline_vendor_candidates,
                 vendor_box_fit_tolerance_max_chargeable_increase_kg,
+                band_size_kg=band_size_kg,
             ) or baseline_vendor_candidates
         if all_vendor_candidates:
             _billed, _chargeable, _volume, vendor_box, assigned_dimensions = all_vendor_candidates[0]

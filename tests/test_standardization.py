@@ -519,6 +519,150 @@ def test_vendor_box_fit_guardrail_allows_flex_when_it_keeps_billed_weight_lower(
     assert guarded == [flex_candidate]
 
 
+def test_vendor_box_fit_guardrail_allows_preferred_flex_one_band_above_baseline():
+    preferred_flex_box = VendorBox("34", Dimensions(48, 36, 27))
+    baseline_box = VendorBox("39", Dimensions(40, 26.5, 44))
+    preferred_candidate = (
+        10.0,
+        9.5904,
+        48 * 37 * 27,
+        preferred_flex_box,
+        Dimensions(48, 37, 27),
+    )
+    baseline_candidate = (
+        9.0,
+        8.268,
+        40 * 26.5 * 39,
+        baseline_box,
+        Dimensions(40, 26.5, 39),
+    )
+
+    guarded = _guarded_vendor_fit_candidates(
+        [preferred_candidate],
+        [baseline_candidate],
+        1.0,
+        band_size_kg=1.0,
+    )
+
+    assert guarded == [preferred_candidate]
+
+
+def test_vendor_box_fit_guardrail_keeps_nonpreferred_flex_strict():
+    nonpreferred_flex_box = VendorBox("NON", Dimensions(48, 36, 27))
+    baseline_box = VendorBox("39", Dimensions(40, 26.5, 44))
+    nonpreferred_candidate = (
+        10.0,
+        9.5904,
+        48 * 37 * 27,
+        nonpreferred_flex_box,
+        Dimensions(48, 37, 27),
+    )
+    baseline_candidate = (
+        9.0,
+        8.268,
+        40 * 26.5 * 39,
+        baseline_box,
+        Dimensions(40, 26.5, 39),
+    )
+
+    guarded = _guarded_vendor_fit_candidates(
+        [nonpreferred_candidate],
+        [baseline_candidate],
+        1.0,
+        band_size_kg=1.0,
+    )
+
+    assert guarded == []
+
+
+def test_vendor_box_fit_guardrail_rejects_oversized_preferred_flex_candidate():
+    preferred_flex_box = VendorBox("34", Dimensions(48, 36, 27))
+    baseline_box = VendorBox("39", Dimensions(40, 26.5, 44))
+    oversized_candidate = (
+        11.0,
+        10.1,
+        48 * 37 * 30,
+        preferred_flex_box,
+        Dimensions(48, 37, 30),
+    )
+    baseline_candidate = (
+        9.0,
+        8.268,
+        40 * 26.5 * 39,
+        baseline_box,
+        Dimensions(40, 26.5, 39),
+    )
+
+    guarded = _guarded_vendor_fit_candidates(
+        [oversized_candidate],
+        [baseline_candidate],
+        1.0,
+        band_size_kg=1.0,
+    )
+
+    assert guarded == []
+
+
+def test_preferred_tolerance_vb34_style_candidate_beats_vb47_when_allowed():
+    assignments = standardize_optimized_cartons(
+        [
+            OptimizedOrderCarton(
+                order_id="order-1",
+                combination_key="All In x1",
+                optimized_dimensions=Dimensions(39, 37, 27),
+                chargeable_weight_kg=7.7922,
+                placements=[
+                    Placement("Game Bundle", 1, Dimensions(31.4, 14.8, 31.4), (0, 0, 0), 3.25),
+                    Placement("Insert", 1, Dimensions(37, 5.7, 37), (0, 14.8, 0), 1.0),
+                    Placement("Playmat", 1, Dimensions(35, 4, 35), (0, 20.5, 0), 0.88),
+                    Placement("Small Items", 1, Dimensions(3, 7, 3), (31.4, 0, 0), 0.495),
+                ],
+                allow_vendor_box_fit_tolerance=True,
+            )
+        ],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        vendor_box_fit_tolerance_cm=1.5,
+        vendor_box_fit_tolerance_guardrail=True,
+        vendor_box_fit_tolerance_max_chargeable_increase_kg=1.0,
+    )
+
+    assignment = assignments[0]
+    assert assignment.vendor_box_id == "34"
+    assert (
+        assignment.assigned_length_cm,
+        assignment.assigned_width_cm,
+        assignment.assigned_height_cm,
+    ) == (48, 37, 27)
+    assert "fit tolerance" in assignment.box_standardization_note
+
+
+def test_preferred_flexible_allowance_does_not_apply_to_rigid_only_carton():
+    assignments = standardize_optimized_cartons(
+        [
+            OptimizedOrderCarton(
+                order_id="order-1",
+                combination_key="All In x1",
+                optimized_dimensions=Dimensions(39, 37, 27),
+                chargeable_weight_kg=7.7922,
+                placements=[
+                    Placement("Game Bundle", 1, Dimensions(31.4, 14.8, 31.4), (0, 0, 0), 3.25),
+                    Placement("Insert", 1, Dimensions(37, 5.7, 37), (0, 14.8, 0), 1.0),
+                ],
+                allow_vendor_box_fit_tolerance=False,
+            )
+        ],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+        vendor_box_fit_tolerance_cm=1.5,
+        vendor_box_fit_tolerance_guardrail=True,
+        vendor_box_fit_tolerance_max_chargeable_increase_kg=1.0,
+    )
+
+    assert assignments[0].vendor_box_id != "34"
+    assert "fit tolerance" not in assignments[0].box_standardization_note
+
+
 def test_vendor_box_menu_uses_vendor_box_even_when_400_custom_minimum_is_met():
     cartons = [
         _optimized(f"order-{index}", "Same x1", Dimensions(74, 37, 38), chargeable_weight_kg=21)
