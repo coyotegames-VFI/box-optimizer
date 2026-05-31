@@ -427,6 +427,41 @@ def test_final_vendor_assignment_dimensions_fit_rigid_placement_bounds():
     ) == (35.4, 32.4, 12)
 
 
+def test_vendor_assignment_records_next_valid_backup_box_for_summary():
+    assignments = standardize_optimized_cartons(
+        [
+            OptimizedOrderCarton(
+                order_id="order-1",
+                combination_key="Rigid Square x1",
+                optimized_dimensions=Dimensions(34, 34, 12),
+                chargeable_weight_kg=2.8,
+                placements=[
+                    Placement(
+                        canonical_sku="Rigid Square",
+                        quantity=1,
+                        dimensions=Dimensions(31.4, 31.4, 9.8),
+                        origin=(0, 0, 0),
+                        weight_kg=1.95,
+                    )
+                ],
+            )
+        ],
+        use_vendor_box_menu=True,
+        billing_band_kg=1.0,
+    )
+
+    assignment = assignments[0]
+    assert assignment.vendor_box_id == "15"
+    assert assignment.backup_vendor_box_id
+    assert assignment.backup_vendor_box_id != assignment.vendor_box_id
+    assert assignment.backup_vendor_box_id != "39"
+    assert (
+        assignment.backup_assigned_length_cm,
+        assignment.backup_assigned_width_cm,
+        assignment.backup_assigned_height_cm,
+    ) == (34, 34, 12)
+
+
 def test_vendor_box_fit_tolerance_allows_small_real_world_carton_flex():
     assignments = standardize_optimized_cartons(
         [

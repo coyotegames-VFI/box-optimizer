@@ -12,6 +12,7 @@ from box_optimizer.io.column_mapper import (
     infer_dimension_unit,
     infer_weight_unit,
     is_metadata_column,
+    normalize_column_name,
 )
 from box_optimizer.models import OrderLine, SKUItem, UnmatchedSKURecord
 from box_optimizer.normalize import normalize_dimensions, normalize_sku
@@ -24,6 +25,8 @@ class SourceRows:
 
     sheet_name: str
     rows: list[dict]
+    metadata: dict = field(default_factory=dict)
+    preserved_rows: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -151,7 +154,7 @@ def _read_csv(path: str) -> list[SourceRows]:
     with open(path, newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
         rows = [dict(row) for row in reader]
-    return [SourceRows(sheet_name=Path(path).stem, rows=rows)] if rows else []
+    return [SourceRows(sheet_name=Path(path).stem, rows=rows, preserved_rows=rows)] if rows else []
 
 
 def _column_index(cell_reference: str) -> int:
@@ -160,6 +163,15 @@ def _column_index(cell_reference: str) -> int:
     for letter in letters:
         index = index * 26 + ord(letter) - ord("A") + 1
     return index - 1
+
+
+def _column_letter(index: int) -> str:
+    number = index + 1
+    letters = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
@@ -272,7 +284,97 @@ def _headers_and_data_start(table: list[list[object]]) -> tuple[list[str], int]:
             second if second else first
             for first, second in zip(first_headers, second_headers, strict=True)
         ], 2
-    return first_headers, 1
+    data_start = 1
+    if _looks_like_secondary_header_row(first_headers, table[1]):
+        data_start = 2
+    return first_headers, data_start
+
+
+_SECONDARY_HEADER_HINTS = {
+    "sku编号",
+    "商品编号",
+    "商品名称",
+    "商品全名",
+    "重量",
+    "重量kg",
+    "长",
+    "宽",
+    "高",
+    "数量",
+    "商品条码",
+}
+
+
+def _looks_like_secondary_header_row(headers: list[str], row: list[object]) -> bool:
+    mapping = infer_columns(headers)
+    if "sku" not in mapping:
+        return False
+    values_by_header = _row_dict_from_headers(headers, row)
+    hints = 0
+    for key in ["sku", "product_name", "weight", "length", "width", "height", "quantity"]:
+        header = mapping.get(key)
+        if not header:
+            continue
+        normalized = normalize_column_name(values_by_header.get(header, ""))
+        if normalized in _SECONDARY_HEADER_HINTS:
+            hints += 1
+    return hints >= 2
+
+
+def _row_dict_from_headers(headers: list[str], values: list[object]) -> dict:
+    row = {}
+    for index, value in enumerate(values):
+        if index >= len(headers):
+            continue
+        header = headers[index]
+        if not header:
+            continue
+        if header not in row or not str(row.get(header, "")).strip():
+            row[header] = value
+    return row
+
+
+def _preservation_headers(table: list[list[object]]) -> list[str]:
+    if not table:
+        return []
+    width = max(len(row) for row in table)
+    first_row = table[0] if table else []
+    headers = []
+    seen = set()
+    for index in range(width):
+        header = str(first_row[index] if index < len(first_row) else "").strip()
+        if not header:
+            header = f"Column {_column_letter(index)}"
+        original = header
+        suffix = 2
+        while header in seen:
+            header = f"{original} ({_column_letter(index)})" if suffix == 2 else f"{original} ({_column_letter(index)} {suffix})"
+            suffix += 1
+        seen.add(header)
+        headers.append(header)
+    return headers
+
+
+def _preserved_sheet_rows(table: list[list[object]]) -> list[dict]:
+    headers = _preservation_headers(table)
+    return [
+        {header: values[index] if index < len(values) else "" for index, header in enumerate(headers)}
+        for values in table[1:]
+        if any(str(value).strip() for value in values)
+    ]
+
+
+def _sheet_key_value_metadata(table: list[list[object]]) -> dict:
+    metadata = {}
+    for row in table:
+        for index, value in enumerate(row[:-1]):
+            key = str(value or "").strip()
+            if normalize_column_name(key) != "factory":
+                continue
+            factory_value = str(row[index + 1] or "").strip()
+            if factory_value:
+                metadata["factory_name"] = factory_value
+    return metadata
 
 
 def _read_xlsx(path: str) -> list[SourceRows]:
@@ -300,12 +402,19 @@ def _read_xlsx(path: str) -> list[SourceRows]:
             ]
             headers, data_start = _headers_and_data_start(table)
             rows = [
-                {headers[index]: value for index, value in enumerate(values) if headers[index]}
+                _row_dict_from_headers(headers, values)
                 for values in table[data_start:]
                 if any(str(value).strip() for value in values)
             ]
             if rows:
-                source_rows.append(SourceRows(sheet_name=sheet_name, rows=rows))
+                source_rows.append(
+                    SourceRows(
+                        sheet_name=sheet_name,
+                        rows=rows,
+                        metadata=_sheet_key_value_metadata(table),
+                        preserved_rows=_preserved_sheet_rows(table),
+                    )
+                )
     return source_rows
 
 

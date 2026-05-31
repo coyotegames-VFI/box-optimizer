@@ -4,6 +4,8 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 import zipfile
 
+from box_optimizer.io.qr import qr_png
+
 
 REQUIRED_SHEETS = [
     "Summary",
@@ -109,6 +111,475 @@ def _cell_xml(row_index: int, column_index: int, value: object, style: int | Non
     return _string_cell(reference, value, style)
 
 
+def _cell_style_for_sheet_value(
+    sheet_name: str,
+    row_index: int,
+    column_index: int,
+    headers: list[str],
+    row: list[object],
+) -> int | None:
+    if row_index == 1:
+        return 1
+    header = headers[column_index] if column_index < len(headers) else ""
+    if sheet_name == "Summary" and header == "Value":
+        metric = str(row[1] if len(row) > 1 else "")
+        if metric == "Total Chargeable Cost":
+            return 9
+    if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee", "Express"}:
+        return 9
+    return None
+
+
+def _label_cell_style(row_offset: int, column_index: int, value: object) -> int | None:
+    text = str(value or "")
+    if row_offset == 0:
+        return 7
+    if (
+        text.startswith("Detailed description of contents:")
+        or text.startswith("On Arrival:")
+        or text.startswith("If product damage is found")
+    ):
+        return 2
+    if text == "Qty":
+        return 5
+    if text == "SKU":
+        return 6
+    if (row_offset == 6 and column_index == 5) or (row_offset == 11 and column_index == 3):
+        return 8
+    if row_offset >= 13 and column_index in {0, 3} and text:
+        return 3
+    if row_offset >= 13 and column_index in {1, 4} and text:
+        return 4
+    return None
+
+
+def _split_label_from_line(value: object) -> tuple[str, str]:
+    text = str(value or "").strip()
+    marker = "Longhai,"
+    if marker in text:
+        first, second = text.split(marker, 1)
+        return f"{first}{marker[:-1]}".strip(), second.strip(" ,")
+    return text, ""
+
+
+def _label_to_name_with_backer(label: dict) -> str:
+    name = str(label.get("To Name", "") or "").strip()
+    backer_id = str(label.get("Backer ID", "") or "").strip()
+    if name and backer_id:
+        return f"{name}  Backer ID {backer_id}"
+    return name
+
+
+def _label_campaign_pledge_footer(label: dict) -> str:
+    campaign = str(label.get("Campaign Name", "") or "").strip()
+    pledge = str(label.get("Pledge Configuration", "") or "").strip()
+    if campaign and pledge:
+        return f"{campaign}     Config: {pledge}"
+    if pledge:
+        return f"Config: {pledge}"
+    return campaign
+
+
+def _label_total_items_footer(label: dict) -> str:
+    total = str(label.get("Total Units", "") or "").strip()
+    return f"Item Count: {total}" if total else "Item Count:"
+
+
+def _label_phone_text(label: dict) -> str:
+    phone = str(label.get("Phone", "") or "").strip()
+    return f"phone: {phone}" if phone else "phone:"
+
+
+def _continuation_original_label_number(label: dict) -> str:
+    original = str(label.get("Original Label Number", "") or "").strip()
+    if original:
+        return original
+    return str(label.get("Label Number", "") or "").replace("CONTINUED", "").strip()
+
+
+def _label_config_text(label: dict) -> str:
+    config = str(label.get("Pledge Configuration", "") or "").strip()
+    return f"Config: {config}" if config else ""
+
+
+def _label_continuation_header_text(label: dict) -> str:
+    config = _label_config_text(label)
+    return f"CONTINUED  {config}" if config else "CONTINUED"
+
+
+def _clean_label_state(value: object) -> str:
+    text = str(value or "").strip()
+    return "" if text.casefold() == "choose a state" else text
+
+
+def _label_city_state_zip(label: dict) -> str:
+    city = str(label.get("City", "") or "").strip()
+    state = _clean_label_state(label.get("State/Province", ""))
+    postal = str(label.get("Postal/Zip", "") or "").strip()
+    location = ", ".join(part for part in [city, state] if part)
+    if location and postal:
+        return f"{location} {postal}" if state else f"{location}, {postal}"
+    return location or postal
+
+
+def _label_block_rows(label: dict) -> list[list[object]]:
+    items_column_1 = str(label.get("Items to Pack Column 1", "") or "").splitlines()
+    items_column_2 = str(label.get("Items to Pack Column 2", "") or "").splitlines()
+    if label.get("Label Continuation"):
+        original_label = _continuation_original_label_number(label)
+        continuation_items = [item for item in [*items_column_1, *items_column_2] if str(item or "").strip()]
+        rows = [
+            ["VFI #", original_label, _label_continuation_header_text(label), "", "", label.get("Country Code", "")],
+            ["Continuation for", original_label, "", "", "", ""],
+            ["Qty", "SKU", "", "Qty", "SKU", ""],
+        ]
+        for index in range(0, len(continuation_items), 2):
+            left_item = continuation_items[index]
+            right_item = continuation_items[index + 1] if index + 1 < len(continuation_items) else ""
+            rows.append(
+                [
+                    _label_item_qty(left_item),
+                    _label_item_sku(left_item),
+                    "",
+                    _label_item_qty(right_item),
+                    _label_item_sku(right_item),
+                    "",
+                ]
+            )
+        rows.append(["", "", "", "", "", ""])
+        return rows
+    item_line_count = max(len(items_column_1), len(items_column_2), 1)
+    from_line_1, from_line_2 = _split_label_from_line(label.get("From", ""))
+    rows = [
+        ["VFI #", label.get("Label Number", ""), label.get("Country Code", ""), "", "", ""],
+        ["Origin:", label.get("Origin", ""), "", "", "", ""],
+        ["", "", "", "", "", label.get("Barcode/QR Value", "")],
+        ["From", from_line_1, "", "", "", ""],
+        ["", from_line_2, "", "", "", ""],
+        ["", "", "", "", "", ""],
+        ["To", _label_to_name_with_backer(label), "", "", "", ""],
+        ["Address 1", label.get("Address Line 1", ""), "", "", "", ""],
+        ["Address 2", label.get("Address Line 2", ""), "", "", "", ""],
+        [
+            "City/State/Zip",
+            _label_city_state_zip(label),
+            "",
+            "",
+            _label_phone_text(label),
+            "",
+        ],
+        ["Country", label.get("Country", ""), "", "", "", ""],
+        ["Detailed description of contents: Board Games-of paper and plastic,non-electrical", "", "", "", "", ""],
+        ["Qty", "SKU", "", "Qty", "SKU", ""],
+    ]
+    for index in range(item_line_count):
+        rows.append(
+            [
+                _label_item_qty(items_column_1[index]) if index < len(items_column_1) else "",
+                _label_item_sku(items_column_1[index]) if index < len(items_column_1) else "",
+                "",
+                _label_item_qty(items_column_2[index]) if index < len(items_column_2) else "",
+                _label_item_sku(items_column_2[index]) if index < len(items_column_2) else "",
+                "",
+            ]
+        )
+    rows.append(["On Arrival: If shipping box is damaged please take photos.", "", "", "", "", ""])
+    rows.append([label.get("On Arrival Note", ""), "", "", "", "", ""])
+    rows.append(["", "", "", "", "", ""])
+    rows.append([_label_campaign_pledge_footer(label), "", "", "", "", ""])
+    rows.append([_label_total_items_footer(label), "", label.get("Factory Name", ""), "", label.get("Carton Box Designation", ""), label.get("Country Name Chinese", "")])
+    rows.append(["", "", "", "", "", ""])
+    return rows
+
+
+def _label_item_qty(item: str) -> str:
+    text = str(item or "").strip()
+    if " x" not in text:
+        return ""
+    qty = text.rsplit(" x", 1)[1].strip()
+    return qty if qty.replace(".", "", 1).isdigit() else ""
+
+
+def _label_item_sku(item: str) -> str:
+    text = str(item or "").strip()
+    if " x" not in text:
+        return text
+    sku, qty = text.rsplit(" x", 1)
+    return sku.strip() if qty.strip().replace(".", "", 1).isdigit() else text
+
+
+def _label_item_block_end_offset(block_rows: list[list[object]]) -> int:
+    for index, row in enumerate(block_rows):
+        if row and str(row[0] or "").startswith("On Arrival:"):
+            return max(index - 1, 0)
+    return len(block_rows) - 1
+
+
+def _label_detail_offset(block_rows: list[list[object]]) -> int:
+    for index, row in enumerate(block_rows):
+        if row and str(row[0] or "").startswith("Detailed description of contents:"):
+            return index
+    return -1
+
+
+def _label_spacer_offsets(block_rows: list[list[object]]) -> set[int]:
+    offsets = set()
+    for index, row in enumerate(block_rows):
+        if any(str(value or "").strip() for value in row):
+            continue
+        previous_text = " ".join(str(value or "") for value in block_rows[index - 1]) if index > 0 else ""
+        next_text = " ".join(str(value or "") for value in block_rows[index + 1]) if index + 1 < len(block_rows) else ""
+        if "Fujian, China" in previous_text and "To" in next_text:
+            offsets.add(index)
+        if "If product damage is found" in previous_text and ("Config:" in next_text or "Pledge Config:" in next_text):
+            offsets.add(index)
+    return offsets
+
+
+def _label_block_cell_style(
+    label: dict,
+    block_rows: list[list[object]],
+    row_offset: int,
+    column_index: int,
+    value: object,
+) -> int | None:
+    if label.get("Label Continuation"):
+        if row_offset == 0:
+            style = 7
+        elif row_offset == 1:
+            style = 2
+        elif row_offset == 2:
+            if column_index in {0, 3}:
+                style = 11
+            elif column_index in {1, 4}:
+                style = 12
+            else:
+                style = 14
+        elif row_offset >= 3 and row_offset < len(block_rows) - 1:
+            if column_index in {0, 3}:
+                style = 13
+            elif column_index in {1, 4}:
+                style = 14
+            else:
+                style = 14
+        else:
+            style = _label_cell_style(row_offset, column_index, value)
+        if row_offset == 0 and column_index == 5:
+            return style
+        return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
+
+    footer_offsets = {len(block_rows) - 3, len(block_rows) - 2}
+    if row_offset == 0 or row_offset in footer_offsets:
+        style = 7
+        return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
+    detail_offset = _label_detail_offset(block_rows)
+    item_block_end = _label_item_block_end_offset(block_rows)
+    qty_header_offset = detail_offset + 1 if detail_offset >= 0 else -1
+    if detail_offset >= 0 and detail_offset <= row_offset <= item_block_end:
+        if row_offset == detail_offset:
+            return 10
+        if row_offset == qty_header_offset:
+            if column_index in {0, 3}:
+                return 11
+            if column_index in {1, 4}:
+                return 12
+            return 14
+        if row_offset > qty_header_offset:
+            if column_index in {0, 3}:
+                return 13
+            if column_index in {1, 4}:
+                return 14
+            return 14
+        return 14
+    style = _label_cell_style(row_offset, column_index, value)
+    return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
+
+
+def _label_right_aligned_style(style: int | None) -> int:
+    if style == 7:
+        return 17
+    return 16
+
+
+def _merge_range(row_index: int, start_column: int, end_column: int) -> str:
+    return f"{_column_letter(start_column)}{row_index}:{_column_letter(end_column)}{row_index}"
+
+
+def _label_merge_ranges(block_rows: list[list[object]], current_row: int) -> list[str]:
+    merges = []
+    if block_rows and str(block_rows[0][2] or "").startswith("CONTINUED"):
+        merges.append(_merge_range(current_row, 2, 4))
+        for offset in range(2, max(len(block_rows) - 1, 2)):
+            merges.append(_merge_range(current_row + offset, 1, 2))
+            merges.append(_merge_range(current_row + offset, 4, 5))
+        return merges
+    detail_offset = _label_detail_offset(block_rows)
+    item_block_end = _label_item_block_end_offset(block_rows)
+    if detail_offset >= 0:
+        merges.append(_merge_range(current_row + detail_offset, 0, 5))
+        qty_header_offset = detail_offset + 1
+        for offset in range(qty_header_offset, item_block_end + 1):
+            merges.append(_merge_range(current_row + offset, 1, 2))
+            merges.append(_merge_range(current_row + offset, 4, 5))
+    for offset, row in enumerate(block_rows):
+        row_index = current_row + offset
+        if len(row) > 4 and str(row[4] or "").startswith("phone:"):
+            merges.append(_merge_range(row_index, 4, 5))
+        if offset == len(block_rows) - 3:
+            merges.append(_merge_range(row_index, 0, 5))
+        if offset == len(block_rows) - 2:
+            merges.append(_merge_range(row_index, 0, 1))
+            merges.append(_merge_range(row_index, 2, 3))
+    return merges
+
+
+def _labels_sheet_xml(rows: list[dict], include_drawing: bool = False) -> str:
+    labels = rows or [{"Note": "No package labels generated."}]
+    row_xml = []
+    page_breaks = []
+    merge_ranges = []
+    current_row = 1
+    for label in labels:
+        block_rows = _label_block_rows(label)
+        merge_ranges.extend(_label_merge_ranges(block_rows, current_row))
+        spacer_offsets = _label_spacer_offsets(block_rows)
+        for offset, block_row in enumerate(block_rows):
+            row_index = current_row + offset
+            cells = []
+            for column_index, value in enumerate(block_row):
+                style = _label_block_cell_style(label, block_rows, offset, column_index, value)
+                if value == "" and style is None:
+                    continue
+                cells.append(
+                    _cell_xml(
+                        row_index,
+                        column_index,
+                        value,
+                        style=style,
+                    )
+                )
+            footer_offsets = {len(block_rows) - 3, len(block_rows) - 2}
+            if offset == len(block_rows) - 2:
+                height = ' ht="23" customHeight="1"'
+            elif offset == 0 or offset in footer_offsets:
+                height = ' ht="20" customHeight="1"'
+            elif offset in spacer_offsets:
+                height = ' ht="10" customHeight="1"'
+            elif offset in {2, 3, 4, 6, 7, 8, 9, 10, 12}:
+                height = ' ht="22" customHeight="1"'
+            else:
+                height = ' ht="18" customHeight="1"'
+            row_xml.append(f'<row r="{row_index}"{height}>{"".join(cells)}</row>')
+        current_row += len(block_rows)
+        page_breaks.append(current_row - 1)
+
+    widths = [12, 22, 14, 14, 22, 14]
+    cols_xml = "".join(
+        f'<col min="{index + 1}" max="{index + 1}" width="{width}" customWidth="1"/>'
+        for index, width in enumerate(widths)
+    )
+    breaks_xml = "".join(
+        f'<brk id="{row}" max="16383" man="1"/>'
+        for row in page_breaks[:-1]
+    )
+    row_breaks_xml = f'<rowBreaks count="{len(page_breaks) - 1}" manualBreakCount="{len(page_breaks) - 1}">{breaks_xml}</rowBreaks>' if len(page_breaks) > 1 else ""
+
+    drawing_xml = '<drawing r:id="rId1"/>' if include_drawing else ""
+    merge_xml = (
+        f'<mergeCells count="{len(merge_ranges)}">'
+        + "".join(f'<mergeCell ref="{merge_range}"/>' for merge_range in merge_ranges)
+        + "</mergeCells>"
+        if merge_ranges
+        else ""
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>'
+        '<sheetViews><sheetView workbookViewId="0"/></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="18"/>'
+        f"<cols>{cols_xml}</cols>"
+        f'<sheetData>{"".join(row_xml)}</sheetData>'
+        f"{merge_xml}"
+        '<printOptions horizontalCentered="1"/>'
+        '<pageMargins left="0.12" right="0.12" top="0.12" bottom="0.12" header="0.0" footer="0.0"/>'
+        '<pageSetup orientation="portrait" fitToWidth="1" fitToHeight="0"/>'
+        f"{row_breaks_xml}"
+        f"{drawing_xml}"
+        "</worksheet>"
+    )
+
+
+def _label_block_lengths(rows: list[dict]) -> list[int]:
+    return [len(_label_block_rows(label)) for label in (rows or [{"Note": "No package labels generated."}])]
+
+
+def _label_qr_images(rows: list[dict]) -> list[tuple[int, bytes]]:
+    images = []
+    current_row = 1
+    for label, block_length in zip(rows, _label_block_lengths(rows), strict=False):
+        if label.get("Label Continuation"):
+            current_row += block_length
+            continue
+        value = str(label.get("Barcode/QR Value") or label.get("Label Value") or "").strip()
+        if value:
+            images.append((current_row, qr_png(value, scale=8, border=4)))
+        current_row += block_length
+    return images
+
+
+def _worksheet_rels_xml(drawing_id: int) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{drawing_id}.xml"/>'
+        "</Relationships>"
+    )
+
+
+def _drawing_xml(image_count: int, start_rows: list[int]) -> str:
+    anchors = []
+    for index, start_row in enumerate(start_rows, start=1):
+        anchors.append(
+            '<xdr:oneCellAnchor>'
+            '<xdr:from><xdr:col>4</xdr:col><xdr:colOff>57150</xdr:colOff>'
+            f'<xdr:row>{max(start_row - 1, 0)}</xdr:row><xdr:rowOff>57150</xdr:rowOff></xdr:from>'
+            '<xdr:ext cx="1524000" cy="1524000"/>'
+            '<xdr:pic>'
+            f'<xdr:nvPicPr><xdr:cNvPr id="{index}" name="QR Code {index}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            '<xdr:blipFill>'
+            f'<a:blip r:embed="rId{index}"/>'
+            '<a:stretch><a:fillRect/></a:stretch>'
+            '</xdr:blipFill>'
+            '<xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+            '</xdr:pic>'
+            '<xdr:clientData/>'
+            '</xdr:oneCellAnchor>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'{"".join(anchors)}'
+        '</xdr:wsDr>'
+    )
+
+
+def _drawing_rels_xml(image_count: int) -> str:
+    relationships = "".join(
+        f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/label_qr_{index}.png"/>'
+        for index in range(1, image_count + 1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{relationships}"
+        "</Relationships>"
+    )
+
+
 def _headers_for_sheet(sheet_name: str, rows: list[dict]) -> list[str]:
     headers = []
     seen = set()
@@ -198,7 +669,12 @@ def _worksheet_xml(sheet_name: str, rows: list[dict]) -> str:
     row_xml = []
     for row_index, row in enumerate(table, start=1):
         cells = [
-            _cell_xml(row_index, column_index, value, style=1 if row_index == 1 else None)
+            _cell_xml(
+                row_index,
+                column_index,
+                value,
+                style=_cell_style_for_sheet_value(sheet_name, row_index, column_index, headers, row),
+            )
             for column_index, value in enumerate(row)
         ]
         row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
@@ -271,22 +747,30 @@ def _root_rels() -> str:
     )
 
 
-def _content_types(sheet_count: int) -> str:
+def _content_types(sheet_count: int, drawing_count: int = 0) -> str:
     overrides = "".join(
         f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
         for index in range(1, sheet_count + 1)
     )
+    drawing_overrides = "".join(
+        f'<Override PartName="/xl/drawings/drawing{index}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        for index in range(1, drawing_count + 1)
+    )
+    png_default = '<Default Extension="png" ContentType="image/png"/>' if drawing_count else ""
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
+        f"{png_default}"
         '<Override PartName="/xl/workbook.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
         '<Override PartName="/xl/styles.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
         f"{overrides}"
+        f"{drawing_overrides}"
         "</Types>"
     )
 
@@ -295,20 +779,47 @@ def _styles_xml() -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<fonts count="2">'
+        '<numFmts count="1"><numFmt numFmtId="164" formatCode="$#,##0.00&quot; (USD)&quot;"/></numFmts>'
+        '<fonts count="8">'
         '<font><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="12"/><name val="Calibri"/></font>'
+        '<font><sz val="16"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="16"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="16"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="20"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="16"/><name val="Calibri"/></font>'
         "</fonts>"
         '<fills count="3">'
         '<fill><patternFill patternType="none"/></fill>'
         '<fill><patternFill patternType="gray125"/></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill>'
         "</fills>"
-        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<borders count="3">'
+        '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        '<border><left/><right/><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
+        '<border><left style="thick"><color auto="1"/></left><right style="thick"><color auto="1"/></right><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
+        '</borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="2">'
+        '<cellXfs count="18">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+        '<xf numFmtId="0" fontId="5" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="left"/></xf>'
+        '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+        '<xf numFmtId="0" fontId="2" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1"/>'
+        '<xf numFmtId="0" fontId="4" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+        '<xf numFmtId="0" fontId="5" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1"/>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+        '<xf numFmtId="0" fontId="3" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1"/>'
+        '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="right"/></xf>'
+        '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"
@@ -376,17 +887,34 @@ def write_workbook(
 
     sheet_payloads = _build_sheet_payloads(rows, sheets, **named_rows)
     safe_names = [_safe_sheet_name(name) for name, _ in sheet_payloads]
+    labels_entry = next(((index, sheet_rows) for index, (name, sheet_rows) in enumerate(sheet_payloads, start=1) if name == "Labels"), None)
+    label_qr_images = _label_qr_images(labels_entry[1]) if labels_entry else []
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", _content_types(len(sheet_payloads)))
+        archive.writestr("[Content_Types].xml", _content_types(len(sheet_payloads), drawing_count=1 if label_qr_images else 0))
         archive.writestr("_rels/.rels", _root_rels())
         archive.writestr("xl/workbook.xml", _workbook_xml(safe_names))
         archive.writestr("xl/_rels/workbook.xml.rels", _workbook_rels(len(sheet_payloads)))
         archive.writestr("xl/styles.xml", _styles_xml())
         for index, (sheet_name, sheet_rows) in enumerate(sheet_payloads, start=1):
+            sheet_xml = (
+                _labels_sheet_xml(sheet_rows, include_drawing=bool(label_qr_images))
+                if sheet_name == "Labels"
+                else _worksheet_xml(sheet_name, sheet_rows)
+            )
             archive.writestr(
                 f"xl/worksheets/sheet{index}.xml",
-                _worksheet_xml(sheet_name, sheet_rows),
+                sheet_xml,
             )
+        if labels_entry and label_qr_images:
+            labels_sheet_index = labels_entry[0]
+            archive.writestr(f"xl/worksheets/_rels/sheet{labels_sheet_index}.xml.rels", _worksheet_rels_xml(1))
+            archive.writestr(
+                "xl/drawings/drawing1.xml",
+                _drawing_xml(len(label_qr_images), [start_row for start_row, _image in label_qr_images]),
+            )
+            archive.writestr("xl/drawings/_rels/drawing1.xml.rels", _drawing_rels_xml(len(label_qr_images)))
+            for image_index, (_start_row, image) in enumerate(label_qr_images, start=1):
+                archive.writestr(f"xl/media/label_qr_{image_index}.png", image)
 
     return str(output_path)

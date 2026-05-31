@@ -1,7 +1,7 @@
 import csv
 import zipfile
 
-from box_optimizer.io.excel_reader import read_intake, read_orders, read_sku_master
+from box_optimizer.io.excel_reader import read_intake, read_orders, read_sku_master, read_workbook
 
 
 def _write_csv(path, rows):
@@ -176,6 +176,69 @@ def test_read_xlsx_processes_all_useful_sheets(tmp_path):
 
     assert [item.canonical_sku for item in items] == ["A1", "B1"]
     assert {item.metadata["_source_sheet"] for item in items} == {"Products A", "Products B"}
+
+
+def test_sku_master_skips_translated_subheader_and_preserves_first_duplicate_header_values(tmp_path):
+    path = tmp_path / "vestige_style_sku.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "stock": [
+                ["SKU", "Item name", "", "", "Weight/g", "L-cm", "W-cm", "H-cm", "SKU", "Item name"],
+                ["SKU编号", "商品全名", "成本算法", "条码", "重量(kg)", "长", "宽", "高", "", ""],
+                ["ONB0100", "Vindication Base Game", "", "", "3640", "39", "32", "11", "", ""],
+            ],
+        },
+    )
+
+    items = read_sku_master(str(path))
+
+    assert len(items) == 1
+    assert items[0].raw_sku == "ONB0100"
+    assert items[0].product_name == "Vindication Base Game"
+    assert items[0].length_cm == 39
+    assert items[0].width_cm == 32
+    assert items[0].height_cm == 11
+    assert items[0].weight_kg == 3.64
+
+
+def test_read_workbook_extracts_adjacent_factory_metadata(tmp_path):
+    path = tmp_path / "factory_metadata.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "stock": [
+                ["SKU", "Item name", "Weight/g", "L-cm", "W-cm", "H-cm", "", ""],
+                ["ONB0100", "Vindication Base Game", "3640", "39", "32", "11", "Factory", "WHATZ"],
+            ],
+        },
+    )
+
+    source = read_workbook(str(path))[0]
+
+    assert source.metadata["factory_name"] == "WHATZ"
+
+
+def test_read_workbook_preserves_blank_header_columns_for_intake_copy(tmp_path):
+    path = tmp_path / "factory_metadata.xlsx"
+    _write_xlsx(
+        path,
+        {
+            "stock": [
+                ["SKU", "Item name", "Weight/g", "L-cm", "W-cm", "H-cm", "", ""],
+                ["SKU编号", "商品全名", "重量(kg)", "长", "宽", "高", "", ""],
+                ["ONB0100", "Vindication Base Game", "3640", "39", "32", "11", "", ""],
+                ["", "", "", "", "", "", "Factory", "WHATZ"],
+            ],
+        },
+    )
+
+    source = read_workbook(str(path))[0]
+
+    assert "Column G" in source.preserved_rows[0]
+    assert source.preserved_rows[0]["Column G"] == ""
+    assert source.preserved_rows[2]["Column G"] == "Factory"
+    assert source.preserved_rows[2]["Column H"] == "WHATZ"
 
 
 def test_read_sku_master_supports_vfi_short_cm_dimension_headers(tmp_path):

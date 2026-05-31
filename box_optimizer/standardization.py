@@ -51,6 +51,10 @@ class StandardizedBoxAssignment:
     placements: list = None
     vendor_box_id: str | None = None
     selection_decision: str = ""
+    backup_vendor_box_id: str | None = None
+    backup_assigned_length_cm: float | None = None
+    backup_assigned_width_cm: float | None = None
+    backup_assigned_height_cm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +381,17 @@ def _vendor_candidates(
     return sorted(candidates, key=lambda candidate: candidate[:3])
 
 
+def _next_backup_vendor_candidate(
+    candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
+    primary_vendor_id: str,
+) -> tuple[float, float, float, VendorBox, Dimensions] | None:
+    for candidate in candidates:
+        _billed, _chargeable, _volume, vendor_box, _assigned_dimensions = candidate
+        if vendor_box.vendor_id != primary_vendor_id:
+            return candidate
+    return None
+
+
 def _guarded_vendor_fit_candidates(
     candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
     baseline_candidates: list[tuple[float, float, float, VendorBox, Dimensions]],
@@ -416,8 +431,11 @@ def _vendor_assignment(
     note: str,
     decision: str,
     assigned_dimensions: Dimensions | None = None,
+    backup_candidate: tuple[float, float, float, VendorBox, Dimensions] | None = None,
 ) -> StandardizedBoxAssignment:
     assigned = assigned_dimensions or vendor_box.dimensions
+    backup_box = backup_candidate[3] if backup_candidate else None
+    backup_dimensions = backup_candidate[4] if backup_candidate else None
     return StandardizedBoxAssignment(
         order_id=carton.order_id,
         combination_key=carton.combination_key,
@@ -432,6 +450,10 @@ def _vendor_assignment(
         placements=carton.placements,
         vendor_box_id=vendor_box.vendor_id,
         selection_decision=decision,
+        backup_vendor_box_id=backup_box.vendor_id if backup_box else None,
+        backup_assigned_length_cm=backup_dimensions.length if backup_dimensions else None,
+        backup_assigned_width_cm=backup_dimensions.width if backup_dimensions else None,
+        backup_assigned_height_cm=backup_dimensions.height if backup_dimensions else None,
     )
 
 
@@ -474,6 +496,7 @@ def _standardize_to_vendor_boxes(
         effective_vendor_box_fit_tolerance_cm = (
             vendor_box_fit_tolerance_cm if carton.allow_vendor_box_fit_tolerance else 0
         )
+        optimized_billed = _billed_weight_kg(carton.chargeable_weight_kg, band_size_kg)
         baseline_vendor_candidates = _vendor_candidates(
             carton,
             VENDOR_BOXES,
@@ -481,36 +504,6 @@ def _standardize_to_vendor_boxes(
             same_band_only=False,
             vendor_box_fit_tolerance_cm=0,
         )
-        same_band_candidates = _vendor_candidates(
-            carton,
-            VENDOR_BOXES,
-            band_size_kg=band_size_kg,
-            same_band_only=True,
-            vendor_box_fit_tolerance_cm=effective_vendor_box_fit_tolerance_cm,
-        )
-        if vendor_box_fit_tolerance_guardrail:
-            same_band_candidates = _guarded_vendor_fit_candidates(
-                same_band_candidates,
-                baseline_vendor_candidates,
-                vendor_box_fit_tolerance_max_chargeable_increase_kg,
-                band_size_kg=band_size_kg,
-            )
-        if same_band_candidates:
-            _billed, _chargeable, _volume, vendor_box, assigned_dimensions = same_band_candidates[0]
-            assignments.append(
-                _vendor_assignment(
-                    carton,
-                    f"Vendor Box {vendor_box.vendor_id}",
-                    vendor_box,
-                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit within billing band."
-                    + _vendor_height_cutdown_note(assigned_dimensions, vendor_box)
-                    + _vendor_fit_tolerance_note(assigned_dimensions, vendor_box),
-                    "vendor_smallest_safe_same_band",
-                    assigned_dimensions=assigned_dimensions,
-                )
-            )
-            continue
-
         all_vendor_candidates = _vendor_candidates(
             carton,
             VENDOR_BOXES,
@@ -525,8 +518,32 @@ def _standardize_to_vendor_boxes(
                 vendor_box_fit_tolerance_max_chargeable_increase_kg,
                 band_size_kg=band_size_kg,
             ) or baseline_vendor_candidates
+        same_band_candidates = [
+            candidate
+            for candidate in all_vendor_candidates
+            if candidate[0] <= optimized_billed + 1e-9
+        ]
+        if same_band_candidates:
+            _billed, _chargeable, _volume, vendor_box, assigned_dimensions = same_band_candidates[0]
+            backup_candidate = _next_backup_vendor_candidate(all_vendor_candidates, vendor_box.vendor_id)
+            assignments.append(
+                _vendor_assignment(
+                    carton,
+                    f"Vendor Box {vendor_box.vendor_id}",
+                    vendor_box,
+                    f"Assigned vendor Box {vendor_box.vendor_id}; smallest safe vendor fit within billing band."
+                    + _vendor_height_cutdown_note(assigned_dimensions, vendor_box)
+                    + _vendor_fit_tolerance_note(assigned_dimensions, vendor_box),
+                    "vendor_smallest_safe_same_band",
+                    assigned_dimensions=assigned_dimensions,
+                    backup_candidate=backup_candidate,
+                )
+            )
+            continue
+
         if all_vendor_candidates:
             _billed, _chargeable, _volume, vendor_box, assigned_dimensions = all_vendor_candidates[0]
+            backup_candidate = _next_backup_vendor_candidate(all_vendor_candidates, vendor_box.vendor_id)
             assignments.append(
                 _vendor_assignment(
                     carton,
@@ -537,6 +554,7 @@ def _standardize_to_vendor_boxes(
                     + _vendor_fit_tolerance_note(assigned_dimensions, vendor_box),
                     "vendor_smallest_safe_fit",
                     assigned_dimensions=assigned_dimensions,
+                    backup_candidate=backup_candidate,
                 )
             )
             continue

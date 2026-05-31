@@ -275,6 +275,53 @@ def _write_xlsx_table(path: Path, sheet_name: str, table: list[list[object]]) ->
         archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
 
 
+def _write_xlsx_tables(path: Path, sheets: dict[str, list[list[object]]]) -> None:
+    sheet_entries = []
+    rel_entries = []
+    worksheet_payloads = []
+    for index, (sheet_name, table) in enumerate(sheets.items(), start=1):
+        xml_rows = []
+        for row_number, row_values in enumerate(table, start=1):
+            cells = [
+                _inline_cell(chr(ord("A") + column), row_number, value)
+                for column, value in enumerate(row_values)
+            ]
+            xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+        worksheet_payloads.append(
+            (
+                f"xl/worksheets/sheet{index}.xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetData>{"".join(xml_rows)}</sheetData>'
+                "</worksheet>",
+            )
+        )
+        sheet_entries.append(f'<sheet name="{sheet_name}" sheetId="{index}" r:id="rId{index}"/>')
+        rel_entries.append(
+            f'<Relationship Id="rId{index}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{index}.xml"/>'
+        )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets>{"".join(sheet_entries)}</sheets>'
+        "</workbook>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'{"".join(rel_entries)}'
+        "</Relationships>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", rels)
+        for worksheet_path, worksheet_xml in worksheet_payloads:
+            archive.writestr(worksheet_path, worksheet_xml)
+
+
 def _sheet_rows(path: Path, sheet_name: str) -> list[dict]:
     return next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == sheet_name)
 
@@ -1262,7 +1309,7 @@ def test_pledge_combination_summary_groups_identical_breakdowns(tmp_path):
     rows = _sheet_rows(output_path, "Pledge Combination Summary")
     assert len(rows) == 1
     assert int(float(rows[0]["Order Count"])) == 2
-    assert rows[0]["SKU Breakdown"] == "ADDON x1 | CORE x1"
+    assert rows[0]["SKU Breakdown"] == "CORE x1 | ADDON x1"
 
 
 def test_box_detail_output_granularity_repeats_order_per_box_for_debug(tmp_path):
@@ -2376,6 +2423,72 @@ def test_label_generator_populates_simplified_chinese_country_from_two_letter_co
     assert rows[2]["Country Name Chinese"] == ""
     assert workflow_module._country_name_zh_hans("HK") == "中国香港"
 
+def test_label_generator_uses_backer_data_aliases_for_addresses_country_code_and_order_id():
+    rows = workflow_module._label_generator_rows(
+        [
+            {
+                "Order ID": "Column-1",
+                "VFI #": "1",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "VB 33 cutdown",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Order #": "BK-100",
+                "Name": "Ralf Kwok",
+                "Phone": "98835556",
+                "CustomerEmail": "ralf@example.com",
+                "Address 1": "Flat 12",
+                "Address 2": "1 Example Road",
+                "City": "Hong Kong",
+                "PostalCode": "0000",
+                "Country": "Hong Kong",
+                "Code": "HK",
+                "State/Province": "HK",
+            }
+        ],
+        {"CORE x1": 1},
+        "VEST",
+    )
+
+    assert rows[0]["Backer ID"] == "BK-100"
+    assert rows[0]["Shipping name"] == "Ralf Kwok"
+    assert rows[0]["phone"] == "98835556"
+    assert rows[0]["email"] == "ralf@example.com"
+    assert rows[0]["add 1"] == "Flat 12"
+    assert rows[0]["add 2"] == "1 Example Road"
+    assert rows[0]["Shipping City"] == "Hong Kong"
+    assert rows[0]["Shipping Postal Code"] == "0000"
+    assert rows[0]["Country Name"] == "Hong Kong"
+    assert rows[0]["Ship to Country Code"] == "HK"
+    assert rows[0]["Country Name Chinese"] == workflow_module._country_name_zh_hans("HK")
+    assert rows[0]["Shipping State"] == "HK"
+
+
+def test_label_country_code_does_not_use_full_country_name_as_two_letter_code():
+    rows = workflow_module._label_generator_rows(
+        [
+            {
+                "Order ID": "1",
+                "VFI #": "1",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "VB 25",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Address Country": "New Zealand",
+                "Country": "New Zealand",
+            }
+        ],
+        {"CORE x1": 1},
+        "OPR",
+    )
+
+    assert rows[0]["Ship to Country Code"] == ""
+    assert rows[0]["Country Name Chinese"] == ""
+
 
 def test_labels_rows_are_generated_one_per_carton_from_label_generator_rows():
     label_rows = workflow_module._labels_rows(
@@ -2452,6 +2565,76 @@ def test_labels_rows_are_generated_one_per_carton_from_label_generator_rows():
     assert label_rows[1]["Items to Pack Column 2"] == ""
 
 
+def test_labels_rows_prefix_item_lines_with_intake_picking_order():
+    label_rows = workflow_module._labels_rows(
+        [
+            {
+                "Order ID": "PICK-1",
+                "Label numbers": "OPR 1",
+                "SKU Breakdown": "ADDON x2 | UNKNOWN x1 | CORE x1 | COIN x3",
+            }
+        ],
+        {},
+        sku_pick_order={"CORE": 0, "ADDON": 1, "COIN": 2},
+    )
+
+    assert label_rows[0]["Items to Pack Column 1"].splitlines() == [
+        "(1)  CORE x1",
+        "(2)  ADDON x2",
+        "(3)  COIN x3",
+        "(?)  UNKNOWN x1",
+    ]
+    assert label_rows[0]["Items to Pack Column 2"] == ""
+
+
+def test_labels_rows_print_order_groups_by_pledge_then_country_stably():
+    label_rows = [
+        {
+            "Pledge Configuration": 2,
+            "Country": "United States",
+            "Order ID": "A",
+            "Label Value": "LC 4",
+        },
+        {
+            "Pledge Configuration": 1,
+            "Country": "United States",
+            "Order ID": "B",
+            "Label Value": "LC 1",
+        },
+        {
+            "Pledge Configuration": 1,
+            "Country": "Canada",
+            "Order ID": "C",
+            "Label Value": "LC 2",
+        },
+        {
+            "Pledge Configuration": 1,
+            "Country": "Canada",
+            "Order ID": "D",
+            "Label Value": "LC 3",
+        },
+        {
+            "Pledge Configuration": 2,
+            "Country": "China",
+            "Order ID": "E",
+            "Label Value": "LC 5",
+        },
+    ]
+
+    ordered_rows = workflow_module._labels_rows_in_print_order(label_rows)
+
+    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 1, 1, 2, 2]
+    assert [row["Country"] for row in ordered_rows] == [
+        "Canada",
+        "Canada",
+        "United States",
+        "China",
+        "United States",
+    ]
+    assert [row["Order ID"] for row in ordered_rows] == ["C", "D", "B", "E", "A"]
+    assert [row["Label Value"] for row in ordered_rows] == ["LC 2", "LC 3", "LC 1", "LC 5", "LC 4"]
+
+
 def test_labels_rows_respect_campaign_item_line_controls_and_report_overflow():
     label_rows = workflow_module._labels_rows(
         [
@@ -2471,15 +2654,25 @@ def test_labels_rows_respect_campaign_item_line_controls_and_report_overflow():
         },
     )
 
+    assert len(label_rows) == 2
     row = label_rows[0]
     assert row["Items to Pack Column 1"] == "A x1\nB x1"
     assert row["Items to Pack Column 2"] == "C x1\nD x1"
     assert row["Label Item Lines Per Column"] == 2
     assert row["Label Item Column Count"] == 2
+    assert row["Label Overflow Items Per Label"] == workflow_module.DEFAULT_LABEL_OVERFLOW_ITEMS_PER_LABEL
     assert row["Overflow Item Count"] == 1
-    assert row["Overflow Items"] == "E x1"
-    assert row["Overflow Note"] == "1 item line(s) exceed configured label space; see SKU Breakdown."
+    assert row["Overflow Items"] == ""
+    assert row["Overflow Note"] == ""
     assert row["SKU Breakdown"] == "A x1 | B x1 | C x1 | D x1 | E x1"
+
+    continuation = label_rows[1]
+    assert continuation["Label Continuation"] is True
+    assert continuation["Label Number"] == "40 CONTINUED"
+    assert continuation["Original Label Number"] == "40"
+    assert continuation["Barcode/QR Value"] == "OPR 40"
+    assert continuation["Items to Pack Column 1"] == "E x1"
+    assert continuation["Items to Pack Column 2"] == ""
 
 
 def test_labels_rows_can_use_single_item_column_for_dense_campaigns():
@@ -2494,12 +2687,46 @@ def test_labels_rows_can_use_single_item_column_for_dense_campaigns():
         {"label_item_lines_per_column": 2, "label_item_column_count": 1},
     )
 
+    assert len(label_rows) == 2
     row = label_rows[0]
     assert row["Items to Pack Column 1"] == "A x1\nB x1"
     assert row["Items to Pack Column 2"] == ""
     assert row["Label Item Column Count"] == 1
     assert row["Overflow Item Count"] == 1
-    assert row["Overflow Items"] == "C x1"
+    assert row["Overflow Items"] == ""
+    assert label_rows[1]["Items to Pack Column 1"] == "C x1"
+
+
+def test_labels_rows_support_multiple_continuation_labels():
+    label_rows = workflow_module._labels_rows(
+        [
+            {
+                "Order ID": "MULTI-CONTINUED",
+                "Label numbers": "OPR 42",
+                "SKU Breakdown": " | ".join(f"SKU-{index} x1" for index in range(1, 10)),
+            }
+        ],
+        {
+            "label_item_lines_per_column": 2,
+            "label_item_column_count": 2,
+            "label_overflow_items_per_label": 2,
+        },
+    )
+
+    assert len(label_rows) == 4
+    assert label_rows[0]["Items to Pack Column 1"] == "SKU-1 x1\nSKU-2 x1"
+    assert label_rows[0]["Items to Pack Column 2"] == "SKU-3 x1\nSKU-4 x1"
+    assert [row["Label Number"] for row in label_rows[1:]] == [
+        "42 CONTINUED 1",
+        "42 CONTINUED 2",
+        "42 CONTINUED 3",
+    ]
+    assert [row["Items to Pack Column 1"] for row in label_rows[1:]] == [
+        "SKU-5 x1\nSKU-6 x1",
+        "SKU-7 x1\nSKU-8 x1",
+        "SKU-9 x1",
+    ]
+    assert all(row["Barcode/QR Value"] == "OPR 42" for row in label_rows)
 
 
 def test_label_generator_expands_bundles_for_label_units_and_sku_lines():
@@ -2544,6 +2771,47 @@ def test_label_sku_counts_expand_bundled_placements_without_changing_pack_diagno
 
     assert counts == {"ADDON": 2, "COIN": 3, "CORE": 1}
     assert workflow_module._sku_counts_text(counts) == "ADDON x2 | COIN x3 | CORE x1"
+    assert (
+        workflow_module._sku_counts_text(counts, {"CORE": 0, "ADDON": 1, "COIN": 2})
+        == "CORE x1 | ADDON x2 | COIN x3"
+    )
+
+
+def test_label_sku_breakdown_follows_sku_master_order(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "CORE", "Length": "10", "Width": "10", "Height": "2", "Weight kg": "1"},
+            {"SKU": "ADDON", "Length": "8", "Width": "8", "Height": "2", "Weight kg": "0.5"},
+            {"SKU": "COIN", "Length": "2", "Width": "2", "Height": "1", "Weight kg": "0.1"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "COIN", "Quantity": "3"},
+            {"Order ID": "1", "SKU": "ADDON", "Quantity": "2"},
+            {"Order ID": "1", "SKU": "CORE", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"preserve_region_sheets": False},
+    )
+
+    label_row = _sheet_rows(output_path, "Label generator")[0]
+    assert label_row["SKU Breakdown"] == "CORE x1 | ADDON x2 | COIN x3"
+    cost_row = _sheet_rows(output_path, "Cost Summary")[0]
+    assert cost_row["SKU Breakdown"] == "CORE x1 | ADDON x2 | COIN x3"
+    optimized_row = _sheet_rows(output_path, "Optimized to Pack")[0]
+    assert optimized_row["All Items"] == "CORE x1, ADDON x2, COIN x3"
+    assert optimized_row["Box 1"].endswith("CORE x1, ADDON x2, COIN x3")
 
 
 def test_asia_like_fast_mode_fixture_does_not_split_small_items_into_six_boxes(tmp_path):
@@ -3362,19 +3630,94 @@ def test_cost_summary_uses_customer_rate_sheet_for_zone_and_shipping_fee(tmp_pat
         {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(rate_path)},
     )
 
-    assert rows[0]["Zone"] == "Zone USA"
-    assert rows[0]["Customer Shipping Fee"] == 15.35
-    assert rows[1]["Zone"] == "Zone 1"
-    assert rows[1]["Customer Shipping Fee"] == 24.5
-    assert rows[2]["Zone"] == "Zone 1"
-    assert rows[2]["Customer Shipping Fee"] == 25.0
+    assert rows[0]["Hub Shipping Fee"] == 15.35
+    assert rows[0]["Express"] == 0
+    assert rows[0]["Shipping Method"] == "Review Needed"
+    assert "Shipping method mapping missing" in rows[0]["Shipping Rate Note"]
+    assert rows[1]["Hub Shipping Fee"] == 24.5
+    assert rows[1]["Express"] == 0
+    assert rows[2]["Hub Shipping Fee"] == 25.0
+    assert rows[2]["Express"] == 0
+    assert "Zone" not in rows[0]
+    assert "Shipping Method" in rows[0]
     assert rows[2]["Backer ID"] == "37043809"
     assert rows[2]["Shipping name"] == "Jonathon Adkins"
     assert rows[2]["phone"] == "423732691"
     assert rows[2]["email"] == "harry@example.com"
+    assert "Customer Shipping Fee" not in rows[0]
+    assert "Slow Post" not in rows[0]
     assert "Estimated VFI Cost" not in rows[0]
     assert "Picking Fee" not in rows[0]
     assert "Margin" not in rows[0]
+
+
+def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path):
+    rate_path = tmp_path / "Rate and Zone.xlsx"
+    zone_key = [[""] for _ in range(37)]
+    zone_key[0] = ["HUB"]
+    zone_key[1] = ["KG", 0.5, 1, 1.5, 2]
+    zone_key[2] = ["Zone USA", 11, 12, 13, 14]
+    zone_key[3] = ["Zone 1", 21, 22, 23, 24]
+    zone_key[4] = ["Zone 2", 31, 32, 33, 34]
+    zone_key[5] = ["Zone 3", 41, 42, 43, 44]
+    zone_key[6] = ["Zone 9", "", "", "", ""]
+    zone_key[31] = ["Express"]
+    zone_key[32] = ["KG", 0.5, 1, 1.5, 2]
+    zone_key[33] = ["Zone 1", 101, 111, 121, 131]
+    zone_key[34] = ["Zone 2", 201, 211, 221, 231]
+    zone_key[35] = ["Zone 3", 301, 311, 321, 331]
+    zone_key[36] = ["Zone 4", 401, 411, 421, 431]
+    sheet2 = [
+        ["", "HUB", "", "", "", "", "", "", "Express", "", "", ""],
+        ["", "COUNTRY", "A2 (ISO)", "Ship by", "Zone", "ship by", "ship to contact", "", "COUNTRY", "", "A2 (ISO)", "Zone"],
+        ["", "Australia", "AU", "Hub", "Zone 1", "ship to Aetherworks", "kickstarter@aetherworks.com.au", "", "Australia", "澳大利亚", "AU", "Zone 2"],
+        ["", "Fallbackia", "FB", "Hub", "Zone 9", "ship to fallback", "", "", "Fallbackia", "回退", "FB", "Zone 2"],
+        ["", "", "", "", "", "", "", "", "Brazil", "巴西", "BR", "Zone 2"],
+    ]
+    _write_xlsx_tables(rate_path, {"Zone Key": zone_key, "Sheet2": sheet2})
+
+    rows = workflow_module._cost_summary_rows(
+        [
+            {"Country": "Australia", "Chargeable Weight kg": 1.0, "Total Units": 1},
+            {"Country": "Brazil", "Chargeable Weight kg": 1.1, "Total Units": 1},
+            {"Country": "Fallbackia", "Chargeable Weight kg": 0.6, "Total Units": 3},
+            {"Country": "Unknown", "Chargeable Weight kg": 1.0, "Total Units": 1},
+        ],
+        {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(rate_path)},
+    )
+
+    assert rows[0]["Hub Shipping Fee"] == 24
+    assert rows[0]["Express"] == 0
+    assert rows[0]["Shipping Method"] == "ship to Aetherworks: kickstarter@aetherworks.com.au"
+    assert rows[1]["Hub Shipping Fee"] == 0
+    assert rows[1]["Express"] == 223
+    assert rows[1]["Shipping Method"] == "Ship by Express"
+    assert rows[1]["Shipping Rate Note"] == "Express fallback; hub unavailable."
+    assert rows[2]["Hub Shipping Fee"] == 0
+    assert rows[2]["Express"] == 213.5
+    assert rows[2]["Shipping Method"] == "Ship by Express"
+    assert rows[3]["Hub Shipping Fee"] == 0
+    assert rows[3]["Express"] == 0
+    assert rows[3]["Shipping Method"] == "Review Needed"
+    assert "No hub or express rate found" in rows[3]["Shipping Rate Note"]
+    assert "Shipping method unavailable" in rows[3]["Shipping Rate Note"]
+    assert "Zone" not in rows[0]
+    assert sum(row["Hub Shipping Fee"] + row["Express"] for row in rows) == 460.5
+    summary_rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 4,
+            "boxes_created": 4,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "total_shipping_cost": 460.5,
+        },
+        [],
+        [],
+        {},
+    )
+    total_row = next(row for row in summary_rows if row["Metric"] == "Total Chargeable Cost")
+    assert total_row["Value"] == 460.5
+
 
 def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
@@ -3390,6 +3733,7 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
                 "Width": "8",
                 "Height": "4",
                 "Weight kg": "1",
+                "Factory Name": "Longhai Printworks",
                 "Publisher Upload Column": "keep me",
             }
         ],
@@ -3436,15 +3780,17 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     assert "Chargeable Weight Plans Selected" not in summary_metrics
     assert "Rules Applied Summary" in summary_sections
     assert "Box Not Available - Substituted Up To VB Box X" in summary_rows[0]
+    assert any(row["Metric"] == "Factory" and row["Value"] == "Longhai Printworks" for row in summary_rows)
 
     debug_summary_rows = _sheet_rows(output_path, "Debug Summary")
     assert any(row["Metric"] == "Warning Count" for row in debug_summary_rows)
 
     cost_rows = _sheet_rows(output_path, "Cost Summary - Launch Campaign")
     assert "Shipping fee Hub" not in cost_rows[0]
-    assert "Customer Shipping Fee" in cost_rows[0]
-    assert cost_rows[0]["Express"] == "Pending future rate table"
-    assert cost_rows[0]["Slow Post"] == "Pending future rate table"
+    assert "Customer Shipping Fee" not in cost_rows[0]
+    assert "Hub Shipping Fee" in cost_rows[0]
+    assert "Express" in cost_rows[0]
+    assert "Slow Post" not in cost_rows[0]
 
     intake_rows = _sheet_rows(output_path, "VFI Intake Form")
     assert intake_rows[0]["Publisher Upload Column"] == "keep me"
@@ -3460,13 +3806,151 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     assert "VFI #" in labels_xml
     assert "Barcode / QR Value" not in labels_xml
     assert "LC 1" in labels_xml
+    assert "Longhai Printworks" in labels_xml
     assert "Launch Campaign" in labels_xml
-    assert "Pledge Config" in labels_xml
+    assert "Config:" in labels_xml
+    assert "Pledge Config" not in labels_xml
     assert "CORE" in labels_xml
-    assert "Carton Box" in labels_xml
+    assert "Carton Box" not in labels_xml
     assert "Detailed description of contents: Board Games-of paper and plastic,non-electrical" in labels_xml
-    assert "City/State/Post" in labels_xml
+    assert "City/State/Zip" in labels_xml
+    assert "City/State/Post" not in labels_xml
     assert "<pageSetup" in labels_xml
+
+
+def test_factory_name_detects_header_or_adjacent_vfi_intake_value():
+    assert workflow_module._factory_name_from_vfi_intake_rows(
+        [{"Factory Name": "Longhai Printworks", "SKU": "CORE"}]
+    ) == "Longhai Printworks"
+    assert workflow_module._factory_name_from_vfi_intake_rows(
+        [{"Field": "Factory", "Value": "Longhai Printworks"}]
+    ) == "Longhai Printworks"
+    assert workflow_module._factory_name_from_vfi_intake_rows(
+        [{"SKU": "CORE"}]
+    ) == ""
+
+
+def test_adjacent_factory_metadata_appears_in_labels_header(tmp_path):
+    sku_master_path = tmp_path / "sku_master.xlsx"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_xlsx(
+        sku_master_path,
+        "stock",
+        [
+            {"SKU": "CORE", "Item name": "Core Game", "Weight/g": "1000", "L-cm": "10", "W-cm": "8", "H-cm": "4", "Field": "Factory", "Value": "WHATZ"}
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [{"Order ID": "1", "SKU": "CORE", "Quantity": "1", "Backer ID": "B-1", "Name": "Ada"}],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "preserve_region_sheets": False,
+            "campaign": {"name": "Launch Campaign", "code": "LC"},
+        },
+    )
+
+    summary_rows = _sheet_rows(output_path, "Summary")
+    labels_xml = _sheet_xml(output_path, "Labels")
+
+    assert any(row["Metric"] == "Factory" and row["Value"] == "WHATZ" for row in summary_rows)
+    assert 'r="C1" t="inlineStr" s="7"><is><t></t></is></c>' in labels_xml
+    assert "WHATZ" in labels_xml
+
+
+def test_vfi_intake_form_preserves_blank_header_factory_columns(tmp_path):
+    sku_master_path = tmp_path / "sku_master.xlsx"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_xlsx_table(
+        sku_master_path,
+        "stock",
+        [
+            ["SKU", "Item name", "Weight/g", "L-cm", "W-cm", "H-cm", "", ""],
+            ["SKU编号", "商品全名", "重量(kg)", "长", "宽", "高", "", ""],
+            ["CORE", "Core Game", "1000", "10", "8", "4", "", ""],
+            ["", "", "", "", "", "", "Factory", "WHATZ"],
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [{"Order ID": "1", "SKU": "CORE", "Quantity": "1", "Backer ID": "B-1", "Name": "Ada"}],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"packing_mode": "fast", "preserve_region_sheets": False},
+    )
+
+    intake_rows = _sheet_rows(output_path, "VFI Intake Form")
+    summary_rows = _sheet_rows(output_path, "Summary")
+
+    assert intake_rows[0]["Column G"] == ""
+    assert intake_rows[2]["Column G"] == "Factory"
+    assert intake_rows[2]["Column H"] == "WHATZ"
+    assert any(row["Metric"] == "Factory" and row["Value"] == "WHATZ" for row in summary_rows)
+
+
+def test_summary_boxes_needed_shows_backup_vendor_box_recommendation():
+    rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+        },
+        [
+            {
+                "Box Type": "VB 15 cutdown",
+                "Length cm": 35.4,
+                "Width cm": 32.4,
+                "Height cm": 12,
+                "Box Count": 1,
+                "Backup Vendor Box": "VB9 / 34x34x12",
+            }
+        ],
+        [],
+        {},
+    )
+
+    box_row = next(row for row in rows if row["Section"] == "Boxes Needed")
+    assert box_row["Metric"] == "VB 15"
+    assert box_row["Box Not Available - Substituted Up To VB Box X"] == "VB9 / 34x34x12"
+
+
+def test_summary_boxes_needed_shows_na_when_no_valid_backup_exists():
+    rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+        },
+        [
+            {
+                "Box Type": "VB 15",
+                "Length cm": 35.4,
+                "Width cm": 32.4,
+                "Height cm": 12,
+                "Box Count": 1,
+                "Backup Vendor Box": "N/A",
+            }
+        ],
+        [],
+        {},
+    )
+
+    box_row = next(row for row in rows if row["Section"] == "Boxes Needed")
+    assert box_row["Box Not Available - Substituted Up To VB Box X"] == "N/A"
 
 
 def test_phase_a_cost_summary_falls_back_when_campaign_name_missing(tmp_path):
