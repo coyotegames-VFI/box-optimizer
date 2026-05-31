@@ -1,6 +1,7 @@
 import csv
 import logging
 import zipfile
+from collections import Counter
 from xml.etree import ElementTree
 from pathlib import Path
 
@@ -409,10 +410,10 @@ def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path
     assert [sheet.sheet_name for sheet in workbook_rows[:8]] == [
         "Summary",
         "Cost Summary",
+        "Labels",
         "VFI Intake Form",
         "Optimized to Pack",
         "Label generator",
-        "Labels",
         "Order Volume Weights",
         "Box Size Summary",
     ]
@@ -1102,10 +1103,10 @@ def test_workbook_presentation_tabs_and_compact_columns(tmp_path):
     assert [sheet.sheet_name for sheet in workbook[:8]] == [
         "Summary",
         "Cost Summary",
+        "Labels",
         "VFI Intake Form",
         "Optimized to Pack",
         "Label generator",
-        "Labels",
         "Order Volume Weights",
         "Box Size Summary",
     ]
@@ -1778,7 +1779,7 @@ def test_fast_mode_combines_large_item_and_small_addons_when_they_fit(tmp_path):
     )
 
 
-def test_chargeable_weight_plan_selects_extra_box_when_savings_exceed_threshold(tmp_path):
+def test_chargeable_weight_plan_keeps_one_box_when_savings_below_operational_threshold(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
     output_path = tmp_path / "optimized.xlsx"
@@ -1812,18 +1813,15 @@ def test_chargeable_weight_plan_selects_extra_box_when_savings_exceed_threshold(
     )
 
     row = _sheet_rows(output_path, "Order Volume Weights")[0]
-    assert int(float(row["Box Qty"])) == 2
-    assert float(row["Chargeable Weight kg"]) < 7
-    assert "VB 48 cutdown" in row["Box Plan"]
-    assert "VB 2 cutdown" in row["Box Plan"]
+    assert int(float(row["Box Qty"])) == 1
 
     debug_summary_rows = _sheet_rows(output_path, "Debug Summary")
     assert any(
-        summary["Metric"] == "Chargeable Weight Plans Selected" and int(float(summary["Value"])) == 1
+        summary["Metric"] == "Chargeable Weight Plans Selected" and int(float(summary["Value"])) == 0
         for summary in debug_summary_rows
     )
-    warning_messages = [row["Message"] for row in _sheet_rows(output_path, "Errors and Warnings")]
-    assert any("Selected 2-box plan over 1-box plan" in message for message in warning_messages)
+    sheet_names = [sheet.sheet_name for sheet in read_workbook(str(output_path))]
+    assert "Errors and Warnings" not in sheet_names
 
 
 def test_company_protection_guardrail_rejects_extra_box_when_margin_gets_worse(monkeypatch):
@@ -1979,6 +1977,79 @@ def test_repeat_retail_can_accept_small_margin_giveback_for_customer_savings():
     )
 
 
+def test_extra_box_plan_requires_three_kg_savings_per_candidate_extra_box():
+    baseline = workflow_module.CandidatePlanScore(
+        total_chargeable_weight_kg=10.0,
+        box_qty=1,
+        box_type_count=1,
+        total_assigned_volume_cm3=10000,
+    )
+
+    def beats(total_chargeable: float, box_qty: int) -> bool:
+        return workflow_module._candidate_beats_baseline(
+            workflow_module.CandidatePlanScore(
+                total_chargeable_weight_kg=total_chargeable,
+                box_qty=box_qty,
+                box_type_count=box_qty,
+                total_assigned_volume_cm3=box_qty * 1000,
+            ),
+            baseline,
+            1,
+            0.5,
+            0.05,
+            2.0,
+            4,
+            4,
+            1.0,
+            0.075,
+            3.0,
+            0.10,
+            [],
+            workflow_module.DEFAULT_CONFIG,
+        )
+
+    assert not beats(7.7, 2)
+    assert beats(7.0, 2)
+    assert not beats(6.0, 3)
+    assert beats(3.0, 3)
+    assert beats(1.2, 3)
+
+
+def test_three_box_plan_compared_to_two_box_plan_requires_six_kg_savings():
+    baseline = workflow_module.CandidatePlanScore(
+        total_chargeable_weight_kg=12.0,
+        box_qty=2,
+        box_type_count=2,
+        total_assigned_volume_cm3=12000,
+    )
+
+    def beats(total_chargeable: float) -> bool:
+        return workflow_module._candidate_beats_baseline(
+            workflow_module.CandidatePlanScore(
+                total_chargeable_weight_kg=total_chargeable,
+                box_qty=3,
+                box_type_count=3,
+                total_assigned_volume_cm3=3000,
+            ),
+            baseline,
+            1,
+            0.5,
+            0.05,
+            2.0,
+            4,
+            4,
+            1.0,
+            0.075,
+            3.0,
+            0.10,
+            [],
+            workflow_module.DEFAULT_CONFIG,
+        )
+
+    assert not beats(8.0)
+    assert beats(5.0)
+
+
 def test_broader_top_two_dim_candidate_can_win_when_two_extra_boxes_allowed(monkeypatch):
     lines = [
         _order_line("1", "LARGE A"),
@@ -2008,7 +2079,7 @@ def test_broader_top_two_dim_candidate_can_win_when_two_extra_boxes_allowed(monk
 
     def fake_score(**kwargs):
         box_qty = kwargs["split_result"].box_qty
-        chargeable_by_box_qty = {1: 12.0, 2: 11.2, 3: 9.5}
+        chargeable_by_box_qty = {1: 12.0, 2: 11.2, 3: 5.0}
         return workflow_module.CandidatePlanScore(
             total_chargeable_weight_kg=chargeable_by_box_qty[box_qty],
             box_qty=box_qty,
@@ -2112,7 +2183,7 @@ def test_repeat_retail_batch_candidate_can_use_more_small_cartons(monkeypatch):
 
     def fake_score(**kwargs):
         box_qty = kwargs["split_result"].box_qty
-        chargeable_by_box_qty = {1: 40.0, 2: 38.0, 8: 30.0}
+        chargeable_by_box_qty = {1: 60.0, 2: 58.0, 8: 30.0}
         return workflow_module.CandidatePlanScore(
             total_chargeable_weight_kg=chargeable_by_box_qty.get(box_qty, 45.0),
             box_qty=box_qty,
@@ -2812,6 +2883,48 @@ def test_label_sku_breakdown_follows_sku_master_order(tmp_path):
     optimized_row = _sheet_rows(output_path, "Optimized to Pack")[0]
     assert optimized_row["All Items"] == "CORE x1, ADDON x2, COIN x3"
     assert optimized_row["Box 1"].endswith("CORE x1, ADDON x2, COIN x3")
+
+
+def test_label_generator_carries_first_valid_backer_notes_and_ignores_sku_notes():
+    row = {
+        "Order ID": "1",
+        "Box Qty": 1,
+        "SKU Breakdown": "CORE x1",
+        "Label SKUs in Box": "CORE x1",
+        "Box Type": "VB 4",
+        "Chargeable Weight kg": 1,
+        "Total Units": 1,
+        "Label Unit Count": 1,
+        "SKU Notes": "do not use",
+        "Customer Notes": "Leave package at front desk",
+        "Delivery Notes": "do not concatenate",
+    }
+
+    labels = workflow_module._label_generator_rows([row], {"CORE x1": 1}, "TEST")
+
+    assert workflow_module._valid_order_notes_header("Shipping Notes")
+    assert workflow_module._valid_order_notes_header("customernotes")
+    assert workflow_module._valid_order_notes_header("Delivernotes")
+    assert not workflow_module._valid_order_notes_header("SKU Notes")
+    assert labels[0]["Notes"] == "Leave package at front desk"
+
+
+def test_label_generator_does_not_duplicate_order_notes_for_multi_carton_orders():
+    row = {
+        "Order ID": "1",
+        "Box Qty": 2,
+        "SKU Breakdown": "CORE x1",
+        "Label SKUs in Box": "CORE x1",
+        "Box Type": "VB 4",
+        "Chargeable Weight kg": 1,
+        "Total Units": 1,
+        "Label Unit Count": 1,
+        "Shipping Notes": "Leave package at front desk",
+    }
+
+    labels = workflow_module._label_generator_rows([row], {"CORE x1": 1}, "TEST")
+
+    assert labels[0]["Notes"] == ""
 
 
 def test_asia_like_fast_mode_fixture_does_not_split_small_items_into_six_boxes(tmp_path):
@@ -3703,13 +3816,15 @@ def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path):
     assert "Shipping method unavailable" in rows[3]["Shipping Rate Note"]
     assert "Zone" not in rows[0]
     assert sum(row["Hub Shipping Fee"] + row["Express"] for row in rows) == 460.5
+    assert workflow_module._cost_summary_total_cost(rows) == 460.5
     summary_rows = workflow_module._clean_summary_rows(
         {
             "orders_processed": 4,
             "boxes_created": 4,
             "box_types": 1,
             "unmatched_skus": 0,
-            "total_shipping_cost": 460.5,
+            "total_shipping_cost": workflow_module._cost_summary_total_cost(rows),
+            "total_shipping_cost_detail": "Hub Shipping Fee + Express",
         },
         [],
         [],
@@ -3717,6 +3832,114 @@ def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path):
     )
     total_row = next(row for row in summary_rows if row["Metric"] == "Total Chargeable Cost")
     assert total_row["Value"] == 460.5
+    assert total_row["Detail"] == "Hub Shipping Fee + Express"
+
+
+def test_summary_total_cost_sums_cost_summary_row_totals():
+    cost_rows = [
+        {"Hub Shipping Fee": 10, "Express": 0},
+        {"Hub Shipping Fee": "", "Express": 20.5},
+        {"Hub Shipping Fee": None, "Express": ""},
+    ]
+    cost_total = workflow_module._cost_summary_total_cost(cost_rows)
+    summary_rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 4,
+            "boxes_created": 4,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "total_shipping_cost": cost_total,
+            "total_shipping_cost_detail": "Hub Shipping Fee + Express",
+        },
+        [],
+        [],
+        {},
+    )
+
+    assert workflow_module._customer_handling_fee(1) == 2.0
+    assert workflow_module._customer_handling_fee(2) == 2.25
+    assert workflow_module._customer_handling_fee(5) == 3.0
+    assert workflow_module._customer_handling_fee(1, True) == 1.75
+    assert workflow_module._customer_handling_fee(2, True) == 2.25
+    assert cost_total == 30.5
+    total_row = next(row for row in summary_rows if row["Metric"] == "Total Chargeable Cost")
+    assert total_row["Value"] == 30.5
+    assert total_row["Detail"] == "Hub Shipping Fee + Express"
+    assert not any(row["Metric"] == "Estimated Cost" for row in summary_rows)
+
+
+def test_cost_summary_applies_narrow_prepacked_handling_discount_inside_shipping_fee():
+    lane = workflow_module.CustomerRateLane(rates_by_zone={"Zone 1": {1.0: 10.0}}, zone_by_country={})
+    assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 1) == 12.0
+    assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 2) == 12.25
+    assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 1, True) == 11.75
+    assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 2, True) == 12.25
+
+    rows = workflow_module._cost_summary_rows(
+        [
+            {"Country": "Unknown", "Chargeable Weight kg": 1.0, "Total Units": 1},
+            {"Country": "Unknown", "Chargeable Weight kg": 1.0, "Total Units": 2},
+            {"Country": "Unknown", "Chargeable Weight kg": 1.0, "Total Units": 1, "Prepacked No Touch": True},
+            {"Country": "Unknown", "Chargeable Weight kg": 1.0, "Total Units": 2, "Prepacked No Touch": True},
+        ],
+        {},
+    )
+
+    assert "Prepacked No Touch" not in rows[0]
+    assert "Picking/Packing Fee" not in rows[0]
+    assert "Total Cost" not in rows[0]
+
+
+def test_summary_box_types_collapse_cutdown_variants_to_base_vb_box():
+    box_rows = [
+        {"Box Type": "VB33", "Length cm": 40, "Width cm": 30, "Height cm": 20, "Box Count": 1},
+        {"Box Type": "VB33 cut down", "Length cm": 40, "Width cm": 30, "Height cm": 12, "Box Count": 2},
+        {"Box Type": "VB33 / cutdown 34 x 32 x 12", "Length cm": 34, "Width cm": 32, "Height cm": 12, "Box Count": 3},
+    ]
+    summary_rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 6,
+            "boxes_created": 6,
+            "box_types": len({workflow_module._base_box_type(row["Box Type"]) for row in box_rows}),
+            "unmatched_skus": 0,
+        },
+        box_rows,
+        [],
+        {},
+    )
+
+    box_type_row = next(row for row in summary_rows if row["Metric"] == "Box Types")
+    box_needed_rows = [row for row in summary_rows if row["Section"] == "Boxes Needed"]
+    assert box_type_row["Value"] == 1
+    assert box_needed_rows == [{"Section": "Boxes Needed", "Metric": "VB 33", "Value": 6, "Detail": "40x30x20 cm"}]
+
+
+def test_summary_boxes_needed_sorts_by_vb_number_not_alphabetically():
+    rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 8,
+            "boxes_created": 8,
+            "box_types": 8,
+            "unmatched_skus": 0,
+        },
+        [
+            {"Box Type": "VB 18", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "VB 39", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "VB 4", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "VB 23-1", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "VB 32", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "VB 23", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "CUSTOM", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+            {"Box Type": "VB6", "Length cm": 1, "Width cm": 1, "Height cm": 1, "Box Count": 1},
+        ],
+        [],
+        {},
+    )
+
+    box_metrics = [row["Metric"] for row in rows if row["Section"] == "Boxes Needed"]
+    assert box_metrics == ["VB 4", "VB 6", "VB 18", "VB 23", "VB 23-1", "VB 32", "VB 39", "CUSTOM"]
+    assert box_metrics.index("VB 4") < box_metrics.index("VB 39")
+    assert box_metrics.index("VB 23") < box_metrics.index("VB 23-1") < box_metrics.index("VB 32")
 
 
 def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_path):
@@ -3759,13 +3982,14 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     assert sheet_names[:8] == [
         "Summary",
         "Cost Summary - Launch Campaign",
+        "Labels",
         "VFI Intake Form",
         "Optimized to Pack",
         "Label generator",
-        "Labels",
         "Order Volume Weights",
         "Box Size Summary",
     ]
+    assert "Box Consolidation What-If" in sheet_names
     assert "Debug Summary" in sheet_names
     assert sheet_names.index("Debug Summary") > sheet_names.index("Pledge Combination Summary")
 
@@ -3779,7 +4003,7 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     assert "Rules Applied" not in summary_metrics
     assert "Chargeable Weight Plans Selected" not in summary_metrics
     assert "Rules Applied Summary" in summary_sections
-    assert "Box Not Available - Substituted Up To VB Box X" in summary_rows[0]
+    assert "Box Not Available - Substituted Up To VB Box X" not in summary_rows[0]
     assert any(row["Metric"] == "Factory" and row["Value"] == "Longhai Printworks" for row in summary_rows)
 
     debug_summary_rows = _sheet_rows(output_path, "Debug Summary")
@@ -3788,8 +4012,8 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     cost_rows = _sheet_rows(output_path, "Cost Summary - Launch Campaign")
     assert "Shipping fee Hub" not in cost_rows[0]
     assert "Customer Shipping Fee" not in cost_rows[0]
-    assert "Hub Shipping Fee" in cost_rows[0]
-    assert "Express" in cost_rows[0]
+    assert "Hub Shipping Fee (USD)" in cost_rows[0]
+    assert "Express (USD)" in cost_rows[0]
     assert "Slow Post" not in cost_rows[0]
 
     intake_rows = _sheet_rows(output_path, "VFI Intake Form")
@@ -3803,7 +4027,7 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     assert label_generator_rows[0]["Total Units"] == "1"
     assert label_generator_rows[0]["SKU Breakdown"] == "CORE x1"
     labels_xml = _sheet_xml(output_path, "Labels")
-    assert "VFI #" in labels_xml
+    assert "VFI #" not in labels_xml
     assert "Barcode / QR Value" not in labels_xml
     assert "LC 1" in labels_xml
     assert "Longhai Printworks" in labels_xml
@@ -3900,7 +4124,7 @@ def test_vfi_intake_form_preserves_blank_header_factory_columns(tmp_path):
     assert any(row["Metric"] == "Factory" and row["Value"] == "WHATZ" for row in summary_rows)
 
 
-def test_summary_boxes_needed_shows_backup_vendor_box_recommendation():
+def test_summary_boxes_needed_omits_backup_vendor_box_recommendation_column():
     rows = workflow_module._clean_summary_rows(
         {
             "orders_processed": 1,
@@ -3924,10 +4148,10 @@ def test_summary_boxes_needed_shows_backup_vendor_box_recommendation():
 
     box_row = next(row for row in rows if row["Section"] == "Boxes Needed")
     assert box_row["Metric"] == "VB 15"
-    assert box_row["Box Not Available - Substituted Up To VB Box X"] == "VB9 / 34x34x12"
+    assert "Box Not Available - Substituted Up To VB Box X" not in box_row
 
 
-def test_summary_boxes_needed_shows_na_when_no_valid_backup_exists():
+def test_summary_boxes_needed_has_no_substitute_column_when_no_valid_backup_exists():
     rows = workflow_module._clean_summary_rows(
         {
             "orders_processed": 1,
@@ -3950,7 +4174,590 @@ def test_summary_boxes_needed_shows_na_when_no_valid_backup_exists():
     )
 
     box_row = next(row for row in rows if row["Section"] == "Boxes Needed")
-    assert box_row["Box Not Available - Substituted Up To VB Box X"] == "N/A"
+    assert "Box Not Available - Substituted Up To VB Box X" not in box_row
+
+
+def test_box_consolidation_what_if_prefers_used_valid_backup_for_low_volume_box():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 34",
+                "Backup Vendor Box": "VB35 / 50x40x27.25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            {
+                "Box Type": "VB 35",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 35",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 35",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 35",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 35",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+        ]
+    )
+
+    recommended = next(row for row in rows if row["Original VB Box"] == "VB 34")
+    assert recommended["Backup VB Box Candidate"] == "VB 35"
+    assert recommended["Backup Box Current Quantity"] == 5
+    assert recommended["Quantity Proposed to Move"] == 1
+    assert recommended["Original Box Quantity After Move"] == 0
+    assert recommended["Backup Box Quantity After Move"] == 6
+    assert recommended["Recommendation"] == "Recommended"
+    assert recommended["Chain Path"] == "VB 34 -> VB 35"
+    assert recommended["Final Target VB Box"] == "VB 35"
+    assert recommended["Final Fit Validated"] == "Yes"
+    assert recommended["Box Type Reduction Impact"] == 1
+    assert recommended["Original Box Type Count"] == 2
+    assert recommended["Hypothetical Box Type Count"] == 1
+    assert recommended["Chargeable Weight Increase per Package"] == 1.9
+    assert recommended["Total Chargeable Weight Increase"] == 1.9
+
+
+def test_box_consolidation_what_if_reports_no_valid_backup_and_does_not_move_high_volume_box():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 10",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 2,
+                "Chargeable Weight kg": 3,
+            },
+            {
+                "Box Type": "VB 20",
+                "Backup Vendor Box": "VB30 / 60x40x30",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+            {
+                "Box Type": "VB 20",
+                "Backup Vendor Box": "VB30 / 60x40x30",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+        ]
+    )
+
+    no_backup = next(row for row in rows if row["Original VB Box"] == "VB 10")
+    assert no_backup["Recommendation"] == "Rejected"
+    assert no_backup["Backup VB Box Candidate"] == "N/A"
+    assert no_backup["Final Fit Validated"] == "No"
+
+    high_volume = next(row for row in rows if row["Original VB Box"] == "VB 20")
+    assert high_volume["Recommendation"] == "Rejected"
+    assert high_volume["Quantity Proposed to Move"] == 0
+    assert high_volume["Box Type Reduction Impact"] == 0
+    assert high_volume["Final Fit Validated"] == "No"
+    assert high_volume["Reason Accepted / Rejected"] == "Skipped: protected high-volume primary box."
+
+
+def test_box_consolidation_what_if_rejects_chargeable_increase_at_or_above_two_kg():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 10",
+                "Backup Vendor Box": "VB30 / 50x40x27.5",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            {
+                "Box Type": "VB 11",
+                "Backup Vendor Box": "VB30 / 50x40x27.75",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            {
+                "Box Type": "VB 30",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 30",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 30",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 30",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 30",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+        ]
+    )
+
+    two_kg = next(row for row in rows if row["Original VB Box"] == "VB 10")
+    assert two_kg["Chargeable Weight Increase per Package"] == 2.0
+    assert two_kg["Recommendation"] == "Rejected"
+    assert two_kg["Quantity Proposed to Move"] == 0
+    assert two_kg["Reason Accepted / Rejected"] == "Rejected: total chargeable increase >= 2.0 kg."
+
+    over_two_kg = next(row for row in rows if row["Original VB Box"] == "VB 11")
+    assert over_two_kg["Chargeable Weight Increase per Package"] == 2.1
+    assert over_two_kg["Recommendation"] == "Rejected"
+    assert over_two_kg["Reason Accepted / Rejected"] == "Rejected: total chargeable increase >= 2.0 kg."
+
+
+def test_box_consolidation_what_if_protects_top_quarter_high_volume_sources_and_ties():
+    protected = workflow_module._protected_high_volume_boxes(
+        Counter(
+            {
+                "VB 33": 72,
+                "VB 39": 41,
+                "VB 47": 41,
+                "VB 32": 12,
+                "VB 23": 4,
+                "VB 12": 3,
+                "VB 8": 2,
+                "VB 3": 1,
+            }
+        )
+    )
+
+    assert protected == {"VB 33", "VB 39", "VB 47"}
+
+
+def test_box_consolidation_what_if_allows_low_volume_source_to_move_into_protected_target():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 12",
+                "Backup Vendor Box": "VB33 / 50x40x27.25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            *[
+                {
+                    "Box Type": "VB 33",
+                    "Backup Vendor Box": "VB47 / 50x40x29",
+                    "Packed Actual Weight kg": 4,
+                    "Chargeable Weight kg": 12,
+                }
+                for _ in range(8)
+            ],
+            *[
+                {
+                    "Box Type": f"VB {box_id}",
+                    "Backup Vendor Box": "N/A",
+                    "Packed Actual Weight kg": 4,
+                    "Chargeable Weight kg": 13,
+                }
+                for box_id in [47] * 7 + [48] * 6 + [49] * 5 + [50] * 4 + [51] * 3 + [52] * 2
+            ],
+        ]
+    )
+
+    low_volume = next(row for row in rows if row["Original VB Box"] == "VB 12")
+    protected_source = next(row for row in rows if row["Original VB Box"] == "VB 33")
+    assert low_volume["Recommendation"] == "Recommended"
+    assert low_volume["Final Target VB Box"] == "VB 33"
+    assert protected_source["Recommendation"] == "Rejected"
+    assert protected_source["Reason Accepted / Rejected"] == "Skipped: protected high-volume primary box."
+
+
+def test_box_consolidation_what_if_accepts_chained_substitution_when_total_increase_stays_under_cap():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 23",
+                "Backup Vendor Box": "VB23.1 / 50x40x25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            {
+                "Box Type": "VB 23.1",
+                "Backup Vendor Box": "VB32 / 50x40x27.25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+        ]
+    )
+
+    first_step = next(row for row in rows if row["Original VB Box"] == "VB 23")
+    assert first_step["Backup VB Box Candidate"] == "VB 32"
+    assert first_step["Chain Path"] == "VB 23 -> VB 23.1 -> VB 32"
+    assert first_step["Final Target VB Box"] == "VB 32"
+    assert first_step["Recommendation"] == "Recommended"
+    assert first_step["Quantity Proposed to Move"] == 1
+    assert first_step["Chargeable Weight Increase per Package"] == 1.9
+
+    chained_step = next(row for row in rows if row["Original VB Box"] == "VB 23.1")
+    assert chained_step["Backup VB Box Candidate"] == "VB 32"
+    assert chained_step["Recommendation"] == "Rejected"
+    assert chained_step["Quantity Proposed to Move"] == 0
+    assert chained_step["Box Type Reduction Impact"] == 0
+    assert chained_step["Reason Accepted / Rejected"] == "Rejected: conflicts with accepted consolidation path."
+
+
+def test_box_consolidation_what_if_rejects_chained_substitution_when_total_increase_hits_cap():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 23",
+                "Backup Vendor Box": "VB23.1 / 50x40x25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            {
+                "Box Type": "VB 23.1",
+                "Backup Vendor Box": "VB32 / 50x40x29",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+        ]
+    )
+
+    rejected = next(row for row in rows if row["Original VB Box"] == "VB 23")
+    assert rejected["Chain Path"] == "VB 23 -> VB 23.1"
+    assert rejected["Final Target VB Box"] == "VB 23.1"
+    assert rejected["Recommendation"] == "Recommended"
+    assert rejected["Chargeable Weight Increase per Package"] == 1.0
+    assert rejected["Reason Accepted / Rejected"] == "Accepted one-step fallback; second step rejected: chargeable increase >= 2.0 kg."
+
+
+def test_box_consolidation_what_if_rejects_chain_when_final_target_cannot_contain_direct_backup():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 23",
+                "Backup Vendor Box": "VB23.1 / 50x40x25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+            {
+                "Box Type": "VB 23.1",
+                "Backup Vendor Box": "VB32 / 50x35x25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+        ]
+    )
+
+    rejected = next(row for row in rows if row["Original VB Box"] == "VB 23")
+    assert rejected["Chain Path"] == "VB 23 -> VB 23.1"
+    assert rejected["Final Target VB Box"] == "VB 23.1"
+    assert rejected["Recommendation"] == "Recommended"
+    assert rejected["Final Fit Validated"] == "Yes"
+    assert rejected["Reason Accepted / Rejected"] == "Accepted one-step fallback; second step rejected: final target not valid for original package."
+
+
+def test_box_consolidation_what_if_does_not_chain_beyond_two_steps():
+    rows = workflow_module._box_consolidation_what_if_rows(
+        [
+            {
+                "Box Type": "VB 23",
+                "Backup Vendor Box": "VB23.1 / 50x40x25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 9,
+            },
+            {
+                "Box Type": "VB 23.1",
+                "Backup Vendor Box": "VB32 / 50x40x27.25",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 10,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "VB39 / 50x40x28",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "VB39 / 50x40x28",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "VB39 / 50x40x28",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 11,
+            },
+            {
+                "Box Type": "VB 39",
+                "Backup Vendor Box": "VB47 / 50x40x29",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 39",
+                "Backup Vendor Box": "VB47 / 50x40x29",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+            },
+            {
+                "Box Type": "VB 47",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 13,
+            },
+            {
+                "Box Type": "VB 47",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 13,
+            },
+        ]
+    )
+
+    recommended = next(row for row in rows if row["Original VB Box"] == "VB 23")
+    assert recommended["Recommendation"] == "Recommended"
+    assert recommended["Chain Path"] == "VB 23 -> VB 23.1 -> VB 32"
+    assert recommended["Chain Path"].count("->") == 2
+    assert "VB 39" not in recommended["Chain Path"]
+
+
+def test_accepted_box_consolidation_updates_summary_and_labels_without_changing_original_rows():
+    box_rows = [
+        {
+            "Box Type": "VB 23",
+            "Backup Vendor Box": "VB32 / 50x40x27.25",
+            "Packed Actual Weight kg": 4,
+            "Chargeable Weight kg": 9,
+            "Chargeable Weight g": 9000,
+            "Length cm": 45,
+            "Width cm": 35,
+            "Height cm": 25,
+            "Box Count": 1,
+            "SKU Breakdown": "CORE x1",
+            "Label SKUs in Box": "CORE x1",
+            "Total Units": 1,
+            "Unit Count": 1,
+            "Label Unit Count": 1,
+            "Order ID": "1",
+            "Box Number": 1,
+            "Box Qty": 1,
+            "Country": "United States",
+            "Box Standardization Note": "",
+        },
+        *[
+            {
+                "Box Type": "VB 32",
+                "Backup Vendor Box": "N/A",
+                "Packed Actual Weight kg": 4,
+                "Chargeable Weight kg": 12,
+                "Chargeable Weight g": 12000,
+                "Length cm": 50,
+                "Width cm": 40,
+                "Height cm": 27.25,
+                "Box Count": 1,
+                "SKU Breakdown": "EXP x1",
+                "Label SKUs in Box": "EXP x1",
+                "Total Units": 1,
+                "Unit Count": 1,
+                "Label Unit Count": 1,
+                "Order ID": str(index),
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Country": "United States",
+                "Box Standardization Note": "",
+            }
+            for index in range(2, 5)
+        ],
+    ]
+
+    what_if_rows = workflow_module._box_consolidation_what_if_rows(box_rows)
+    operational_rows = workflow_module._box_rows_with_operational_consolidation(box_rows, what_if_rows)
+    summary_rows = workflow_module._clean_summary_rows(
+        {"orders_processed": 4, "boxes_created": 4, "box_types": 1, "unmatched_skus": 0},
+        workflow_module._box_size_summary(operational_rows),
+        [],
+        {},
+    )
+    label_rows = workflow_module._label_generator_rows([operational_rows[0]], {"CORE x1": 1}, "TEST")
+    cost_rows = workflow_module._cost_summary_rows(
+        [
+            {
+                "Country": "United States",
+                "US State Abbreviation": "CA",
+                "Chargeable Weight kg": operational_rows[0]["Chargeable Weight kg"],
+                "Chargeable Weight g": operational_rows[0]["Chargeable Weight g"],
+                "Total Units": operational_rows[0]["Total Units"],
+            }
+        ],
+        {},
+    )
+
+    assert box_rows[0]["Box Type"] == "VB 23"
+    assert what_if_rows[0]["Workbook Presentation Applied"] == "Yes: Summary, Labels, Cost Summary"
+    assert operational_rows[0]["Box Type"] == "VB 32"
+    assert operational_rows[0]["Length cm"] == 50
+    assert operational_rows[0]["Chargeable Weight kg"] == 10.9
+    assert operational_rows[0]["Chargeable Weight g"] == 10900
+    box_summary = [row for row in summary_rows if row["Section"] == "Boxes Needed"]
+    assert box_summary == [{"Section": "Boxes Needed", "Metric": "VB 32", "Value": 4, "Detail": "50.0x40.0x27.25 cm"}]
+    assert "Box Not Available - Substituted Up To VB Box X" not in summary_rows[0]
+    assert label_rows[0]["Box Plan"] == "VB 32"
+    assert cost_rows[0]["Chargeable Weight kg"] == 10.9
+    assert cost_rows[0]["Chargeable Weight g"] == 10900
+
+
+def test_all_quantity_one_quote_safety_skips_box_consolidation():
+    box_rows = [
+        {
+            "Box Type": "VB 23",
+            "Backup Vendor Box": "VB32 / 50x40x27.25",
+            "Packed Actual Weight kg": 4,
+            "Chargeable Weight kg": 9,
+            "Chargeable Weight g": 9000,
+            "Length cm": 45,
+            "Width cm": 35,
+            "Height cm": 25,
+            "Box Count": 1,
+            "SKU Breakdown": "CORE x1",
+            "Label SKUs in Box": "CORE x1",
+            "Total Units": 1,
+            "Unit Count": 1,
+            "Label Unit Count": 1,
+            "Order ID": "1",
+            "Box Number": 1,
+            "Box Qty": 1,
+            "Country": "United States",
+            "Box Standardization Note": "",
+        },
+        {
+            "Box Type": "VB 32",
+            "Backup Vendor Box": "N/A",
+            "Packed Actual Weight kg": 4,
+            "Chargeable Weight kg": 12,
+            "Chargeable Weight g": 12000,
+            "Length cm": 50,
+            "Width cm": 40,
+            "Height cm": 27.25,
+            "Box Count": 1,
+            "SKU Breakdown": "EXP x1",
+            "Label SKUs in Box": "EXP x1",
+            "Total Units": 1,
+            "Unit Count": 1,
+            "Label Unit Count": 1,
+            "Order ID": "2",
+            "Box Number": 1,
+            "Box Qty": 1,
+            "Country": "United States",
+            "Box Standardization Note": "",
+        },
+    ]
+
+    assert workflow_module._all_configurations_quantity_one(box_rows)
+    what_if_rows = workflow_module._box_consolidation_what_if_rows(
+        box_rows,
+        skip_reason="Skipped: all configurations quantity 1; using best-fit boxes.",
+    )
+    operational_rows = workflow_module._box_rows_with_operational_consolidation(box_rows, what_if_rows)
+    summary_rows = workflow_module._clean_summary_rows(
+        {"orders_processed": 2, "boxes_created": 2, "box_types": 2, "unmatched_skus": 0},
+        workflow_module._box_size_summary(operational_rows),
+        [],
+        {},
+    )
+    label_rows = workflow_module._label_generator_rows([operational_rows[0]], {"CORE x1": 1}, "TEST")
+
+    skipped = next(row for row in what_if_rows if row["Original VB Box"] == "VB 23")
+    assert skipped["Reason Accepted / Rejected"] == "Skipped: all configurations quantity 1; using best-fit boxes."
+    assert skipped["Workbook Presentation Applied"] == "No"
+    assert operational_rows[0]["Box Type"] == "VB 23"
+    assert operational_rows[0]["Chargeable Weight kg"] == 9
+    assert {row["Metric"] for row in summary_rows if row["Section"] == "Boxes Needed"} == {"VB 23", "VB 32"}
+    assert label_rows[0]["Box Plan"] == "VB 23"
+
+
+def test_all_quantity_one_quote_safety_detects_repeated_configurations_as_eligible():
+    box_rows = [
+        {"Order ID": "1", "SKU Breakdown": "CORE x1", "Box Number": 1},
+        {"Order ID": "2", "SKU Breakdown": "CORE x1", "Box Number": 1},
+    ]
+
+    assert not workflow_module._all_configurations_quantity_one(box_rows)
 
 
 def test_phase_a_cost_summary_falls_back_when_campaign_name_missing(tmp_path):

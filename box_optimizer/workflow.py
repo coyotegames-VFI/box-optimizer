@@ -3148,6 +3148,7 @@ def _candidate_beats_baseline(
         required_savings = max(
             threshold_kg,
             baseline_score.total_chargeable_weight_kg * threshold_pct,
+            MULTI_BOX_OPERATIONAL_SAVINGS_PER_EXTRA_BOX_KG * (candidate_score.box_qty - 1),
         )
         if is_repeat_retail_candidate:
             required_savings = max(
@@ -3254,8 +3255,21 @@ def _rule_summary(sku_rules: dict[str, SKUCampaignRule]) -> list[str]:
 
 
 def _base_box_type(box_type: str) -> str:
+    vb_key = _vb_box_key(box_type)
+    if vb_key:
+        return vb_key
     match = re.match(r"^(VB\s+[^ ]+)", str(box_type or ""))
     return match.group(1) if match else str(box_type or "")
+
+
+def _summary_box_sort_key(box_type: object) -> tuple[int, float, int, str]:
+    text = str(box_type or "").strip()
+    match = re.match(r"^VB\s*([0-9]+)(?:[-.]([0-9]+))?", text, flags=re.IGNORECASE)
+    if not match:
+        return (1, math.inf, 0, text.casefold())
+    primary = int(match.group(1))
+    suffix = int(match.group(2)) if match.group(2) is not None else 0
+    return (0, primary, suffix, text.casefold())
 
 
 def _format_dimension_part(value: object) -> str:
@@ -3292,20 +3306,17 @@ def _clean_summary_rows(
             "Metric": "Orders Processed",
             "Value": result["orders_processed"],
             "Detail": "",
-            "Box Not Available - Substituted Up To VB Box X": "",
         },
-        {"Section": "Run Summary", "Metric": "Boxes Created", "Value": result["boxes_created"], "Detail": "", "Box Not Available - Substituted Up To VB Box X": ""},
-        {"Section": "Run Summary", "Metric": "Box Types", "Value": result["box_types"], "Detail": "", "Box Not Available - Substituted Up To VB Box X": ""},
-        {"Section": "Run Summary", "Metric": "Unmatched SKUs", "Value": result["unmatched_skus"], "Detail": "", "Box Not Available - Substituted Up To VB Box X": ""},
-        {"Section": "Run Summary", "Metric": "Factory", "Value": factory_name, "Detail": "", "Box Not Available - Substituted Up To VB Box X": ""},
+        {"Section": "Run Summary", "Metric": "Boxes Created", "Value": result["boxes_created"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Box Types", "Value": result["box_types"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Unmatched SKUs", "Value": result["unmatched_skus"], "Detail": ""},
+        {"Section": "Run Summary", "Metric": "Factory", "Value": factory_name, "Detail": ""},
         {
             "Section": "Cost Placeholder",
             "Metric": "Total Chargeable Cost",
             "Value": result.get("total_shipping_cost", "Pending rate integration"),
-            "Detail": "Hub Shipping Fee + Express" if "total_shipping_cost" in result else "",
-            "Box Not Available - Substituted Up To VB Box X": "",
+            "Detail": result.get("total_shipping_cost_detail", "Hub Shipping Fee + Express") if "total_shipping_cost" in result else "",
         },
-        {"Section": "Cost Placeholder", "Metric": "Estimated Cost", "Value": "Pending rate integration", "Detail": "", "Box Not Available - Substituted Up To VB Box X": ""},
     ]
     boxes_by_base: dict[str, dict] = {}
     for box in box_size_rows:
@@ -3317,20 +3328,12 @@ def _clean_summary_rows(
                 "Metric": base_type,
                 "Value": 0,
                 "Detail": "",
-                "Box Not Available - Substituted Up To VB Box X": "",
-                "_backup_values": set(),
             },
         )
         entry["Value"] += int(float(box.get("Box Count") or 0))
         if not entry["Detail"]:
             entry["Detail"] = f"{box.get('Length cm', '')}x{box.get('Width cm', '')}x{box.get('Height cm', '')} cm"
-        backup_box = str(box.get("Backup Vendor Box", "") or "").strip()
-        if backup_box and backup_box != "N/A":
-            entry["_backup_values"].add(backup_box)
-    for entry in boxes_by_base.values():
-        backup_values = sorted(entry.pop("_backup_values", set()))
-        entry["Box Not Available - Substituted Up To VB Box X"] = " | ".join(backup_values) if backup_values else "N/A"
-    rows.extend(boxes_by_base.values())
+    rows.extend(sorted(boxes_by_base.values(), key=lambda row: _summary_box_sort_key(row["Metric"])))
     if unmatched_rows:
         for unmatched in unmatched_rows[:20]:
             rows.append(
@@ -3339,18 +3342,17 @@ def _clean_summary_rows(
                     "Metric": unmatched.get("Canonical SKU") or unmatched.get("Raw SKU", ""),
                     "Value": unmatched.get("Reason", ""),
                     "Detail": unmatched.get("Order ID", ""),
-                    "Box Not Available - Substituted Up To VB Box X": "",
                 }
             )
     else:
-        rows.append({"Section": "Unmatched SKU Summary", "Metric": "Unmatched SKUs", "Value": 0, "Detail": "None", "Box Not Available - Substituted Up To VB Box X": ""})
+        rows.append({"Section": "Unmatched SKU Summary", "Metric": "Unmatched SKUs", "Value": 0, "Detail": "None"})
 
     rule_summaries = _rule_summary(sku_rules)
     if rule_summaries:
         for summary in rule_summaries:
-            rows.append({"Section": "Rules Applied Summary", "Metric": "Rule", "Value": summary, "Detail": "", "Box Not Available - Substituted Up To VB Box X": ""})
+            rows.append({"Section": "Rules Applied Summary", "Metric": "Rule", "Value": summary, "Detail": ""})
     else:
-        rows.append({"Section": "Rules Applied Summary", "Metric": "Rules", "Value": 0, "Detail": "No special packing rules matched", "Box Not Available - Substituted Up To VB Box X": ""})
+        rows.append({"Section": "Rules Applied Summary", "Metric": "Rules", "Value": 0, "Detail": "No special packing rules matched"})
     return rows
 
 
@@ -3452,6 +3454,8 @@ _XLSX_NS = {
     "rel": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "pkgrel": "http://schemas.openxmlformats.org/package/2006/relationships",
 }
+
+MULTI_BOX_OPERATIONAL_SAVINGS_PER_EXTRA_BOX_KG = 3.0
 
 
 COUNTRY_NAME_ZH_HANS_BY_CODE = {
@@ -3826,13 +3830,42 @@ def _express_zone_for_cost_summary_row(row: dict, rate_sheet: CustomerRateSheet 
     return rate_sheet.express.zone_by_country.get(_clean_rate_country(country), "")
 
 
-def _customer_handling_fee(total_units: object) -> float:
+def _customer_handling_fee(total_units: object, prepacked_no_touch: object = False) -> float:
     try:
         units = int(float(total_units))
     except (TypeError, ValueError):
         units = 1
     units = max(units, 1)
+    if units == 1 and str(prepacked_no_touch).strip().lower() in {"true", "yes", "1"}:
+        return 1.75
     return 2.0 + max(units - 1, 0) * 0.25
+
+
+def _is_prepacked_no_touch_row(row: dict) -> bool:
+    explicit = str(row.get("Prepacked No Touch", "") or "").strip().lower()
+    if explicit in {"true", "yes", "1"}:
+        return True
+    text = " ".join(
+        str(row.get(key, "") or "")
+        for key in [
+            "Rule Applied",
+            "Box Selection Decision",
+            "Box Standardization Note",
+            "Warning",
+        ]
+    ).lower()
+    return any(marker in text for marker in ["prepacked", "pre-packed", "ship-as-is", "no-touch", "final-carton"])
+
+
+def _cost_summary_total_cost(rows: list[dict]) -> float:
+    total = 0.0
+    for row in rows:
+        for key in ["Hub Shipping Fee", "Express"]:
+            try:
+                total += float(row.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+    return round(total, 2)
 
 
 def _rate_lane_shipping_fee(
@@ -3840,6 +3873,7 @@ def _rate_lane_shipping_fee(
     zone: str,
     lane: CustomerRateLane | None,
     total_units: object = 1,
+    prepacked_no_touch: object = False,
 ) -> float | None:
     if not lane:
         return None
@@ -3853,7 +3887,7 @@ def _rate_lane_shipping_fee(
     charge = _rated_charge_for_weight(weight, rates, lane.max_weight_kg)
     if charge is None:
         return None
-    return round(charge + _customer_handling_fee(total_units), 2)
+    return round(charge + _customer_handling_fee(total_units, prepacked_no_touch), 2)
 
 
 def _shipping_fee_choice(row: dict, rate_sheet: CustomerRateSheet | None, hub_zone: str) -> tuple[float, float, str]:
@@ -3861,11 +3895,12 @@ def _shipping_fee_choice(row: dict, rate_sheet: CustomerRateSheet | None, hub_zo
         return 0, 0, "Rate sheet unavailable."
     weight = row.get("Chargeable Weight kg", "")
     total_units = row.get("Total Units", "")
-    hub_fee = _rate_lane_shipping_fee(weight, hub_zone, rate_sheet.hub, total_units)
+    prepacked_no_touch = _is_prepacked_no_touch_row(row)
+    hub_fee = _rate_lane_shipping_fee(weight, hub_zone, rate_sheet.hub, total_units, prepacked_no_touch)
     if hub_fee is not None:
         return hub_fee, 0, ""
     express_zone = _express_zone_for_cost_summary_row(row, rate_sheet)
-    express_fee = _rate_lane_shipping_fee(weight, express_zone, rate_sheet.express, total_units)
+    express_fee = _rate_lane_shipping_fee(weight, express_zone, rate_sheet.express, total_units, prepacked_no_touch)
     if express_fee is not None:
         return 0, express_fee, "Express fallback; hub unavailable."
     return 0, 0, f"No hub or express rate found for {row.get('Country', '')} at {weight} kg."
@@ -3931,6 +3966,21 @@ def _country_code_for_label_row(row: dict) -> str:
     )
     code = re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
     return code if len(code) == 2 else ""
+
+
+def _valid_order_notes_header(header: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(header or "").strip().lower())
+    if "notes" not in normalized:
+        return False
+    return not any(token in normalized for token in ["sku", "item", "product"])
+
+
+def _order_notes_value(row: dict) -> str:
+    for key, value in row.items():
+        if _valid_order_notes_header(key):
+            return str(value or "").strip()
+    return ""
+
 
 def _cost_summary_rows(order_rows: list[dict], cfg: dict) -> list[dict]:
     rows = []
@@ -4002,6 +4052,10 @@ def _label_generator_rows(
     rows = []
     for row in box_rows:
         country_code = _country_code_for_label_row(row)
+        try:
+            box_qty = int(float(row.get("Box Qty") or 0))
+        except (TypeError, ValueError):
+            box_qty = 0
         rows.append(
             {
                 "Pledge Configuration": pledge_config_by_combo.get(str(row.get("SKU Breakdown", "")), ""),
@@ -4015,6 +4069,7 @@ def _label_generator_rows(
                 "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Backer Name", "Customer Name", "Name"]),
                 "phone": _first_present(row, ["phone", "Phone", "Address Phone Number"]),
                 "email": _first_present(row, ["email", "Email", "CustomerEmail", "Customer Email"]),
+                "Notes": _order_notes_value(row) if box_qty <= 1 else "",
                 "add 1": _first_present(row, ["add 1", "Address 1", "Address Line 1", "Shipping Address 1", "Shipping Address Line 1", "Address1"]),
                 "add 2": _first_present(row, ["add 2", "Address 2", "Address Line 2", "Shipping Address 2", "Shipping Address Line 2", "Address2"]),
                 "Shipping City": _first_present(row, ["Shipping City", "Address City", "City"]),
@@ -4149,9 +4204,10 @@ def _labels_rows(
             "Postal/Zip": label.get("Shipping Postal Code", ""),
             "Country": label.get("Country Name", ""),
             "Country Code": label.get("Ship to Country Code", ""),
-            "Phone": label.get("phone", ""),
-            "Email": label.get("email", ""),
-            "Order ID": label.get("Order ID", ""),
+                "Phone": label.get("phone", ""),
+                "Email": label.get("email", ""),
+                "Notes": label.get("Notes", ""),
+                "Order ID": label.get("Order ID", ""),
             "Pledge Configuration": label.get("Pledge Configuration", ""),
             "Carton Box Designation": label.get("Box Plan", ""),
             "Box Plan": label.get("Box Plan", ""),
@@ -4314,6 +4370,400 @@ def _box_size_summary(box_rows: list[dict]) -> list[dict]:
             }
         )
     return sorted(output, key=lambda row: row["Box Type"])
+
+
+def _vb_box_key(value: object) -> str:
+    match = re.search(r"\bVB\s*([A-Za-z0-9_.-]+)", str(value or ""), flags=re.IGNORECASE)
+    return f"VB {match.group(1)}" if match else ""
+
+
+def _backup_dimensions_from_text(value: object) -> Dimensions | None:
+    text = str(value or "")
+    match = re.search(r"/\s*([0-9.]+)\s*x\s*([0-9.]+)\s*x\s*([0-9.]+)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return Dimensions(*(float(part) for part in match.groups()))
+    except ValueError:
+        return None
+
+
+def _dimensions_can_contain(required: Dimensions, container: Dimensions) -> bool:
+    required_values = (required.length, required.width, required.height)
+    container_values = (container.length, container.width, container.height)
+    return any(
+        all(required_side <= container_side + 1e-9 for required_side, container_side in zip(orientation, container_values))
+        for orientation in permutations(required_values)
+    )
+
+
+def _consolidation_candidates_for_rows(rows: list[dict]) -> list[dict]:
+    backups: dict[str, dict] = {}
+    for row in rows:
+        backup_text = str(row.get("Backup Vendor Box", "") or "").strip()
+        backup_box = _vb_box_key(backup_text)
+        if not backup_box:
+            continue
+        original_box = _vb_box_key(row.get("Box Type"))
+        if backup_box == original_box:
+            continue
+        dimensions = _backup_dimensions_from_text(backup_text)
+        if dimensions is None:
+            continue
+        packed_weight = float(row.get("Packed Actual Weight kg") or 0)
+        original_chargeable = float(row.get("Chargeable Weight kg") or 0)
+        backup_chargeable = max(packed_weight, dimensional_weight_kg(dimensions))
+        increase = max(0.0, backup_chargeable - original_chargeable)
+        candidate = backups.setdefault(
+            backup_box,
+            {
+                "backup_box": backup_box,
+                "dimensions": dimensions,
+                "rows": 0,
+                "increase_total": 0.0,
+                "increase_max": 0.0,
+            },
+        )
+        candidate["rows"] += 1
+        candidate["increase_total"] += increase
+        candidate["increase_max"] = max(candidate["increase_max"], increase)
+    return list(backups.values())
+
+
+def _sort_consolidation_candidates(candidates: list[dict], primary_counts: Counter) -> list[dict]:
+    return sorted(
+        candidates,
+        key=lambda item: (
+            0 if primary_counts.get(item["backup_box"], 0) > 0 else 1,
+            -primary_counts.get(item["backup_box"], 0),
+            item["increase_total"],
+            item["backup_box"],
+        ),
+    )
+
+
+def _resolve_consolidation_chain(
+    original_box: str,
+    candidates_by_box: dict[str, list[dict]],
+    primary_counts: Counter,
+) -> dict | None:
+    direct_candidates = candidates_by_box.get(original_box, [])
+    if not direct_candidates:
+        return None
+    first_candidate = direct_candidates[0]
+    path = [original_box, first_candidate["backup_box"]]
+    second_candidate = None
+    next_candidates = candidates_by_box.get(first_candidate["backup_box"], [])
+    if next_candidates:
+        candidate = next_candidates[0]
+        if candidate["backup_box"] not in path:
+            second_candidate = candidate
+            path.append(candidate["backup_box"])
+    final_candidate = second_candidate or first_candidate
+    return {
+        "direct_candidate": first_candidate,
+        "second_candidate": second_candidate,
+        "final_candidate": final_candidate,
+        "path": path,
+        "final_box": final_candidate["backup_box"],
+        "final_current_quantity": primary_counts.get(final_candidate["backup_box"], 0),
+    }
+
+
+def _original_to_final_increase(rows: list[dict], final_dimensions: Dimensions) -> tuple[float, float]:
+    increase_total = 0.0
+    increase_max = 0.0
+    for row in rows:
+        packed_weight = float(row.get("Packed Actual Weight kg") or 0)
+        original_chargeable = float(row.get("Chargeable Weight kg") or 0)
+        final_chargeable = max(packed_weight, dimensional_weight_kg(final_dimensions))
+        increase = max(0.0, final_chargeable - original_chargeable)
+        increase_total += increase
+        increase_max = max(increase_max, increase)
+    return increase_total, increase_max
+
+
+def _protected_high_volume_boxes(primary_counts: Counter, protected_fraction: float = 0.25) -> set[str]:
+    if not primary_counts:
+        return set()
+    sorted_counts = sorted(primary_counts.items(), key=lambda item: (-item[1], item[0]))
+    protected_count = max(1, math.ceil(len(sorted_counts) * protected_fraction))
+    cutoff_quantity = sorted_counts[protected_count - 1][1]
+    return {box for box, quantity in sorted_counts if quantity >= cutoff_quantity}
+
+
+def _box_consolidation_what_if_rows(box_rows: list[dict], skip_reason: str = "") -> list[dict]:
+    if not box_rows:
+        return [{"Original VB Box": "N/A", "Recommendation": "Rejected", "Reason Accepted / Rejected": "No box rows available.", "Final Fit Validated": "No"}]
+
+    primary_counts = Counter(_vb_box_key(row.get("Box Type")) for row in box_rows)
+    primary_counts.pop("", None)
+    protected_source_boxes = _protected_high_volume_boxes(primary_counts)
+    original_type_count = len(primary_counts)
+    max_primary_count = max(primary_counts.values(), default=0)
+    low_volume_limit = max(1, math.ceil(max_primary_count * 0.2))
+
+    grouped_rows: dict[str, list[dict]] = defaultdict(list)
+    for row in box_rows:
+        original_box = _vb_box_key(row.get("Box Type"))
+        if original_box:
+            grouped_rows[original_box].append(row)
+
+    candidates_by_box = {
+        box: _sort_consolidation_candidates(_consolidation_candidates_for_rows(rows), primary_counts)
+        for box, rows in grouped_rows.items()
+    }
+    if skip_reason:
+        report_rows = []
+        for original_box, rows in sorted(grouped_rows.items(), key=lambda item: (len(item[1]), item[0])):
+            candidates = candidates_by_box.get(original_box, [])
+            candidate = candidates[0] if candidates else None
+            backup_box = candidate["backup_box"] if candidate else "N/A"
+            report_rows.append(
+                {
+                    "Original VB Box": original_box,
+                    "Original Box Quantity": len(rows),
+                    "Backup VB Box Candidate": backup_box,
+                    "Chain Path": original_box,
+                    "Final Target VB Box": backup_box,
+                    "Final Target Current Quantity": primary_counts.get(backup_box, 0) if backup_box != "N/A" else 0,
+                    "Backup Box Current Quantity": primary_counts.get(backup_box, 0) if backup_box != "N/A" else 0,
+                    "Quantity Proposed to Move": 0,
+                    "Original Box Quantity After Move": len(rows),
+                    "Backup Box Quantity After Move": primary_counts.get(backup_box, 0) if backup_box != "N/A" else 0,
+                    "Chargeable Weight Increase per Package": "N/A",
+                    "Total Chargeable Weight Increase": 0,
+                    "Box Type Reduction Impact": 0,
+                    "Recommendation": "Rejected",
+                    "Reason Accepted / Rejected": skip_reason,
+                    "Final Fit Validated": "No",
+                    "Workbook Presentation Applied": "No",
+                    "Original Box Type Count": original_type_count,
+                    "Hypothetical Box Type Count": original_type_count,
+                }
+            )
+        return report_rows
+    report_rows = []
+    accepted_path_boxes: set[str] = set()
+    for original_box, rows in sorted(grouped_rows.items(), key=lambda item: (len(item[1]), item[0])):
+        original_quantity = len(rows)
+        chain = _resolve_consolidation_chain(original_box, candidates_by_box, primary_counts)
+        if original_box in protected_source_boxes:
+            direct_candidate = chain["direct_candidate"] if chain else None
+            backup_box = direct_candidate["backup_box"] if direct_candidate else "N/A"
+            report_rows.append(
+                {
+                    "Original VB Box": original_box,
+                    "Original Box Quantity": original_quantity,
+                    "Backup VB Box Candidate": backup_box,
+                    "Chain Path": original_box,
+                    "Final Target VB Box": backup_box,
+                    "Final Target Current Quantity": primary_counts.get(backup_box, 0) if backup_box != "N/A" else 0,
+                    "Backup Box Current Quantity": primary_counts.get(backup_box, 0) if backup_box != "N/A" else 0,
+                    "Quantity Proposed to Move": 0,
+                    "Original Box Quantity After Move": original_quantity,
+                    "Backup Box Quantity After Move": primary_counts.get(backup_box, 0) if backup_box != "N/A" else 0,
+                    "Chargeable Weight Increase per Package": "N/A",
+                    "Total Chargeable Weight Increase": 0,
+                    "Box Type Reduction Impact": 0,
+                    "Recommendation": "Rejected",
+                    "Reason Accepted / Rejected": "Skipped: protected high-volume primary box.",
+                    "Final Fit Validated": "No",
+                    "Workbook Presentation Applied": "No",
+                }
+            )
+            continue
+        if not chain:
+            report_rows.append(
+                {
+                    "Original VB Box": original_box,
+                    "Original Box Quantity": original_quantity,
+                    "Backup VB Box Candidate": "N/A",
+                    "Chain Path": original_box,
+                    "Final Target VB Box": "N/A",
+                    "Final Target Current Quantity": 0,
+                    "Backup Box Current Quantity": 0,
+                    "Quantity Proposed to Move": 0,
+                    "Original Box Quantity After Move": original_quantity,
+                    "Backup Box Quantity After Move": 0,
+                    "Chargeable Weight Increase per Package": "N/A",
+                    "Total Chargeable Weight Increase": 0,
+                    "Box Type Reduction Impact": 0,
+                    "Recommendation": "Rejected",
+                    "Reason Accepted / Rejected": "No final-valid backup box candidate is available for this primary box.",
+                    "Final Fit Validated": "No",
+                    "Workbook Presentation Applied": "No",
+                }
+            )
+            continue
+
+        direct_candidate = chain["direct_candidate"]
+        second_candidate = chain["second_candidate"]
+        final_candidate = chain["final_candidate"]
+        low_volume = original_quantity <= low_volume_limit
+        conflicts_with_accepted_path = original_box in accepted_path_boxes
+
+        selected_candidate = final_candidate
+        selected_path = chain["path"]
+        selected_final_valid = True
+        selected_reason_prefix = ""
+        increase_total, increase_max = _original_to_final_increase(rows, selected_candidate["dimensions"])
+        final_target_valid = True
+        chargeable_increase_too_high = increase_max >= 2.0
+
+        if second_candidate is not None:
+            final_target_valid = _dimensions_can_contain(direct_candidate["dimensions"], final_candidate["dimensions"])
+            if not final_target_valid or chargeable_increase_too_high:
+                direct_increase_total, direct_increase_max = _original_to_final_increase(rows, direct_candidate["dimensions"])
+                direct_chargeable_too_high = direct_increase_max >= 2.0
+                if not final_target_valid:
+                    rejected_second_reason = "final target not valid for original package"
+                else:
+                    rejected_second_reason = "chargeable increase >= 2.0 kg"
+                if not direct_chargeable_too_high:
+                    selected_candidate = direct_candidate
+                    selected_path = chain["path"][:2]
+                    selected_final_valid = True
+                    selected_reason_prefix = f"Accepted one-step fallback; second step rejected: {rejected_second_reason}."
+                    increase_total = direct_increase_total
+                    increase_max = direct_increase_max
+                    final_target_valid = True
+                    chargeable_increase_too_high = False
+                else:
+                    selected_final_valid = final_target_valid
+
+        final_box = selected_candidate["backup_box"]
+        final_current_quantity = primary_counts.get(final_box, 0)
+        chain_path = " -> ".join(selected_path)
+        already_used = final_current_quantity > 0
+        accepted = (
+            low_volume
+            and already_used
+            and selected_final_valid
+            and not chargeable_increase_too_high
+            and not conflicts_with_accepted_path
+        )
+        move_quantity = original_quantity if accepted else 0
+        if accepted:
+            accepted_path_boxes.update(selected_path)
+            reason = selected_reason_prefix or "Accepted: low-volume primary can move into an already-used final-valid backup box."
+        elif conflicts_with_accepted_path:
+            reason = "Rejected: conflicts with accepted consolidation path."
+        elif not selected_final_valid:
+            reason = "Rejected: final target not valid for original package."
+        elif chargeable_increase_too_high:
+            reason = "Rejected: total chargeable increase >= 2.0 kg."
+        else:
+            reason = "Rejected: backup is final-valid but primary is not low-volume or backup is not already used as a primary box."
+        report_rows.append(
+            {
+                "Original VB Box": original_box,
+                "Original Box Quantity": original_quantity,
+                "Backup VB Box Candidate": final_box,
+                "Chain Path": chain_path,
+                "Final Target VB Box": final_box,
+                "Final Target Current Quantity": final_current_quantity,
+                "Backup Box Current Quantity": final_current_quantity,
+                "Quantity Proposed to Move": move_quantity,
+                "Original Box Quantity After Move": original_quantity - move_quantity,
+                "Backup Box Quantity After Move": final_current_quantity + move_quantity,
+                "Final Target Length cm": selected_candidate["dimensions"].length,
+                "Final Target Width cm": selected_candidate["dimensions"].width,
+                "Final Target Height cm": selected_candidate["dimensions"].height,
+                "Chargeable Weight Increase per Package": round(increase_max, 3),
+                "Total Chargeable Weight Increase per Package": round(increase_max, 3),
+                "Total Chargeable Weight Increase": round(increase_total if accepted else 0, 3),
+                "Box Type Reduction Impact": 1 if accepted else 0,
+                "Recommendation": "Recommended" if accepted else "Rejected",
+                "Reason Accepted / Rejected": reason,
+                "Final Fit Validated": "Yes" if selected_final_valid else "No",
+                "Workbook Presentation Applied": "Yes: Summary, Labels, Cost Summary" if accepted else "No",
+            }
+        )
+
+    if report_rows:
+        accepted_rows = [row for row in report_rows if row["Recommendation"] == "Recommended"]
+        adjusted_type_count = original_type_count - sum(row["Box Type Reduction Impact"] for row in accepted_rows)
+        for row in report_rows:
+            row["Original Box Type Count"] = original_type_count
+            row["Hypothetical Box Type Count"] = adjusted_type_count
+    return report_rows
+
+
+def _all_configurations_quantity_one(box_rows: list[dict]) -> bool:
+    entries = _combo_entries_for_optimized_to_pack(box_rows)
+    return bool(entries) and all(len(entry["order_ids"]) == 1 for _combo, entry in entries)
+
+
+def _accepted_consolidation_map(what_if_rows: list[dict]) -> dict[str, dict]:
+    accepted = {}
+    for row in what_if_rows:
+        if row.get("Recommendation") != "Recommended":
+            continue
+        if row.get("Final Fit Validated") != "Yes":
+            continue
+        final_box = str(row.get("Final Target VB Box") or "").strip()
+        original_box = str(row.get("Original VB Box") or "").strip()
+        if not original_box or not final_box or final_box == "N/A":
+            continue
+        if str(row.get("Chain Path") or "").count("->") > 2:
+            continue
+        try:
+            increase = float(row.get("Chargeable Weight Increase per Package") or 0)
+            dimensions = Dimensions(
+                float(row.get("Final Target Length cm")),
+                float(row.get("Final Target Width cm")),
+                float(row.get("Final Target Height cm")),
+            )
+        except (TypeError, ValueError):
+            continue
+        if increase >= 2.0:
+            continue
+        accepted[original_box] = {
+            "box_type": final_box,
+            "dimensions": dimensions,
+            "chain_path": row.get("Chain Path", ""),
+        }
+    return accepted
+
+
+def _box_rows_with_operational_consolidation(box_rows: list[dict], what_if_rows: list[dict]) -> list[dict]:
+    consolidation_by_box = _accepted_consolidation_map(what_if_rows)
+    if not consolidation_by_box:
+        return [dict(row) for row in box_rows]
+    output = []
+    for row in box_rows:
+        updated = dict(row)
+        original_box = _vb_box_key(row.get("Box Type"))
+        consolidation = consolidation_by_box.get(original_box)
+        if not consolidation:
+            output.append(updated)
+            continue
+        dimensions = consolidation["dimensions"]
+        packed_weight = float(row.get("Packed Actual Weight kg") or 0)
+        dim_weight = dimensional_weight_kg(dimensions)
+        chargeable = max(packed_weight, dim_weight)
+        updated["Original Optimized Box Type"] = row.get("Box Type", "")
+        updated["Box Type"] = consolidation["box_type"]
+        updated["Length cm"] = dimensions.length
+        updated["Width cm"] = dimensions.width
+        updated["Height cm"] = dimensions.height
+        updated["Assigned Box Length cm"] = dimensions.length
+        updated["Assigned Box Width cm"] = dimensions.width
+        updated["Assigned Box Height cm"] = dimensions.height
+        updated["Dimensional Weight kg (/5000)"] = _format_weight_display(dim_weight)
+        updated["Chargeable Weight kg"] = _format_weight_display(chargeable)
+        updated["Chargeable Weight g"] = int(chargeable * 1000)
+        updated["Box Standardization Note"] = " ".join(
+            part
+            for part in [
+                str(row.get("Box Standardization Note", "") or "").strip(),
+                f"Workbook presentation consolidated from {row.get('Box Type', '')} to {consolidation['box_type']} via {consolidation['chain_path']}.",
+            ]
+            if part
+        )
+        output.append(updated)
+    return output
 
 
 def _unmatched_rows(unmatched_skus) -> list[dict]:
@@ -4550,6 +5000,7 @@ def _order_summary_rows(
             "Chargeable Weight g": int(chargeable * 1000),
             "Total Units": _total_units(lines),
             "Box Qty": box_qty,
+            "Prepacked No Touch": all(bool(box_row.get("Prepacked No Touch")) for box_row in order_box_rows),
             "Box Plan": _box_plan(order_box_rows),
             "Per-Box Chargeable Weight": _per_box_chargeable_weight_summary(order_box_rows),
             "SKU Breakdown": combo_by_order[order_id],
@@ -4982,6 +5433,7 @@ def optimize_workbook(
                 "Vendor Box ID": vendor_box_id,
                 "Backup Vendor Box": "N/A" if carton.box_type else _backup_vendor_box_text(assignment),
                 "Box Selection Decision": selection_decision,
+                "Prepacked No Touch": _carton_is_prepacked_final(carton, sku_rules),
                 "Length cm": assigned_dimensions.length,
                 "Width cm": assigned_dimensions.width,
                 "Height cm": assigned_dimensions.height,
@@ -5053,7 +5505,6 @@ def optimize_workbook(
     vfi_by_order = _vfi_numbers_by_order(grouped_orders, combo_by_order, box_rows, cfg)
     box_rows = _with_vfi_numbers(box_rows, vfi_by_order)
     order_summary_rows = _with_vfi_numbers(order_summary_rows, vfi_by_order)
-    cost_order_summary_rows = list(order_summary_rows)
     output_granularity = cfg.get("output_granularity", "order_summary")
     order_rows = (
         _box_rows_in_vfi_sequence(box_rows, vfi_by_order)
@@ -5088,21 +5539,37 @@ def optimize_workbook(
                 rows_by_region[f"Region - {row['Region']}"].append(row)
         region_sheets = dict(rows_by_region)
 
-    box_size_rows = _box_size_summary(box_rows)
+    consolidation_skip_reason = (
+        "Skipped: all configurations quantity 1; using best-fit boxes."
+        if _all_configurations_quantity_one(box_rows)
+        else ""
+    )
+    box_consolidation_rows = _box_consolidation_what_if_rows(box_rows, skip_reason=consolidation_skip_reason)
+    operational_box_rows = _box_rows_with_operational_consolidation(box_rows, box_consolidation_rows)
+    operational_order_summary_rows = _with_vfi_numbers(
+        _order_summary_rows(
+            operational_box_rows,
+            grouped_orders,
+            items_by_order,
+            combo_by_order,
+            warning_rows,
+        ),
+        vfi_by_order,
+    )
+    cost_order_summary_rows = list(operational_order_summary_rows)
+    box_size_rows = _box_size_summary(operational_box_rows)
     unmatched_rows = _unmatched_rows(intake.unmatched_skus)
     optimized_to_pack_rows = _optimized_to_pack_rows(box_rows)
     pledge_config_by_combo = _pledge_config_by_combo(box_rows)
 
     cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg)
-    result["total_shipping_cost"] = round(
-        sum(
-            float(row.get("Hub Shipping Fee") or 0) + float(row.get("Express") or 0)
-            for row in cost_summary_rows
-        ),
-        2,
-    )
+    total_cost = _cost_summary_total_cost(cost_summary_rows)
+    result["total_shipping_cost"] = total_cost
+    result["total_shipping_cost_detail"] = "Hub Shipping Fee + Express"
+    summary_result = dict(result)
+    summary_result["box_types"] = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
     label_generator_rows = _label_generator_rows(
-        _box_rows_in_vfi_sequence(box_rows, vfi_by_order),
+        _box_rows_in_vfi_sequence(operational_box_rows, vfi_by_order),
         pledge_config_by_combo,
         _campaign_vfi_prefix(cfg),
     )
@@ -5117,6 +5584,7 @@ def optimize_workbook(
     )
     labels_rows = _labels_rows_in_print_order(labels_rows)
     workbook_sheets = dict(region_sheets)
+    workbook_sheets["Box Consolidation What-If"] = box_consolidation_rows
     cost_sheet_name = _cost_summary_sheet_name(cfg)
     if cost_sheet_name != "Cost Summary":
         workbook_sheets[cost_sheet_name] = cost_summary_rows
@@ -5124,7 +5592,7 @@ def optimize_workbook(
     _log_event("excel_writing_started", output_path=str(Path(output_path).name))
     write_workbook(
         output_path,
-        summary_rows=_clean_summary_rows(result, box_size_rows, unmatched_rows, sku_rules, factory_name=factory_name),
+        summary_rows=_clean_summary_rows(summary_result, box_size_rows, unmatched_rows, sku_rules, factory_name=factory_name),
         cost_summary_rows=cost_summary_rows,
         vfi_intake_form_rows=vfi_intake_form_rows,
         optimized_to_pack_rows=optimized_to_pack_rows,

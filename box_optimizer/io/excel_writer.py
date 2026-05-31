@@ -10,10 +10,10 @@ from box_optimizer.io.qr import qr_png
 REQUIRED_SHEETS = [
     "Summary",
     "Cost Summary",
+    "Labels",
     "VFI Intake Form",
     "Optimized to Pack",
     "Label generator",
-    "Labels",
     "Order Volume Weights",
     "Box Size Summary",
 ]
@@ -57,6 +57,9 @@ _UNIT_HINTS = {
     "volume": "cm3",
 }
 
+LABEL_ADDRESS_SPLIT_MIN = 35
+LABEL_ADDRESS_SPLIT_MAX = 50
+
 
 def _column_letter(index: int) -> str:
     result = ""
@@ -85,6 +88,12 @@ def _header_with_units(header: str) -> str:
         if token in normalized:
             return f"{header} ({unit})"
     return header
+
+
+def _display_header_for_sheet(sheet_name: str, header: str) -> str:
+    if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee", "Express"}:
+        return f"{header} (USD)"
+    return _header_with_units(header)
 
 
 def _string_cell(reference: str, value: object, style: int | None = None) -> str:
@@ -125,8 +134,8 @@ def _cell_style_for_sheet_value(
         metric = str(row[1] if len(row) > 1 else "")
         if metric == "Total Chargeable Cost":
             return 9
-    if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee", "Express"}:
-        return 9
+    if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee (USD)", "Express (USD)"}:
+        return 19
     return None
 
 
@@ -144,7 +153,7 @@ def _label_cell_style(row_offset: int, column_index: int, value: object) -> int 
         return 5
     if text == "SKU":
         return 6
-    if (row_offset == 6 and column_index == 5) or (row_offset == 11 and column_index == 3):
+    if text and ((row_offset == 6 and column_index == 5) or (row_offset == 11 and column_index == 3)):
         return 8
     if row_offset >= 13 and column_index in {0, 3} and text:
         return 3
@@ -202,6 +211,15 @@ def _label_config_text(label: dict) -> str:
     return f"Config: {config}" if config else ""
 
 
+def _label_visible_id(label: dict) -> str:
+    return str(
+        label.get("Barcode/QR Value")
+        or label.get("Label Value")
+        or label.get("Label Number")
+        or ""
+    ).strip()
+
+
 def _label_continuation_header_text(label: dict) -> str:
     config = _label_config_text(label)
     return f"CONTINUED  {config}" if config else "CONTINUED"
@@ -222,6 +240,34 @@ def _label_city_state_zip(label: dict) -> str:
     return location or postal
 
 
+def _label_address_split_index(address: str) -> int:
+    window_end = min(len(address), LABEL_ADDRESS_SPLIT_MAX)
+    candidates = [
+        index
+        for index, character in enumerate(address[:window_end])
+        if index >= LABEL_ADDRESS_SPLIT_MIN and character in {",", " "}
+    ]
+    if candidates:
+        return max(candidates) + 1
+    return min(len(address), LABEL_ADDRESS_SPLIT_MAX)
+
+
+def _label_display_addresses(label: dict) -> tuple[str, str, bool]:
+    address_1 = str(label.get("Address Line 1", "") or "").strip()
+    address_2 = str(label.get("Address Line 2", "") or "").strip()
+    if len(address_1) <= LABEL_ADDRESS_SPLIT_MAX:
+        return address_1, address_2, False
+
+    split_index = _label_address_split_index(address_1)
+    first_line = address_1[:split_index].strip()
+    overflow = address_1[split_index:].strip(" ,")
+    if overflow and address_2:
+        second_line = f"{overflow}, {address_2}"
+    else:
+        second_line = overflow or address_2
+    return first_line, second_line, len(second_line) > LABEL_ADDRESS_SPLIT_MAX
+
+
 def _label_block_rows(label: dict) -> list[list[object]]:
     items_column_1 = str(label.get("Items to Pack Column 1", "") or "").splitlines()
     items_column_2 = str(label.get("Items to Pack Column 2", "") or "").splitlines()
@@ -229,8 +275,8 @@ def _label_block_rows(label: dict) -> list[list[object]]:
         original_label = _continuation_original_label_number(label)
         continuation_items = [item for item in [*items_column_1, *items_column_2] if str(item or "").strip()]
         rows = [
-            ["VFI #", original_label, _label_continuation_header_text(label), "", "", label.get("Country Code", "")],
-            ["Continuation for", original_label, "", "", "", ""],
+            [original_label, "", "", "", "", label.get("Country Code", "")],
+            ["Continuation for", f"{original_label}  {_label_continuation_header_text(label)}", "", "", "", ""],
             ["Qty", "SKU", "", "Qty", "SKU", ""],
         ]
         for index in range(0, len(continuation_items), 2):
@@ -250,16 +296,19 @@ def _label_block_rows(label: dict) -> list[list[object]]:
         return rows
     item_line_count = max(len(items_column_1), len(items_column_2), 1)
     from_line_1, from_line_2 = _split_label_from_line(label.get("From", ""))
+    notes = str(label.get("Notes", "") or "").strip()
+    address_1, address_2, address_needs_notes_space = _label_display_addresses(label)
+    notes_text = f"Notes: {notes}" if notes and not address_needs_notes_space else ""
     rows = [
-        ["VFI #", label.get("Label Number", ""), label.get("Country Code", ""), "", "", ""],
+        [_label_visible_id(label), "", "", "", "", label.get("Country Code", "")],
         ["Origin:", label.get("Origin", ""), "", "", "", ""],
-        ["", "", "", "", "", label.get("Barcode/QR Value", "")],
+        ["", "", "", "", "", ""],
         ["From", from_line_1, "", "", "", ""],
         ["", from_line_2, "", "", "", ""],
         ["", "", "", "", "", ""],
-        ["To", _label_to_name_with_backer(label), "", "", "", ""],
-        ["Address 1", label.get("Address Line 1", ""), "", "", "", ""],
-        ["Address 2", label.get("Address Line 2", ""), "", "", "", ""],
+        ["To", _label_to_name_with_backer(label), "", "", notes_text, ""],
+        ["Address 1", address_1, "", "", "", ""],
+        ["Address 2", address_2, "", "", "", ""],
         [
             "City/State/Zip",
             _label_city_state_zip(label),
@@ -287,8 +336,8 @@ def _label_block_rows(label: dict) -> list[list[object]]:
     rows.append([label.get("On Arrival Note", ""), "", "", "", "", ""])
     rows.append(["", "", "", "", "", ""])
     rows.append([_label_campaign_pledge_footer(label), "", "", "", "", ""])
-    rows.append([_label_total_items_footer(label), "", label.get("Factory Name", ""), "", label.get("Carton Box Designation", ""), label.get("Country Name Chinese", "")])
-    rows.append(["", "", "", "", "", ""])
+    rows.append([_label_total_items_footer(label), "", "", "", label.get("Carton Box Designation", ""), ""])
+    rows.append([label.get("Factory Name", ""), "", "", "", label.get("Country Name Chinese", ""), ""])
     return rows
 
 
@@ -368,11 +417,16 @@ def _label_block_cell_style(
             return style
         return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
 
-    footer_offsets = {len(block_rows) - 3, len(block_rows) - 2}
+    footer_offsets = {len(block_rows) - 3, len(block_rows) - 2, len(block_rows) - 1}
     if row_offset == 0 or row_offset in footer_offsets:
         style = 7
+        if row_offset in {len(block_rows) - 2, len(block_rows) - 1} and column_index in {4, 5}:
+            return _label_right_aligned_style(style)
         return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
     detail_offset = _label_detail_offset(block_rows)
+    has_notes = len(block_rows) > 8 and any(str(block_rows[offset][4] or "").startswith("Notes:") for offset in range(6, 9))
+    if has_notes and 6 <= row_offset <= 8 and column_index in {4, 5}:
+        return 18
     item_block_end = _label_item_block_end_offset(block_rows)
     qty_header_offset = detail_offset + 1 if detail_offset >= 0 else -1
     if detail_offset >= 0 and detail_offset <= row_offset <= item_block_end:
@@ -406,9 +460,8 @@ def _merge_range(row_index: int, start_column: int, end_column: int) -> str:
 
 
 def _label_merge_ranges(block_rows: list[list[object]], current_row: int) -> list[str]:
-    merges = []
-    if block_rows and str(block_rows[0][2] or "").startswith("CONTINUED"):
-        merges.append(_merge_range(current_row, 2, 4))
+    merges = [_merge_range(current_row, 0, 4)]
+    if len(block_rows) > 1 and str(block_rows[1][0] or "") == "Continuation for":
         for offset in range(2, max(len(block_rows) - 1, 2)):
             merges.append(_merge_range(current_row + offset, 1, 2))
             merges.append(_merge_range(current_row + offset, 4, 5))
@@ -421,6 +474,8 @@ def _label_merge_ranges(block_rows: list[list[object]], current_row: int) -> lis
         for offset in range(qty_header_offset, item_block_end + 1):
             merges.append(_merge_range(current_row + offset, 1, 2))
             merges.append(_merge_range(current_row + offset, 4, 5))
+    if len(block_rows) > 8 and any(str(block_rows[offset][4] or "").startswith("Notes:") for offset in range(6, 9)):
+        merges.append(f"E{current_row + 6}:F{current_row + 8}")
     for offset, row in enumerate(block_rows):
         row_index = current_row + offset
         if len(row) > 4 and str(row[4] or "").startswith("phone:"):
@@ -429,7 +484,10 @@ def _label_merge_ranges(block_rows: list[list[object]], current_row: int) -> lis
             merges.append(_merge_range(row_index, 0, 5))
         if offset == len(block_rows) - 2:
             merges.append(_merge_range(row_index, 0, 1))
-            merges.append(_merge_range(row_index, 2, 3))
+            merges.append(_merge_range(row_index, 4, 5))
+        if offset == len(block_rows) - 1:
+            merges.append(_merge_range(row_index, 0, 1))
+            merges.append(_merge_range(row_index, 4, 5))
     return merges
 
 
@@ -458,13 +516,16 @@ def _labels_sheet_xml(rows: list[dict], include_drawing: bool = False) -> str:
                         style=style,
                     )
                 )
-            footer_offsets = {len(block_rows) - 3, len(block_rows) - 2}
-            if offset == len(block_rows) - 2:
-                height = ' ht="23" customHeight="1"'
-            elif offset == 0 or offset in footer_offsets:
-                height = ' ht="20" customHeight="1"'
+            footer_offsets = set() if label.get("Label Continuation") else {len(block_rows) - 3, len(block_rows) - 2, len(block_rows) - 1}
+            detail_offset = _label_detail_offset(block_rows)
+            item_block_end = len(block_rows) - 2 if label.get("Label Continuation") else _label_item_block_end_offset(block_rows)
+            qty_header_offset = detail_offset + 1 if detail_offset >= 0 else 2 if label.get("Label Continuation") else -1
+            if offset == 0 or offset in footer_offsets:
+                height = ' ht="28" customHeight="1"'
             elif offset in spacer_offsets:
                 height = ' ht="10" customHeight="1"'
+            elif qty_header_offset >= 0 and qty_header_offset < offset <= item_block_end:
+                height = ' ht="22" customHeight="1"'
             elif offset in {2, 3, 4, 6, 7, 8, 9, 10, 12}:
                 height = ' ht="22" customHeight="1"'
             else:
@@ -644,7 +705,7 @@ def _rows_to_table(sheet_name: str, rows: list[dict]) -> tuple[list[str], list[l
         return ["Note"], [["No records"]]
 
     headers = _headers_for_sheet(sheet_name, rows)
-    display_headers = [_header_with_units(header) for header in headers]
+    display_headers = [_display_header_for_sheet(sheet_name, header) for header in headers]
     values = [
         [_format_measure_value(header, row.get(header, "")) for header in headers]
         for row in rows
@@ -661,6 +722,21 @@ def _column_widths(headers: list[str], rows: list[list[object]]) -> list[float]:
                 longest = max(longest, len(str(row[index])))
         widths.append(min(max(longest + 2, 12), 40))
     return widths
+
+
+def _worksheet_column_xml(sheet_name: str, widths: list[float]) -> str:
+    column_xml = []
+    for index, width in enumerate(widths):
+        column_number = index + 1
+        hidden = (
+            ' hidden="1" collapsed="1"'
+            if sheet_name == "VFI Intake Form" and 12 <= column_number <= 27
+            else ""
+        )
+        column_xml.append(
+            f'<col min="{column_number}" max="{column_number}" width="{width}" customWidth="1"{hidden}/>'
+        )
+    return "".join(column_xml)
 
 
 def _worksheet_xml(sheet_name: str, rows: list[dict]) -> str:
@@ -680,10 +756,7 @@ def _worksheet_xml(sheet_name: str, rows: list[dict]) -> str:
         row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
 
     widths = _column_widths(headers, values)
-    cols_xml = "".join(
-        f'<col min="{index + 1}" max="{index + 1}" width="{width}" customWidth="1"/>'
-        for index, width in enumerate(widths)
-    )
+    cols_xml = _worksheet_column_xml(sheet_name, widths)
     last_column = _column_letter(len(headers) - 1)
     last_row = max(len(table), 1)
     filter_ref = f"A1:{last_column}{last_row}"
@@ -779,15 +852,18 @@ def _styles_xml() -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<numFmts count="1"><numFmt numFmtId="164" formatCode="$#,##0.00&quot; (USD)&quot;"/></numFmts>'
+        '<numFmts count="2">'
+        '<numFmt numFmtId="164" formatCode="$#,##0.00&quot; (USD)&quot;"/>'
+        '<numFmt numFmtId="165" formatCode="$#,##0.00"/>'
+        '</numFmts>'
         '<fonts count="8">'
         '<font><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><sz val="12"/><name val="Calibri"/></font>'
-        '<font><sz val="16"/><name val="Calibri"/></font>'
+        '<font><sz val="18"/><name val="Calibri"/></font>'
         '<font><b/><sz val="16"/><name val="Calibri"/></font>'
         '<font><b/><sz val="16"/><name val="Calibri"/></font>'
-        '<font><b/><sz val="20"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="25"/><name val="Calibri"/></font>'
         '<font><b/><sz val="16"/><name val="Calibri"/></font>'
         "</fonts>"
         '<fills count="3">'
@@ -801,7 +877,7 @@ def _styles_xml() -> str:
         '<border><left style="thick"><color auto="1"/></left><right style="thick"><color auto="1"/></right><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
         '</borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="18">'
+        '<cellXfs count="20">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
@@ -820,6 +896,8 @@ def _styles_xml() -> str:
         '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="right"/></xf>'
         '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"

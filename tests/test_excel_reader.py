@@ -1,6 +1,7 @@
 import csv
 import zipfile
 
+from box_optimizer.io.column_mapper import is_metadata_column
 from box_optimizer.io.excel_reader import read_intake, read_orders, read_sku_master, read_workbook
 
 
@@ -393,6 +394,13 @@ def test_wide_format_metadata_columns_are_not_product_columns(tmp_path):
     assert lines[0].raw_sku == "Core Game"
     assert lines[0].metadata["Address"] == "1 Main St"
     assert lines[0].metadata["Email"] == "person@example.com"
+
+
+def test_notes_like_backer_headers_are_metadata_columns():
+    assert is_metadata_column("Shipping Notes")
+    assert is_metadata_column("Customer Notes")
+    assert is_metadata_column("customernotes")
+    assert is_metadata_column("Delivernotes")
 
 
 def test_xlsx_reader_uses_second_row_as_headers_when_first_row_is_title(tmp_path):

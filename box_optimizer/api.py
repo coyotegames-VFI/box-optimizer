@@ -344,6 +344,20 @@ def _parse_config(config_json: str | dict[str, Any] | None) -> dict:
     return parsed
 
 
+def _campaign_download_filename(config: dict) -> str:
+    campaign = config.get("campaign") if isinstance(config.get("campaign"), dict) else {}
+    raw_name = str(
+        campaign.get("code")
+        or campaign.get("short_name")
+        or campaign.get("project_name")
+        or campaign.get("name")
+        or ""
+    ).strip()
+    safe_name = re.sub(r'[\\/:*?"<>|]+', "", raw_name)
+    safe_name = re.sub(r"\s+", " ", safe_name).strip()
+    return f"{safe_name} Shipping Plan.xlsx" if safe_name else "optimized_shipping_plan.xlsx"
+
+
 def _form_lines(value: str | None) -> list[str]:
     return [line.strip() for line in (value or "").splitlines() if line.strip()]
 
@@ -1052,6 +1066,7 @@ def _run_upload_job(
             config = final_config
         if config.get("debug"):
             logger.setLevel(logging.DEBUG)
+        output_filename = _campaign_download_filename(config)
 
         sku_master_path = _save_upload(
             sku_master_file,
@@ -1078,6 +1093,7 @@ def _run_upload_job(
             "expires_at": _job_expiration(created_seconds),
             "summary": summary,
             "download_url": f"/jobs/{job_id}/download",
+            "filename": output_filename,
             "error": None,
         }
         _write_job_record(job_dir, record)
@@ -1222,7 +1238,7 @@ def job_download(job_id: str, upload_token: str | None = None, token: str | None
     return FileResponse(
         path=str(output_path),
         media_type=WORKBOOK_CONTENT_TYPE,
-        filename="optimized_shipping_plan.xlsx",
+        filename=str(record.get("filename") or "optimized_shipping_plan.xlsx"),
     )
 
 
@@ -1350,13 +1366,13 @@ def optimize_base64(payload: Base64WorkbookRequest):
     run_id = uuid4().hex
     work_dir: Path | None = None
     content_type = WORKBOOK_CONTENT_TYPE
-    output_filename = "optimized_shipping_plan.xlsx"
     try:
         _log_event("request_received", endpoint="/optimize_base64", run_id=run_id)
         stage = "config"
         config = _parse_config(payload.config_json)
         if config.get("debug"):
             logger.setLevel(logging.DEBUG)
+        output_filename = _campaign_download_filename(config)
 
         work_dir = _work_dir(run_id)
         _log_event(
@@ -1367,7 +1383,7 @@ def optimize_base64(payload: Base64WorkbookRequest):
         )
         stage = "files_saved"
         sku_master_path, orders_path = _save_base64_request_files(payload, work_dir)
-        output_path = work_dir / output_filename
+        output_path = work_dir / "optimized_shipping_plan.xlsx"
         _log_event("files_saved", endpoint="/optimize_base64", run_id=run_id)
 
         stage = "optimize"
@@ -1418,6 +1434,7 @@ def optimize(
         config = _parse_config(config_json)
         if config.get("debug"):
             logger.setLevel(logging.DEBUG)
+        output_filename = _campaign_download_filename(config)
 
         work_dir = _work_dir(run_id)
 
@@ -1458,7 +1475,7 @@ def optimize(
         return FileResponse(
             path=str(output_path),
             media_type=WORKBOOK_CONTENT_TYPE,
-            filename="optimized_shipping_plan.xlsx",
+            filename=output_filename,
         )
     except HTTPException as exc:
         return _json_error(exc, stage, status_code=exc.status_code)

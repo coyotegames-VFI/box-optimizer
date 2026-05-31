@@ -276,6 +276,8 @@ def is_metadata_column(header: str) -> bool:
     normalized = normalize_column_name(header)
     if normalized in METADATA_COLUMN_ALIASES:
         return True
+    if "notes" in normalized:
+        return True
     words = {
         normalize_column_name(word)
         for word in re.split(r"[^A-Za-z0-9]+", str(header or ""))

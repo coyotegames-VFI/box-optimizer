@@ -354,6 +354,34 @@ def test_optimize_base64_returns_json_workbook(monkeypatch):
     assert "elapsed_seconds" in body["summary"]
 
 
+def test_optimize_base64_uses_campaign_specific_download_filename(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize_base64",
+        json=_base64_csv_payload(
+            {
+                "packing_mode": "fast",
+                "campaign": {"name": "Dark Horizon", "code": 'OPR: Wave/2?'},
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["filename"] == "OPR Wave2 Shipping Plan.xlsx"
+
+
+def test_optimize_base64_falls_back_to_default_download_filename(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post("/optimize_base64", json=_base64_csv_payload({"packing_mode": "fast"}))
+
+    assert response.status_code == 200
+    assert response.json()["filename"] == "optimized_shipping_plan.xlsx"
+
+
 def test_inspect_base64_requires_api_key_when_environment_variable_is_set(monkeypatch):
     monkeypatch.setenv("BOX_OPTIMIZER_API_KEY", "secret")
     client = TestClient(app)
@@ -429,6 +457,23 @@ def test_optimize_accepts_x_api_key_header(monkeypatch):
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
     assert response.content[:2] == b"PK"
+
+
+def test_optimize_file_response_uses_campaign_specific_download_filename(monkeypatch):
+    monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post(
+        "/optimize",
+        files={
+            "sku_master_file": _sku_master_file(),
+            "orders_file": _orders_file(),
+        },
+        data={"config_json": '{"packing_mode":"fast","campaign":{"name":"Sordane"}}'},
+    )
+
+    assert response.status_code == 200
+    assert "Sordane%20Shipping%20Plan.xlsx" in response.headers["content-disposition"]
 
 
 def test_optimize_accepts_authorization_bearer_header(monkeypatch):
@@ -633,7 +678,7 @@ def test_upload_workflow_creates_job_status_and_download(monkeypatch, tmp_path):
             "sku_master_file": ("campaign sku list.csv", _sku_master_file()[1], "text/csv"),
             "orders_file": ("daily orders export.csv", _orders_file()[1], "text/csv"),
         },
-        data={"config_json": '{"packing_mode":"fast","output_granularity":"order_summary","preserve_region_sheets":false}'},
+        data={"config_json": '{"packing_mode":"fast","output_granularity":"order_summary","preserve_region_sheets":false,"campaign":{"code":"Dark Horizon"}}'},
     )
 
     assert response.status_code == 200
@@ -656,6 +701,7 @@ def test_upload_workflow_creates_job_status_and_download(monkeypatch, tmp_path):
     assert download_response.headers["content-type"].startswith(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+    assert "Dark%20Horizon%20Shipping%20Plan.xlsx" in download_response.headers["content-disposition"]
     assert download_response.content[:2] == b"PK"
 
 
