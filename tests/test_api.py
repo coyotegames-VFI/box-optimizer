@@ -1,11 +1,14 @@
 import base64
 import csv
+import json
 import re
-from io import StringIO
+import zipfile
+from io import BytesIO, StringIO
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from box_optimizer import api as api_module
 from box_optimizer.api import app
 
 
@@ -372,6 +375,24 @@ def test_optimize_base64_uses_campaign_specific_download_filename(monkeypatch):
     assert response.json()["filename"] == "OPR Wave2 Shipping Plan.xlsx"
 
 
+def _minimal_xlsx_bytes(sheet_names: list[str]) -> bytes:
+    output = BytesIO()
+    sheets_xml = "".join(
+        f'<sheet name="{name}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, name in enumerate(sheet_names, start=1)
+    )
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f"<sheets>{sheets_xml}</sheets>"
+            "</workbook>",
+        )
+    return output.getvalue()
+
+
 def test_optimize_base64_falls_back_to_default_download_filename(monkeypatch):
     monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
     client = TestClient(app)
@@ -610,8 +631,9 @@ def _extract_job_id(html_text: str) -> str:
     return match.group(1)
 
 
-def test_upload_page_uses_employee_friendly_labels(monkeypatch):
+def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
     response = client.get("/upload")
@@ -642,6 +664,37 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch):
     assert "language variants must be listed as separate SKUs" in response.text
     assert "These items also receive no item-level padding by default" in response.text
     assert '&quot;packing_mode&quot;: &quot;fast&quot;' in response.text
+    assert '<details id="rate_sheet_management">' in response.text
+    assert '<details id="rate_sheet_management" open>' not in response.text
+    assert "<summary>Rate Sheet Management</summary>" in response.text
+    assert 'name="rate_sheet_file"' in response.text
+    assert 'form="rate_sheet_upload_form"' in response.text
+    assert ">Load Rates</button>" in response.text
+    assert "No active rate sheet loaded" in response.text
+
+
+def test_upload_page_shows_active_rate_sheet_status(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    upload = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "active-rates.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    response = client.get("/upload")
+
+    assert upload.status_code == 200
+    assert response.status_code == 200
+    assert "Current active rate sheet loaded" in response.text
+    assert "active-rates.xlsx" in response.text
+    assert "Checksum:" in response.text
 
 
 def test_manual_vendor_box_fit_mode_remains_advanced_json_only(monkeypatch):
@@ -665,7 +718,197 @@ def test_upload_page_preserves_token_in_form_action_and_hidden_field(monkeypatch
     assert response.status_code == 200
     assert '<form action="/upload?upload_token=local-upload-test" method="post" enctype="multipart/form-data">' in response.text
     assert 'type="hidden" name="upload_token" value="local-upload-test"' in response.text
+    assert '<form id="rate_sheet_upload_form" action="/rates/upload?upload_token=local-upload-test" method="post" enctype="multipart/form-data">' in response.text
     assert '<button type="submit">Run Optimization</button>' in response.text
+
+
+def test_rate_sheet_storage_path_prefers_explicit_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "explicit"))
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", str(tmp_path / "railway"))
+
+    assert api_module._rate_sheet_root() == tmp_path / "explicit"
+
+
+def test_rate_sheet_storage_path_uses_railway_volume_when_no_explicit_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SHEET_DIR", raising=False)
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", str(tmp_path / "railway"))
+
+    assert api_module._rate_sheet_root() == tmp_path / "railway" / "rates"
+
+
+def test_rate_sheet_storage_path_falls_back_to_runtime_rates(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SHEET_DIR", raising=False)
+    monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    assert api_module._rate_sheet_root() == tmp_path / "runtime" / "rates"
+
+
+def test_rate_sheet_upload_saves_active_sheet_without_running_optimizer(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    called = False
+
+    def fake_optimize_workbook(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("box_optimizer.api.optimize_workbook", fake_optimize_workbook)
+    client = TestClient(app)
+
+    response = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "new-rates.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    active_path = tmp_path / "rates" / "current_rate_sheet.xlsx"
+    metadata_path = tmp_path / "rates" / "current_rate_sheet.json"
+    assert response.status_code == 200
+    assert "Rate sheet loaded successfully." in response.text
+    assert "new-rates.xlsx" in response.text
+    assert active_path.exists()
+    assert metadata_path.exists()
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["original_filename"] == "new-rates.xlsx"
+    assert metadata["saved_filename"] == "current_rate_sheet.xlsx"
+    assert metadata["source"] == "active_upload"
+    assert metadata["size_bytes"] == active_path.stat().st_size
+    assert len(metadata["sha256"]) == 64
+    assert metadata["validation"]["zone_key"] is True
+    assert metadata["validation"]["mapping_sheet_count"] == 1
+    assert called is False
+
+
+def test_rate_sheet_upload_rejects_invalid_extension(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/rates/upload",
+        files={"rate_sheet_file": ("rates.csv", b"not,xlsx", "text/csv")},
+    )
+
+    assert response.status_code == 400
+    assert "accepts .xlsx files only" in response.text
+    assert not (tmp_path / "rates" / "current_rate_sheet.xlsx").exists()
+
+
+def test_rate_sheet_upload_rejects_invalid_structure_without_replacing_current(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+    active_path = tmp_path / "rates" / "current_rate_sheet.xlsx"
+
+    valid = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "good.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    original_bytes = active_path.read_bytes()
+    invalid = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "bad.xlsx",
+                _minimal_xlsx_bytes(["Not Zone Key"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert valid.status_code == 200
+    assert invalid.status_code == 400
+    assert "Zone Key" in invalid.text
+    assert active_path.read_bytes() == original_bytes
+
+
+def test_rate_sheet_current_returns_active_metadata(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    upload = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "current-rates.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    response = client.get("/rates/current")
+
+    assert upload.status_code == 200
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active"] is True
+    assert payload["filename"] == "current-rates.xlsx"
+    assert payload["source"] == "active_upload"
+    assert payload["size_bytes"] > 0
+    assert len(payload["sha256"]) == 64
+    assert payload["checksum_short"] == payload["sha256"][:12]
+    assert payload["validation"]["zone_key"] is True
+
+
+def test_rate_sheet_current_returns_missing_when_no_active_sheet(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    response = client.get("/rates/current")
+
+    assert response.status_code == 200
+    assert response.json()["active"] is False
+    assert response.json()["source"] == "missing"
+
+
+def test_rate_sheet_download_returns_active_workbook(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+    workbook_bytes = _minimal_xlsx_bytes(["Zone Key", "Sheet2"])
+
+    upload = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "download-rates.xlsx",
+                workbook_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    response = client.get("/rates/download")
+
+    assert upload.status_code == 200
+    assert response.status_code == 200
+    assert response.content == workbook_bytes
+    assert "download-rates.xlsx" in response.headers["content-disposition"]
+
+
+def test_rate_sheet_download_returns_404_when_missing(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    response = client.get("/rates/download")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No active rate sheet loaded"
+
 
 def test_upload_workflow_creates_job_status_and_download(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)

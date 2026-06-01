@@ -2,6 +2,7 @@
 .pytest_cache/
 pytest_tmp/
 test_outputs/
+runtime/
 __pycache__/
 *.pyc
 .env

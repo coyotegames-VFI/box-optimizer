@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 import zipfile
 from collections import Counter
@@ -10,6 +11,8 @@ from box_optimizer.io.excel_reader import read_workbook
 from box_optimizer.models import Dimensions, OrderLine, SKUItem
 from box_optimizer.packing.packer import OptimizedCartonResult, Placement
 from box_optimizer.packing.splitter import SplitCarton, SplitResult
+from box_optimizer import rate_sources as rate_source_module
+from box_optimizer.rate_sources import active_rate_sheet_path, rate_sheet_metadata_path, sha256_file
 from box_optimizer.weights import packed_actual_weight_kg
 import box_optimizer.workflow as workflow_module
 from box_optimizer.workflow import SKUCampaignRule, _packed_items_for_order, format_kg_display, inspect_workbook
@@ -3709,7 +3712,84 @@ def test_vendor_box_fit_mode_on_allows_flex_for_rigid_carton():
 
 
 
-def test_cost_summary_uses_customer_rate_sheet_for_zone_and_shipping_fee(tmp_path):
+def _new_rate_sheet_table(hub_zone_usa_rate: float) -> dict[str, list[list[object]]]:
+    return {
+        "Zone Key": [
+            ["HUB"],
+            ["KG", 0.5, 1, 1.5],
+            ["Zone USA", hub_zone_usa_rate, hub_zone_usa_rate, hub_zone_usa_rate],
+            ["Zone 1", 21, 22, 23],
+            ["Zone 2", 31, 32, 33],
+            ["Zone 3", 41, 42, 43],
+            ["Zone 9", "", "", ""],
+            *([[""]] * 24),
+            ["Express"],
+            ["KG", 0.5, 1, 1.5],
+            ["Zone 1", 101, 111, 121],
+            ["Zone 2", 201, 211, 221],
+            ["Zone 3", 301, 311, 321],
+            ["Zone 4", 401, 411, 421],
+        ],
+        "Sheet2": [
+            ["", "HUB", "", "", "", "", "", "", "Express", "", "", ""],
+            ["", "COUNTRY", "A2 (ISO)", "Ship by", "Zone", "ship by", "ship to contact", "", "COUNTRY", "", "A2 (ISO)", "Zone"],
+            ["", "United States", "US", "Hub", "Zone USA", "ship by hub", "hub@example.com", "", "United States", "", "US", "Zone 1"],
+        ],
+    }
+
+
+def _write_active_rate_sheet_metadata_for_test(path: Path, original_filename: str) -> None:
+    metadata = {
+        "original_filename": original_filename,
+        "saved_filename": path.name,
+        "uploaded_at": "2026-05-31T12:00:00+00:00",
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "validation": {"zone_key": True, "mapping_sheet_count": 1, "sheet_names": ["Zone Key", "Sheet2"]},
+        "source": "active_upload",
+    }
+    rate_sheet_metadata_path().write_text(json.dumps(metadata), encoding="utf-8")
+
+
+class _FakeRateSyncResponse:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self) -> bytes:
+        return self.payload
+
+
+def _install_fake_rate_sync(
+    monkeypatch,
+    remote_status: dict,
+    workbook_bytes: bytes | None = None,
+    fail_current: bool = False,
+    fail_download: bool = False,
+) -> None:
+    def fake_urlopen(request, timeout=0):
+        url = getattr(request, "full_url", str(request))
+        if "/rates/current" in url:
+            if fail_current:
+                raise OSError("railway unavailable")
+            return _FakeRateSyncResponse(json.dumps(remote_status).encode("utf-8"))
+        if "/rates/download" in url:
+            if fail_download:
+                raise OSError("download failed")
+            return _FakeRateSyncResponse(workbook_bytes or b"")
+        raise AssertionError(f"Unexpected rate sync URL: {url}")
+
+    monkeypatch.setattr(rate_source_module, "urlopen", fake_urlopen)
+
+
+def test_cost_summary_uses_customer_rate_sheet_for_zone_and_shipping_fee(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
     rate_path = tmp_path / "rates.xlsx"
     _write_xlsx_table(
         rate_path,
@@ -3764,7 +3844,9 @@ def test_cost_summary_uses_customer_rate_sheet_for_zone_and_shipping_fee(tmp_pat
     assert "Margin" not in rows[0]
 
 
-def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path):
+def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
     rate_path = tmp_path / "Rate and Zone.xlsx"
     zone_key = [[""] for _ in range(37)]
     zone_key[0] = ["HUB"]
@@ -3835,6 +3917,318 @@ def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path):
     assert total_row["Detail"] == "Hub Shipping Fee + Express"
 
 
+def test_current_rate_and_zone_format_parses_hub_express_and_ignores_other_services(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    rate_path = tmp_path / "Rate and Zone 2026.xlsx"
+    zone_key = [[""] for _ in range(45)]
+    zone_key[0] = ["HUB"]
+    zone_key[1] = ["KG", 0.5, 1, 1.5, 2]
+    zone_key[2] = ["Zone 0", 1, 2, 3, 4]
+    zone_key[3] = ["Zone USA", 11, 12, 13, 14]
+    zone_key[4] = ["Zone 1", 21, 22, 23, 24]
+    zone_key[5] = ["Zone 2", 31, 32, 33, 34]
+    zone_key[6] = ["Zone 3", 41, 42, 43, 44]
+    zone_key[31] = ["Express"]
+    zone_key[32] = ["KG", 0.5, 1, 1.5, 2]
+    zone_key[33] = ["Zone 1", 101, 111, 121, 131]
+    zone_key[34] = ["Zone 2", 201, 211, 221, 231]
+    zone_key[35] = ["Zone 3", 301, 311, 321, 331]
+    zone_key[36] = ["Zone 4", 401, 411, 421, 431]
+    zone_key[39] = ["Slow Post"]
+    zone_key[40] = ["KG", 0.5, 1, 1.5, 2]
+    zone_key[41] = ["Zone 2", 999, 999, 999, 999]
+    sheet2 = [
+        ["", "HUB", "", "", "", "", "", "", "Express", "", "", ""],
+        ["", "Country", "A2 ISO", "Ship by", "Zone", "hub destination", "ship-to contact", "", "Country", "Chinese country name", "A2 ISO", "Zone"],
+        ["", "Canada", "CA", "Hub", "Zone 2", "ship to hub", "hub@example.com", "", "Brazil", "巴西", "BR", "Zone 2"],
+        ["", "Australia", "AU", "Hub", "Zone 1", "ship to Aetherworks", "kickstarter@aetherworks.com.au", "", "Mexico", "墨西哥", "MX", "Zone 3"],
+    ]
+    _write_xlsx_tables(rate_path, {"Zone Key": zone_key, "Sheet2": sheet2})
+
+    rate_sheet = workflow_module._load_customer_rate_sheet(str(rate_path))
+    rows = workflow_module._cost_summary_rows(
+        [
+            {"Country": "Canada", "Chargeable Weight kg": 1.1, "Total Units": 1},
+            {"Country": "Brazil", "Chargeable Weight kg": 1.1, "Total Units": 1},
+            {"Country": "Unknown", "Chargeable Weight kg": 1.1, "Total Units": 1},
+        ],
+        {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(rate_path)},
+    )
+
+    assert rate_sheet is not None
+    assert rate_sheet.hub.rates_by_zone["Zone 2"][1.5] == 33
+    assert rate_sheet.express.rates_by_zone["Zone 2"][1.5] == 221
+    assert rate_sheet.hub.rates_by_zone["Zone 2"][1.5] != 999
+    assert rate_sheet.hub.zone_by_country["canada"] == "Zone 2"
+    assert rate_sheet.hub.zone_by_country["ca"] == "Zone 2"
+    assert rate_sheet.hub.iso_by_country["canada"] == "CA"
+    assert rate_sheet.hub.ship_by_country["canada"] == "Hub"
+    assert rate_sheet.hub.ship_to_instruction_by_country["canada"] == "ship to hub"
+    assert rate_sheet.hub.ship_to_contact_by_country["canada"] == "hub@example.com"
+    assert rate_sheet.express.zone_by_country["brazil"] == "Zone 2"
+    assert rate_sheet.express.zone_by_country["br"] == "Zone 2"
+    assert rate_sheet.express.iso_by_country["brazil"] == "BR"
+    assert rate_sheet.express.chinese_name_by_country["brazil"] == "巴西"
+    assert rows[0]["Hub Shipping Fee"] == 35
+    assert rows[0]["Express"] == 0
+    assert rows[1]["Hub Shipping Fee"] == 0
+    assert rows[1]["Express"] == 223
+    assert rows[2]["Hub Shipping Fee"] == 0
+    assert rows[2]["Express"] == 0
+    assert "No hub or express rate found" in rows[2]["Shipping Rate Note"]
+
+
+def test_active_uploaded_rate_sheet_is_selected_over_default_rate_sheet(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    default_path = tmp_path / "default-rates.xlsx"
+    active_path = active_rate_sheet_path()
+    _write_xlsx_tables(default_path, _new_rate_sheet_table(90))
+    _write_xlsx_tables(active_path, _new_rate_sheet_table(10))
+    _write_active_rate_sheet_metadata_for_test(active_path, "railway-rates.xlsx")
+
+    selection = workflow_module._resolve_customer_rate_sheet({**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)})
+    rows = workflow_module._cost_summary_rows(
+        [{"Country": "United States", "US State Abbreviation": "CA", "Chargeable Weight kg": 1.0, "Total Units": 1}],
+        {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)},
+        selection,
+    )
+
+    assert selection.source == "active upload"
+    assert selection.filename == "railway-rates.xlsx"
+    assert selection.checksum_short == sha256_file(active_path)[:12]
+    assert rows[0]["Hub Shipping Fee"] == 12
+
+
+def test_default_rate_sheet_is_used_when_no_active_upload_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    default_path = tmp_path / "default-rates.xlsx"
+    _write_xlsx_tables(default_path, _new_rate_sheet_table(30))
+
+    selection = workflow_module._resolve_customer_rate_sheet({**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)})
+    rows = workflow_module._cost_summary_rows(
+        [{"Country": "United States", "US State Abbreviation": "CA", "Chargeable Weight kg": 1.0, "Total Units": 1}],
+        {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)},
+        selection,
+    )
+
+    assert selection.source == "default fallback"
+    assert selection.filename == "default-rates.xlsx"
+    assert rows[0]["Hub Shipping Fee"] == 32
+
+
+def test_invalid_active_rate_sheet_falls_back_to_default_and_reports_warning(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    default_path = tmp_path / "default-rates.xlsx"
+    active_path = active_rate_sheet_path()
+    _write_xlsx_tables(default_path, _new_rate_sheet_table(40))
+    active_path.write_bytes(b"not a workbook")
+    rate_sheet_metadata_path().write_text(json.dumps({"original_filename": "bad-active.xlsx"}), encoding="utf-8")
+
+    selection = workflow_module._resolve_customer_rate_sheet({**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)})
+    rows = workflow_module._cost_summary_rows(
+        [{"Country": "United States", "US State Abbreviation": "CA", "Chargeable Weight kg": 1.0, "Total Units": 1}],
+        {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)},
+        selection,
+    )
+
+    assert selection.source == "default fallback"
+    assert selection.filename == "default-rates.xlsx"
+    assert "Active rate sheet invalid" in selection.warning
+    assert rows[0]["Hub Shipping Fee"] == 42
+
+
+def test_summary_audit_rows_show_rate_sheet_source_and_checksum(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    active_path = active_rate_sheet_path()
+    _write_xlsx_tables(active_path, _new_rate_sheet_table(10))
+    _write_active_rate_sheet_metadata_for_test(active_path, "current-railway.xlsx")
+    selection = workflow_module._resolve_customer_rate_sheet({})
+    summary_rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "rate_sheet_filename": selection.filename,
+            "rate_sheet_source": selection.source,
+            "rate_sheet_audit_detail": f"Uploaded At: {selection.uploaded_at}; Checksum: {selection.checksum_short}",
+            "rate_sheet_warning": selection.warning,
+        },
+        [],
+        [],
+        {},
+    )
+
+    used_row = next(row for row in summary_rows if row["Metric"] == "Rate Sheet Used")
+    source_row = next(row for row in summary_rows if row["Metric"] == "Rate Sheet Source")
+    assert used_row["Value"] == "current-railway.xlsx"
+    assert "Checksum:" in used_row["Detail"]
+    assert source_row["Value"] == "active upload"
+
+
+def test_summary_audit_rows_show_default_fallback_when_no_active_rate_sheet(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    default_path = tmp_path / "default-rates.xlsx"
+    _write_xlsx_tables(default_path, _new_rate_sheet_table(10))
+    selection = workflow_module._resolve_customer_rate_sheet({**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)})
+    summary_rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "rate_sheet_filename": selection.filename,
+            "rate_sheet_source": selection.source,
+            "rate_sheet_audit_detail": "",
+            "rate_sheet_warning": selection.warning,
+        },
+        [],
+        [],
+        {},
+    )
+
+    used_row = next(row for row in summary_rows if row["Metric"] == "Rate Sheet Used")
+    source_row = next(row for row in summary_rows if row["Metric"] == "Rate Sheet Source")
+    assert used_row["Value"] == "default-rates.xlsx"
+    assert source_row["Value"] == "default fallback"
+
+
+def test_rate_sheet_sync_url_missing_skips_remote_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    default_path = tmp_path / "default-rates.xlsx"
+    _write_xlsx_tables(default_path, _new_rate_sheet_table(30))
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("remote sync should not be called")
+
+    monkeypatch.setattr(rate_source_module, "urlopen", fail_if_called)
+    selection = workflow_module._resolve_customer_rate_sheet({**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)})
+
+    assert selection.source == "default fallback"
+    assert selection.sync_status == ""
+
+
+def test_rate_sheet_sync_downloads_railway_sheet_when_checksum_differs(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SYNC_URL", "https://railway.example")
+    remote_path = tmp_path / "remote-rates.xlsx"
+    _write_xlsx_tables(remote_path, _new_rate_sheet_table(10))
+    remote_bytes = remote_path.read_bytes()
+    remote_sha = sha256_file(remote_path)
+    _install_fake_rate_sync(
+        monkeypatch,
+        {
+            "active": True,
+            "filename": "railway-rates.xlsx",
+            "uploaded_at": "2026-05-31T12:00:00+00:00",
+            "sha256": remote_sha,
+            "source": "active_upload",
+        },
+        workbook_bytes=remote_bytes,
+    )
+
+    rows = workflow_module._cost_summary_rows(
+        [{"Country": "United States", "US State Abbreviation": "CA", "Chargeable Weight kg": 1.0, "Total Units": 1}],
+        {},
+    )
+    metadata = json.loads(rate_sheet_metadata_path().read_text(encoding="utf-8"))
+
+    assert rows[0]["Hub Shipping Fee"] == 12
+    assert active_rate_sheet_path().read_bytes() == remote_bytes
+    assert metadata["source"] == "remote_sync"
+    assert metadata["original_filename"] == "railway-rates.xlsx"
+    assert metadata["sha256"] == remote_sha
+
+
+def test_rate_sheet_sync_does_nothing_when_checksum_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SYNC_URL", "https://railway.example")
+    active_path = active_rate_sheet_path()
+    _write_xlsx_tables(active_path, _new_rate_sheet_table(10))
+    _write_active_rate_sheet_metadata_for_test(active_path, "cached-rates.xlsx")
+    active_bytes = active_path.read_bytes()
+    active_sha = sha256_file(active_path)
+    _install_fake_rate_sync(
+        monkeypatch,
+        {"active": True, "filename": "cached-rates.xlsx", "sha256": active_sha},
+        fail_download=True,
+    )
+
+    selection = workflow_module._resolve_customer_rate_sheet({})
+
+    assert selection.source == "active upload"
+    assert selection.sync_status == "Rate Sheet Sync: up to date from Railway."
+    assert active_path.read_bytes() == active_bytes
+
+
+def test_rate_sheet_sync_uses_cached_active_when_railway_unreachable(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SYNC_URL", "https://railway.example")
+    active_path = active_rate_sheet_path()
+    _write_xlsx_tables(active_path, _new_rate_sheet_table(10))
+    _write_active_rate_sheet_metadata_for_test(active_path, "cached-rates.xlsx")
+    _install_fake_rate_sync(monkeypatch, {}, fail_current=True)
+
+    selection = workflow_module._resolve_customer_rate_sheet({})
+    rows = workflow_module._cost_summary_rows(
+        [{"Country": "United States", "US State Abbreviation": "CA", "Chargeable Weight kg": 1.0, "Total Units": 1}],
+        {},
+        selection,
+    )
+
+    assert selection.source == "active upload"
+    assert "failed" in selection.warning
+    assert rows[0]["Hub Shipping Fee"] == 12
+
+
+def test_rate_sheet_sync_failed_download_does_not_corrupt_cached_active(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SYNC_URL", "https://railway.example")
+    active_path = active_rate_sheet_path()
+    remote_path = tmp_path / "remote-rates.xlsx"
+    _write_xlsx_tables(active_path, _new_rate_sheet_table(10))
+    _write_xlsx_tables(remote_path, _new_rate_sheet_table(40))
+    _write_active_rate_sheet_metadata_for_test(active_path, "cached-rates.xlsx")
+    cached_bytes = active_path.read_bytes()
+    _install_fake_rate_sync(
+        monkeypatch,
+        {"active": True, "filename": "railway-rates.xlsx", "sha256": sha256_file(remote_path)},
+        fail_download=True,
+    )
+
+    selection = workflow_module._resolve_customer_rate_sheet({})
+
+    assert selection.source == "active upload"
+    assert "failed" in selection.warning
+    assert active_path.read_bytes() == cached_bytes
+
+
+def test_rate_sheet_sync_remote_no_active_keeps_default_behavior(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SYNC_URL", "https://railway.example")
+    default_path = tmp_path / "default-rates.xlsx"
+    _write_xlsx_tables(default_path, _new_rate_sheet_table(30))
+    _install_fake_rate_sync(monkeypatch, {"active": False})
+
+    selection = workflow_module._resolve_customer_rate_sheet({**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)})
+    rows = workflow_module._cost_summary_rows(
+        [{"Country": "United States", "US State Abbreviation": "CA", "Chargeable Weight kg": 1.0, "Total Units": 1}],
+        {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(default_path)},
+        selection,
+    )
+
+    assert selection.source == "default fallback"
+    assert "Railway has no active rate sheet" in selection.warning
+    assert rows[0]["Hub Shipping Fee"] == 32
+
+
 def test_summary_total_cost_sums_cost_summary_row_totals():
     cost_rows = [
         {"Hub Shipping Fee": 10, "Express": 0},
@@ -3868,7 +4262,9 @@ def test_summary_total_cost_sums_cost_summary_row_totals():
     assert not any(row["Metric"] == "Estimated Cost" for row in summary_rows)
 
 
-def test_cost_summary_applies_narrow_prepacked_handling_discount_inside_shipping_fee():
+def test_cost_summary_applies_narrow_prepacked_handling_discount_inside_shipping_fee(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
     lane = workflow_module.CustomerRateLane(rates_by_zone={"Zone 1": {1.0: 10.0}}, zone_by_country={})
     assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 1) == 12.0
     assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 2) == 12.25
@@ -4597,7 +4993,9 @@ def test_box_consolidation_what_if_does_not_chain_beyond_two_steps():
     assert "VB 39" not in recommended["Chain Path"]
 
 
-def test_accepted_box_consolidation_updates_summary_and_labels_without_changing_original_rows():
+def test_accepted_box_consolidation_updates_summary_and_labels_without_changing_original_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
     box_rows = [
         {
             "Box Type": "VB 23",

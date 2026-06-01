@@ -30,6 +30,17 @@ from box_optimizer.models import (
     UnmatchedSKURecord,
 )
 from box_optimizer.normalize import normalize_sku
+from box_optimizer.rate_sources import (
+    ACTIVE_RATE_SHEET_FILENAME,
+    RateSheetValidationError,
+    active_rate_sheet_path,
+    rate_sheet_metadata,
+    rate_sheet_metadata_path,
+    rate_sheet_root,
+    rate_sheet_status,
+    sha256_file,
+    validate_rate_sheet,
+)
 from box_optimizer.workflow import inspect_workbook, optimize_workbook
 
 
@@ -516,6 +527,45 @@ def _jobs_root() -> Path:
     return root
 
 
+def _rate_sheet_root() -> Path:
+    return rate_sheet_root()
+
+
+def _active_rate_sheet_path() -> Path:
+    return active_rate_sheet_path()
+
+
+def _rate_sheet_metadata_path() -> Path:
+    return rate_sheet_metadata_path()
+
+
+def _rate_sheet_metadata() -> dict[str, Any]:
+    return rate_sheet_metadata()
+
+
+def _sha256_file(path: Path) -> str:
+    return sha256_file(path)
+
+
+def _rate_sheet_status() -> dict[str, Any]:
+    return rate_sheet_status()
+
+
+def _rate_sheet_status_html() -> str:
+    status = _rate_sheet_status()
+    loaded_at = f"<br>Last loaded: {html.escape(status['uploaded_at'])}" if status["uploaded_at"] else ""
+    checksum = f"<br>Checksum: <code>{html.escape(status.get('checksum_short') or '')}</code>" if status.get("checksum_short") else ""
+    filename = f"<br>Filename: {html.escape(status['filename'])}" if status["filename"] else ""
+    return f"<p class=\"help\"><strong>{html.escape(status['message'])}</strong>{filename}{loaded_at}{checksum}</p>"
+
+
+def _validate_rate_sheet(path: Path) -> dict[str, Any]:
+    try:
+        return validate_rate_sheet(path)
+    except RateSheetValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _job_dir(job_id: str) -> Path:
     if not JOB_ID_PATTERN.fullmatch(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
@@ -841,6 +891,7 @@ def _upload_form_html(
     notice: str = "",
     show_campaign_intake: bool = False,
     default_packing_mode_choice: str = "railway_fast",
+    status_code: int = 200,
 ) -> HTMLResponse:
     safe_config = html.escape(config_text or _default_upload_config_text())
     hidden_token = html.escape(upload_token or "")
@@ -852,6 +903,10 @@ def _upload_form_html(
         separator = "&" if "?" in action_target else "?"
         action_target = f"{action_target}{separator}upload_token={quote(upload_token)}"
     safe_action = html.escape(action_target)
+    rate_action = "/rates/upload"
+    if upload_token:
+        rate_action = f"{rate_action}?upload_token={quote(upload_token)}"
+    rate_status_html = _rate_sheet_status_html()
     return _html_page(
         title,
         f"""
@@ -896,11 +951,23 @@ def _upload_form_html(
       </ul>
     </div>
     <textarea id="config_json" name="config_json">{safe_config}</textarea>
+    <details id="rate_sheet_management">
+      <summary>Rate Sheet Management</summary>
+      <p class="help">Load a new Excel rate sheet without running optimization.</p>
+      {rate_status_html}
+      <label for="rate_sheet_file">Select new rate sheet</label>
+      <input id="rate_sheet_file" name="rate_sheet_file" type="file" accept=".xlsx" form="rate_sheet_upload_form">
+      <button type="submit" form="rate_sheet_upload_form">Load Rates</button>
+    </details>
   </details>
 
   <button type="submit">Run Optimization</button>
 </form>
+<form id="rate_sheet_upload_form" action="{html.escape(rate_action)}" method="post" enctype="multipart/form-data">
+  <input type="hidden" name="upload_token" value="{hidden_token}">
+</form>
 """,
+        status_code=status_code,
     )
 
 
@@ -1193,6 +1260,107 @@ def upload_workbooks(
         final_config=final_config,
         return_path="/upload",
     )
+
+
+@app.post("/rates/upload", response_class=HTMLResponse, include_in_schema=False)
+def upload_rate_sheet(
+    rate_sheet_file: UploadFile = File(...),
+    upload_token: str | None = Form(default=None),
+):
+    """Load a new active rate sheet without running optimization."""
+    try:
+        provided_token = _require_upload_access(upload_token=upload_token)
+    except HTTPException as exc:
+        return _error_page(str(exc.detail), upload_token=upload_token, status_code=exc.status_code, return_path="/upload")
+
+    if Path(rate_sheet_file.filename or "").suffix.lower() != ".xlsx":
+        return _upload_form_html(
+            _default_upload_config_text(),
+            upload_token=provided_token,
+            error="Rate sheet upload accepts .xlsx files only.",
+            show_campaign_intake=True,
+            status_code=400,
+        )
+
+    root = _rate_sheet_root()
+    temp_path = root / f"candidate_{uuid4().hex}.xlsx"
+    try:
+        _save_upload(rate_sheet_file, root, temp_path.name)
+        validation = _validate_rate_sheet(temp_path)
+        active_path = _active_rate_sheet_path()
+        temp_path.replace(active_path)
+        size_bytes = active_path.stat().st_size
+        sha256 = _sha256_file(active_path)
+        metadata = {
+            "original_filename": Path(rate_sheet_file.filename or ACTIVE_RATE_SHEET_FILENAME).name,
+            "saved_filename": ACTIVE_RATE_SHEET_FILENAME,
+            "storage_path": str(active_path),
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            "size_bytes": size_bytes,
+            "sha256": sha256,
+            "validation": validation,
+            "source": "active_upload",
+            "app_version": app.version,
+        }
+        _rate_sheet_metadata_path().write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    except HTTPException as exc:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        return _upload_form_html(
+            _default_upload_config_text(),
+            upload_token=provided_token,
+            error=str(exc.detail),
+            show_campaign_intake=True,
+            status_code=exc.status_code,
+        )
+    except Exception:
+        logger.exception("rate sheet upload failed")
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        return _upload_form_html(
+            _default_upload_config_text(),
+            upload_token=provided_token,
+            error="Rate sheet upload failed before it could be saved.",
+            show_campaign_intake=True,
+            status_code=500,
+        )
+
+    return _upload_form_html(
+        _default_upload_config_text(),
+        upload_token=provided_token,
+        notice="Rate sheet loaded successfully.",
+        show_campaign_intake=True,
+    )
+
+
+@app.get("/rates/current", response_class=JSONResponse, include_in_schema=False)
+def current_rate_sheet(
+    upload_token: str | None = None,
+    token: str | None = None,
+):
+    """Return metadata for the current active rate sheet."""
+    _require_upload_access(upload_token=upload_token, token=token)
+    return JSONResponse(_rate_sheet_status())
+
+
+@app.get("/rates/download", include_in_schema=False)
+def download_rate_sheet(
+    upload_token: str | None = None,
+    token: str | None = None,
+):
+    """Download the current active rate sheet."""
+    _require_upload_access(upload_token=upload_token, token=token)
+    active_path = _active_rate_sheet_path()
+    if not active_path.exists():
+        raise HTTPException(status_code=404, detail="No active rate sheet loaded")
+    metadata = _rate_sheet_metadata()
+    filename = str(metadata.get("original_filename") or ACTIVE_RATE_SHEET_FILENAME)
+    return FileResponse(active_path, media_type=WORKBOOK_CONTENT_TYPE, filename=filename)
+
 
 @app.get("/power-upload", include_in_schema=False)
 def power_upload_page(

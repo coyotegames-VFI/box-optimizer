@@ -29,6 +29,13 @@ from box_optimizer.packing.packer import (
 )
 from box_optimizer.packing.splitter import SplitCarton, SplitResult, split_order_into_cartons
 from box_optimizer.padding import add_final_exterior_padding, add_padding
+from box_optimizer.rate_sources import (
+    RateSheetValidationError,
+    active_rate_sheet_path,
+    rate_sheet_metadata,
+    sync_rate_sheet_from_remote,
+    validate_rate_sheet,
+)
 from box_optimizer.standardization import (
     OptimizedOrderCarton,
     PREFERRED_VENDOR_BOX_IDS,
@@ -3318,6 +3325,22 @@ def _clean_summary_rows(
             "Detail": result.get("total_shipping_cost_detail", "Hub Shipping Fee + Express") if "total_shipping_cost" in result else "",
         },
     ]
+    rows.append(
+        {
+            "Section": "Rate Sheet",
+            "Metric": "Rate Sheet Used",
+            "Value": result.get("rate_sheet_filename", ""),
+            "Detail": result.get("rate_sheet_audit_detail", ""),
+        }
+    )
+    rows.append(
+        {
+            "Section": "Rate Sheet",
+            "Metric": "Rate Sheet Source",
+            "Value": result.get("rate_sheet_source", "missing"),
+            "Detail": result.get("rate_sheet_warning", ""),
+        }
+    )
     boxes_by_base: dict[str, dict] = {}
     for box in box_size_rows:
         base_type = _base_box_type(box.get("Box Type", ""))
@@ -3376,6 +3399,18 @@ def _debug_summary_rows(
             "Metric": "Chargeable Weight Plans Selected",
             "Value": result.get("chargeable_weight_plan_selected_count", 0),
             "Detail": "",
+        },
+        {
+            "Section": "Rate Sheet",
+            "Metric": "Rate Sheet Used",
+            "Value": result.get("rate_sheet_filename", ""),
+            "Detail": result.get("rate_sheet_audit_detail", ""),
+        },
+        {
+            "Section": "Rate Sheet",
+            "Metric": "Rate Sheet Source",
+            "Value": result.get("rate_sheet_source", "missing"),
+            "Detail": result.get("rate_sheet_warning", ""),
         },
     ]
     for box in box_size_rows:
@@ -3645,12 +3680,29 @@ class CustomerRateLane:
     zone_by_country: dict[str, str]
     method_by_country: dict[str, str] | None = None
     max_weight_kg: float = 49.0
+    iso_by_country: dict[str, str] | None = None
+    ship_by_country: dict[str, str] | None = None
+    ship_to_instruction_by_country: dict[str, str] | None = None
+    ship_to_contact_by_country: dict[str, str] | None = None
+    chinese_name_by_country: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
 class CustomerRateSheet:
     hub: CustomerRateLane
     express: CustomerRateLane
+
+
+@dataclass(frozen=True)
+class CustomerRateSheetSelection:
+    sheet: CustomerRateSheet | None
+    path: str
+    filename: str
+    source: str
+    uploaded_at: str = ""
+    checksum_short: str = ""
+    sync_status: str = ""
+    warning: str = ""
 
 
 def _empty_rate_lane() -> CustomerRateLane:
@@ -3684,6 +3736,65 @@ def _rate_rows_by_zone(rows: list[list[object]], weights: list[float]) -> dict[s
     return rates_by_zone
 
 
+def _rate_header_index(row: list[object]) -> int:
+    return next(
+        (
+            index
+            for index, value in enumerate(row)
+            if str(value or "").strip().lower() in {"kg", "kgs", "weight", "weight kg"}
+        ),
+        0,
+    )
+
+
+def _rate_weights_from_section_row(row: list[object]) -> list[float]:
+    kg_index = _rate_header_index(row)
+    return _rate_weights_from_row(row[kg_index:])
+
+
+def _rate_rows_by_zone_section(rows: list[list[object]], weights: list[float], kg_row: list[object]) -> dict[str, dict[float, float]]:
+    kg_index = _rate_header_index(kg_row)
+    return _rate_rows_by_zone([row[kg_index:] for row in rows], weights)
+
+
+def _row_has_text(row: list[object], text: str) -> bool:
+    target = text.strip().lower()
+    return any(str(value or "").strip().lower() == target for value in row)
+
+
+def _find_rate_section(zone_key: list[list[object]], label: str, fallback_rows: slice) -> tuple[list[float], list[list[object]], list[object]]:
+    label_index = next((index for index, row in enumerate(zone_key) if _row_has_text(row, label)), -1)
+    if label_index >= 0:
+        kg_index = next(
+            (
+                index
+                for index in range(label_index + 1, min(len(zone_key), label_index + 6))
+                if any(str(value or "").strip().lower() == "kg" for value in zone_key[index])
+            ),
+            -1,
+        )
+        if kg_index >= 0:
+            rows = []
+            for row in zone_key[kg_index + 1:]:
+                first_text = next((str(value or "").strip() for value in row if str(value or "").strip()), "")
+                if not first_text:
+                    if rows:
+                        break
+                    continue
+                if first_text.lower() in {"hub", "express"}:
+                    break
+                if first_text.startswith("Zone"):
+                    rows.append(row)
+                elif rows:
+                    break
+            weights = _rate_weights_from_section_row(zone_key[kg_index])
+            return weights, rows, zone_key[kg_index]
+    fallback = zone_key[fallback_rows]
+    if not fallback:
+        return [], [], []
+    return _rate_weights_from_row(fallback[0]), fallback[1:], fallback[0]
+
+
 def _add_zone_country_key(zone_by_country: dict[str, str], country: object, zone: object) -> None:
     zone_text = str(zone or "").strip()
     if not zone_text.startswith("Zone"):
@@ -3706,45 +3817,109 @@ def _add_method_country_key(method_by_country: dict[str, str], country: object, 
         method_by_country[country_key] = method
 
 
+def _rate_header_map(row: list[object]) -> dict[str, int]:
+    mapped = {}
+    for index, value in enumerate(row):
+        normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+        if normalized:
+            mapped.setdefault(normalized, index)
+    return mapped
+
+
+def _find_sheet2_header(sheet2: list[list[object]]) -> tuple[int, dict[str, int]]:
+    for index, row in enumerate(sheet2[:10]):
+        mapped = _rate_header_map(row)
+        if "country" in mapped and ("zone" in mapped or "a2iso" in mapped):
+            return index, mapped
+    return (1, _rate_header_map(sheet2[1] if len(sheet2) > 1 else []))
+
+
+def _value_at(row: list[object], index: int, default: object = "") -> object:
+    return row[index] if index >= 0 and index < len(row) else default
+
+
+def _store_rate_metadata(mapping: dict[str, str], country: object, value: object) -> None:
+    country_key = _clean_rate_country(country)
+    text = str(value or "").strip()
+    if country_key and text:
+        mapping[country_key] = text
+
+
 def _new_rate_sheet_lane(tables: dict[str, list[list[object]]], lane: str) -> CustomerRateLane:
     zone_key = tables.get("Zone Key") or []
     sheet2 = tables.get("Sheet2") or []
+    header_index, header_map = _find_sheet2_header(sheet2)
     if lane == "hub":
-        weights = _rate_weights_from_row(zone_key[1]) if len(zone_key) > 1 else []
-        rates_by_zone = _rate_rows_by_zone(zone_key[2:7], weights)
+        weights, rate_rows, kg_row = _find_rate_section(zone_key, "HUB", slice(1, 7))
+        rates_by_zone = _rate_rows_by_zone_section(rate_rows, weights, kg_row)
         zone_by_country: dict[str, str] = {}
         method_by_country: dict[str, str] = {}
-        for row in sheet2[2:]:
-            if len(row) < 5:
-                continue
-            _add_zone_country_key(zone_by_country, row[1], row[4])
-            _add_zone_country_key(zone_by_country, row[2], row[4])
-            method = _join_shipping_method(row[5] if len(row) > 5 else "", row[6] if len(row) > 6 else "")
-            _add_method_country_key(method_by_country, row[1], method)
-            _add_method_country_key(method_by_country, row[2], method)
+        iso_by_country: dict[str, str] = {}
+        ship_by_country: dict[str, str] = {}
+        ship_to_instruction_by_country: dict[str, str] = {}
+        ship_to_contact_by_country: dict[str, str] = {}
+        country_col = header_map.get("country", 1)
+        iso_col = header_map.get("a2iso", 2)
+        ship_by_col = header_map.get("shipby", 3)
+        zone_col = header_map.get("zone", 4)
+        ship_to_col = 5
+        contact_col = 6
+        for row in sheet2[header_index + 1:]:
+            country = _value_at(row, country_col)
+            iso = _value_at(row, iso_col)
+            zone = _value_at(row, zone_col)
+            _add_zone_country_key(zone_by_country, country, zone)
+            _add_zone_country_key(zone_by_country, iso, zone)
+            method = _join_shipping_method(_value_at(row, ship_to_col), _value_at(row, contact_col))
+            _add_method_country_key(method_by_country, country, method)
+            _add_method_country_key(method_by_country, iso, method)
+            for key in [country, iso]:
+                _store_rate_metadata(iso_by_country, key, iso)
+                _store_rate_metadata(ship_by_country, key, _value_at(row, ship_by_col))
+                _store_rate_metadata(ship_to_instruction_by_country, key, _value_at(row, ship_to_col))
+                _store_rate_metadata(ship_to_contact_by_country, key, _value_at(row, contact_col))
         return CustomerRateLane(
             rates_by_zone=rates_by_zone,
             zone_by_country=zone_by_country,
             method_by_country=method_by_country,
             max_weight_kg=max(weights) if weights else 49.0,
+            iso_by_country=iso_by_country,
+            ship_by_country=ship_by_country,
+            ship_to_instruction_by_country=ship_to_instruction_by_country,
+            ship_to_contact_by_country=ship_to_contact_by_country,
         )
-    express_header_index = next(
-        (index for index, row in enumerate(zone_key) if str(row[0] if row else "").strip().lower() == "express"),
-        -1,
-    )
-    weights = _rate_weights_from_row(zone_key[express_header_index + 1]) if express_header_index >= 0 and len(zone_key) > express_header_index + 1 else []
-    rates_by_zone = _rate_rows_by_zone(zone_key[express_header_index + 2 : express_header_index + 6], weights) if express_header_index >= 0 else {}
+    weights, rate_rows, kg_row = _find_rate_section(zone_key, "Express", slice(32, 37))
+    rates_by_zone = _rate_rows_by_zone_section(rate_rows, weights, kg_row)
     zone_by_country = {}
-    for row in sheet2[2:]:
-        if len(row) < 12:
-            continue
-        _add_zone_country_key(zone_by_country, row[8], row[11])
-        _add_zone_country_key(zone_by_country, row[10], row[11])
+    iso_by_country = {}
+    chinese_name_by_country = {}
+    country_col = next(
+        (
+            index
+            for index, value in enumerate(sheet2[header_index] if len(sheet2) > header_index else [])
+            if index >= 8 and re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower()) == "country"
+        ),
+        8,
+    )
+    chinese_col = country_col + 1
+    iso_col = country_col + 2
+    zone_col = country_col + 3
+    for row in sheet2[header_index + 1:]:
+        country = _value_at(row, country_col)
+        iso = _value_at(row, iso_col)
+        zone = _value_at(row, zone_col)
+        _add_zone_country_key(zone_by_country, country, zone)
+        _add_zone_country_key(zone_by_country, iso, zone)
+        for key in [country, iso]:
+            _store_rate_metadata(iso_by_country, key, iso)
+            _store_rate_metadata(chinese_name_by_country, key, _value_at(row, chinese_col))
     return CustomerRateLane(
         rates_by_zone=rates_by_zone,
         zone_by_country=zone_by_country,
         method_by_country={},
         max_weight_kg=max(weights) if weights else 49.0,
+        iso_by_country=iso_by_country,
+        chinese_name_by_country=chinese_name_by_country,
     )
 
 
@@ -3806,6 +3981,61 @@ def _customer_rate_sheet_path(cfg: dict) -> str:
     if path.is_absolute():
         return str(path)
     return str(Path.cwd() / path)
+
+
+def _default_customer_rate_sheet_path(cfg: dict) -> str:
+    return _customer_rate_sheet_path(cfg)
+
+
+def _resolve_customer_rate_sheet(cfg: dict) -> CustomerRateSheetSelection:
+    sync_result = sync_rate_sheet_from_remote()
+    sync_message = str(sync_result.get("message") or "")
+    active_path = active_rate_sheet_path()
+    active_warning = ""
+    if active_path.exists():
+        metadata = rate_sheet_metadata()
+        if metadata:
+            try:
+                validate_rate_sheet(active_path)
+                sheet = _load_customer_rate_sheet(str(active_path))
+                if sheet:
+                    sha256 = str(metadata.get("sha256") or "")
+                    return CustomerRateSheetSelection(
+                        sheet=sheet,
+                        path=str(active_path),
+                        filename=str(metadata.get("original_filename") or active_path.name),
+                        source="remote sync" if metadata.get("source") == "remote_sync" else "active upload",
+                        uploaded_at=str(metadata.get("uploaded_at") or metadata.get("loaded_at") or ""),
+                        checksum_short=sha256[:12],
+                        sync_status=sync_message,
+                        warning=sync_message if sync_result.get("status") in {"failed", "no_active"} else "",
+                    )
+                active_warning = f"Active rate sheet could not be parsed; falling back to default rate sheet: {active_path.name}"
+            except (RateSheetValidationError, OSError, KeyError, ValueError) as exc:
+                active_warning = f"Active rate sheet invalid; falling back to default rate sheet: {exc}"
+        else:
+            active_warning = "Active rate sheet metadata missing; falling back to default rate sheet."
+
+    combined_warning = " ".join(part for part in [sync_message if sync_result.get("status") in {"failed", "no_active"} else "", active_warning] if part)
+    fallback_path = _default_customer_rate_sheet_path(cfg)
+    fallback_sheet = _load_customer_rate_sheet(fallback_path)
+    if fallback_sheet:
+        return CustomerRateSheetSelection(
+            sheet=fallback_sheet,
+            path=fallback_path,
+            filename=Path(fallback_path).name,
+            source="default fallback",
+            sync_status=sync_message,
+            warning=combined_warning,
+        )
+    return CustomerRateSheetSelection(
+        sheet=None,
+        path="",
+        filename="",
+        source="missing",
+        sync_status=sync_message,
+        warning=combined_warning,
+    )
 
 
 def _zone_for_cost_summary_row(row: dict, rate_sheet: CustomerRateSheet | None) -> str:
@@ -3982,9 +4212,14 @@ def _order_notes_value(row: dict) -> str:
     return ""
 
 
-def _cost_summary_rows(order_rows: list[dict], cfg: dict) -> list[dict]:
+def _cost_summary_rows(
+    order_rows: list[dict],
+    cfg: dict,
+    rate_selection: CustomerRateSheetSelection | None = None,
+) -> list[dict]:
     rows = []
-    rate_sheet = _load_customer_rate_sheet(_customer_rate_sheet_path(cfg))
+    rate_selection = rate_selection or _resolve_customer_rate_sheet(cfg)
+    rate_sheet = rate_selection.sheet
     for row in order_rows:
         zone = _zone_for_cost_summary_row(row, rate_sheet)
         hub_fee, express_fee, shipping_note = _shipping_fee_choice(row, rate_sheet, zone)
@@ -5562,10 +5797,26 @@ def optimize_workbook(
     optimized_to_pack_rows = _optimized_to_pack_rows(box_rows)
     pledge_config_by_combo = _pledge_config_by_combo(box_rows)
 
-    cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg)
+    rate_selection = _resolve_customer_rate_sheet(cfg)
+    cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg, rate_selection)
     total_cost = _cost_summary_total_cost(cost_summary_rows)
     result["total_shipping_cost"] = total_cost
     result["total_shipping_cost_detail"] = "Hub Shipping Fee + Express"
+    result["rate_sheet_filename"] = rate_selection.filename or "N/A"
+    result["rate_sheet_source"] = rate_selection.source
+    result["rate_sheet_warning"] = rate_selection.warning
+    result["rate_sheet_audit_detail"] = "; ".join(
+        part
+        for part in [
+            rate_selection.sync_status,
+            f"Uploaded At: {rate_selection.uploaded_at}" if rate_selection.uploaded_at else "",
+            f"Checksum: {rate_selection.checksum_short}" if rate_selection.checksum_short else "",
+        ]
+        if part
+    )
+    if rate_selection.warning:
+        warnings.append(rate_selection.warning)
+        result["warning_count"] = len(warnings) + len(warning_rows)
     summary_result = dict(result)
     summary_result["box_types"] = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
     label_generator_rows = _label_generator_rows(
