@@ -19,6 +19,7 @@ ACTIVE_RATE_SHEET_FILENAME = "current_rate_sheet.xlsx"
 RATE_SHEET_METADATA_FILENAME = "current_rate_sheet.json"
 RATE_SYNC_URL_ENV = "BOX_OPTIMIZER_RATE_SYNC_URL"
 RATE_SYNC_TOKEN_ENV = "BOX_OPTIMIZER_RATE_SYNC_TOKEN"
+RATE_ADMIN_TOKEN_ENV = "BOX_OPTIMIZER_RATE_ADMIN_TOKEN"
 
 
 class RateSheetValidationError(ValueError):
@@ -126,7 +127,15 @@ def rate_sheet_status() -> dict[str, Any]:
 
 def _sync_request_url(base_url: str, endpoint: str) -> str:
     url = urljoin(f"{base_url.rstrip('/')}/", endpoint.lstrip("/"))
-    token = os.getenv(RATE_SYNC_TOKEN_ENV) or os.getenv("BOX_OPTIMIZER_UPLOAD_TOKEN")
+    token = (
+        os.getenv(RATE_SYNC_TOKEN_ENV)
+        or os.getenv(RATE_ADMIN_TOKEN_ENV)
+        or (
+            os.getenv("BOX_OPTIMIZER_UPLOAD_TOKEN")
+            if not os.getenv(RATE_SYNC_TOKEN_ENV) and not os.getenv(RATE_ADMIN_TOKEN_ENV)
+            else ""
+        )
+    )
     if token:
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}{urlencode({'upload_token': token})}"

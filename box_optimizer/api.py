@@ -32,6 +32,8 @@ from box_optimizer.models import (
 from box_optimizer.normalize import normalize_sku
 from box_optimizer.rate_sources import (
     ACTIVE_RATE_SHEET_FILENAME,
+    RATE_ADMIN_TOKEN_ENV,
+    RATE_SYNC_TOKEN_ENV,
     RateSheetValidationError,
     active_rate_sheet_path,
     rate_sheet_metadata,
@@ -598,12 +600,44 @@ def _upload_access_token() -> str:
     return (os.getenv("BOX_OPTIMIZER_UPLOAD_TOKEN") or "").strip()
 
 
+def _rate_admin_token() -> str:
+    return (os.getenv(RATE_ADMIN_TOKEN_ENV) or "").strip()
+
+
+def _rate_sync_token() -> str:
+    return (os.getenv(RATE_SYNC_TOKEN_ENV) or "").strip()
+
+
 def _require_upload_access(upload_token: str | None = None, token: str | None = None) -> str:
     expected = _upload_access_token()
     provided = (upload_token or token or "").strip()
     if expected and provided != expected:
         raise HTTPException(status_code=403, detail="Invalid or missing upload access token")
     return provided
+
+
+def _require_rate_upload_access(
+    upload_token: str | None = None,
+    rate_admin_token: str | None = None,
+    token: str | None = None,
+) -> str:
+    admin_expected = _rate_admin_token()
+    provided = (rate_admin_token or token or upload_token or "").strip()
+    if admin_expected:
+        if provided != admin_expected:
+            raise HTTPException(status_code=403, detail="Invalid or missing rate admin token")
+        return provided
+    return _require_upload_access(upload_token=upload_token, token=token)
+
+
+def _require_rate_download_access(upload_token: str | None = None, token: str | None = None) -> str:
+    provided = (upload_token or token or "").strip()
+    allowed_tokens = [value for value in [_rate_sync_token(), _rate_admin_token()] if value]
+    if allowed_tokens:
+        if provided not in allowed_tokens:
+            raise HTTPException(status_code=403, detail="Invalid or missing rate sheet download token")
+        return provided
+    return _require_upload_access(upload_token=upload_token, token=token)
 
 
 def _token_query(upload_token: str | None) -> str:
@@ -957,6 +991,8 @@ def _upload_form_html(
       {rate_status_html}
       <label for="rate_sheet_file">Select new rate sheet</label>
       <input id="rate_sheet_file" name="rate_sheet_file" type="file" accept=".xlsx" form="rate_sheet_upload_form">
+      <label for="rate_admin_token">Rate admin token</label>
+      <input id="rate_admin_token" name="rate_admin_token" type="password" autocomplete="off" form="rate_sheet_upload_form">
       <button type="submit" form="rate_sheet_upload_form">Load Rates</button>
     </details>
   </details>
@@ -1266,17 +1302,23 @@ def upload_workbooks(
 def upload_rate_sheet(
     rate_sheet_file: UploadFile = File(...),
     upload_token: str | None = Form(default=None),
+    rate_admin_token: str | None = Form(default=None),
 ):
     """Load a new active rate sheet without running optimization."""
+    page_upload_token = ""
     try:
-        provided_token = _require_upload_access(upload_token=upload_token)
+        page_upload_token = _require_upload_access(upload_token=upload_token)
+    except HTTPException:
+        page_upload_token = ""
+    try:
+        _require_rate_upload_access(upload_token=upload_token, rate_admin_token=rate_admin_token)
     except HTTPException as exc:
         return _error_page(str(exc.detail), upload_token=upload_token, status_code=exc.status_code, return_path="/upload")
 
     if Path(rate_sheet_file.filename or "").suffix.lower() != ".xlsx":
         return _upload_form_html(
             _default_upload_config_text(),
-            upload_token=provided_token,
+            upload_token=page_upload_token,
             error="Rate sheet upload accepts .xlsx files only.",
             show_campaign_intake=True,
             status_code=400,
@@ -1310,7 +1352,7 @@ def upload_rate_sheet(
             pass
         return _upload_form_html(
             _default_upload_config_text(),
-            upload_token=provided_token,
+            upload_token=page_upload_token,
             error=str(exc.detail),
             show_campaign_intake=True,
             status_code=exc.status_code,
@@ -1323,7 +1365,7 @@ def upload_rate_sheet(
             pass
         return _upload_form_html(
             _default_upload_config_text(),
-            upload_token=provided_token,
+            upload_token=page_upload_token,
             error="Rate sheet upload failed before it could be saved.",
             show_campaign_intake=True,
             status_code=500,
@@ -1331,7 +1373,7 @@ def upload_rate_sheet(
 
     return _upload_form_html(
         _default_upload_config_text(),
-        upload_token=provided_token,
+        upload_token=page_upload_token,
         notice="Rate sheet loaded successfully.",
         show_campaign_intake=True,
     )
@@ -1353,7 +1395,7 @@ def download_rate_sheet(
     token: str | None = None,
 ):
     """Download the current active rate sheet."""
-    _require_upload_access(upload_token=upload_token, token=token)
+    _require_rate_download_access(upload_token=upload_token, token=token)
     active_path = _active_rate_sheet_path()
     if not active_path.exists():
         raise HTTPException(status_code=404, detail="No active rate sheet loaded")

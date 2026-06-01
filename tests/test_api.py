@@ -633,6 +633,8 @@ def _extract_job_id(html_text: str) -> str:
 
 def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
@@ -668,6 +670,7 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     assert '<details id="rate_sheet_management" open>' not in response.text
     assert "<summary>Rate Sheet Management</summary>" in response.text
     assert 'name="rate_sheet_file"' in response.text
+    assert 'name="rate_admin_token"' in response.text
     assert 'form="rate_sheet_upload_form"' in response.text
     assert ">Load Rates</button>" in response.text
     assert "No active rate sheet loaded" in response.text
@@ -675,6 +678,8 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
 
 def test_upload_page_shows_active_rate_sheet_status(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
@@ -746,6 +751,8 @@ def test_rate_sheet_storage_path_falls_back_to_runtime_rates(monkeypatch, tmp_pa
 
 def test_rate_sheet_upload_saves_active_sheet_without_running_optimizer(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     called = False
 
@@ -787,6 +794,7 @@ def test_rate_sheet_upload_saves_active_sheet_without_running_optimizer(monkeypa
 
 def test_rate_sheet_upload_rejects_invalid_extension(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
@@ -802,6 +810,7 @@ def test_rate_sheet_upload_rejects_invalid_extension(monkeypatch, tmp_path):
 
 def test_rate_sheet_upload_rejects_invalid_structure_without_replacing_current(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
     active_path = tmp_path / "rates" / "current_rate_sheet.xlsx"
@@ -834,8 +843,91 @@ def test_rate_sheet_upload_rejects_invalid_structure_without_replacing_current(m
     assert active_path.read_bytes() == original_bytes
 
 
+def test_employee_upload_token_cannot_replace_rate_sheet_when_admin_token_is_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/rates/upload",
+        data={"upload_token": "employee-token"},
+        files={
+            "rate_sheet_file": (
+                "rates.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 403
+    assert "rate admin token" in response.text
+    assert not (tmp_path / "rates" / "current_rate_sheet.xlsx").exists()
+
+
+def test_rate_admin_token_can_replace_rate_sheet_when_employee_token_is_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/rates/upload?upload_token=employee-token",
+        data={"upload_token": "employee-token", "rate_admin_token": "admin-token"},
+        files={
+            "rate_sheet_file": (
+                "admin-rates.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert "Rate sheet loaded successfully." in response.text
+    assert "admin-rates.xlsx" in response.text
+    assert "employee-token" in response.text
+    assert "admin-token" not in response.text
+    assert (tmp_path / "rates" / "current_rate_sheet.xlsx").exists()
+
+
+def test_rate_upload_rejects_missing_or_wrong_admin_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+
+    missing = client.post(
+        "/rates/upload",
+        files={
+            "rate_sheet_file": (
+                "missing-token.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    wrong = client.post(
+        "/rates/upload",
+        data={"rate_admin_token": "wrong-token"},
+        files={
+            "rate_sheet_file": (
+                "wrong-token.xlsx",
+                _minimal_xlsx_bytes(["Zone Key", "Sheet2"]),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert missing.status_code == 403
+    assert wrong.status_code == 403
+    assert not (tmp_path / "rates" / "current_rate_sheet.xlsx").exists()
+
+
 def test_rate_sheet_current_returns_active_metadata(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
@@ -865,6 +957,7 @@ def test_rate_sheet_current_returns_active_metadata(monkeypatch, tmp_path):
 
 def test_rate_sheet_current_returns_missing_when_no_active_sheet(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
@@ -877,6 +970,8 @@ def test_rate_sheet_current_returns_missing_when_no_active_sheet(monkeypatch, tm
 
 def test_rate_sheet_download_returns_active_workbook(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
     workbook_bytes = _minimal_xlsx_bytes(["Zone Key", "Sheet2"])
@@ -899,8 +994,43 @@ def test_rate_sheet_download_returns_active_workbook(monkeypatch, tmp_path):
     assert "download-rates.xlsx" in response.headers["content-disposition"]
 
 
+def test_rate_sheet_download_requires_sync_or_admin_token_when_configured(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SYNC_TOKEN", "sync-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
+    client = TestClient(app)
+    workbook_bytes = _minimal_xlsx_bytes(["Zone Key", "Sheet2"])
+
+    upload = client.post(
+        "/rates/upload",
+        data={"rate_admin_token": "admin-token"},
+        files={
+            "rate_sheet_file": (
+                "secure-download-rates.xlsx",
+                workbook_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    missing = client.get("/rates/download")
+    employee = client.get("/rates/download?upload_token=employee-token")
+    sync = client.get("/rates/download?upload_token=sync-token")
+    admin = client.get("/rates/download?upload_token=admin-token")
+
+    assert upload.status_code == 200
+    assert missing.status_code == 403
+    assert employee.status_code == 403
+    assert sync.status_code == 200
+    assert sync.content == workbook_bytes
+    assert admin.status_code == 200
+    assert admin.content == workbook_bytes
+
+
 def test_rate_sheet_download_returns_404_when_missing(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "rates"))
     client = TestClient(app)
 
@@ -1171,6 +1301,7 @@ def test_local_upload_launcher_opens_single_upload_page():
 
 def test_upload_page_and_jobs_can_require_upload_token(monkeypatch, tmp_path):
     monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "team-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "admin-token")
     monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
     client = TestClient(app)
 
