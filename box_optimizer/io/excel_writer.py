@@ -271,11 +271,12 @@ def _label_display_addresses(label: dict) -> tuple[str, str, bool]:
 def _label_block_rows(label: dict) -> list[list[object]]:
     items_column_1 = str(label.get("Items to Pack Column 1", "") or "").splitlines()
     items_column_2 = str(label.get("Items to Pack Column 2", "") or "").splitlines()
+    country_package_code = label.get("Country Package Code") or label.get("Country Code", "")
     if label.get("Label Continuation"):
         original_label = _continuation_original_label_number(label)
         continuation_items = [item for item in [*items_column_1, *items_column_2] if str(item or "").strip()]
         rows = [
-            [original_label, "", "", "", "", label.get("Country Code", "")],
+            [original_label, "", "", "", "", country_package_code],
             ["Continuation for", f"{original_label}  {_label_continuation_header_text(label)}", "", "", "", ""],
             ["Qty", "SKU", "", "Qty", "SKU", ""],
         ]
@@ -300,7 +301,7 @@ def _label_block_rows(label: dict) -> list[list[object]]:
     address_1, address_2, address_needs_notes_space = _label_display_addresses(label)
     notes_text = f"Notes: {notes}" if notes and not address_needs_notes_space else ""
     rows = [
-        [_label_visible_id(label), "", "", "", "", label.get("Country Code", "")],
+        [_label_visible_id(label), "", "", "", "", country_package_code],
         ["Origin:", label.get("Origin", ""), "", "", "", ""],
         ["", "", "", "", "", ""],
         ["From", from_line_1, "", "", "", ""],
@@ -909,6 +910,8 @@ def _build_sheet_payloads(
     sheets: dict[str, list[dict]] | None,
     **named_rows: list[dict],
 ) -> list[tuple[str, list[dict]]]:
+    country_scan_sheets = named_rows.pop("country_scan_sheets", None) or {}
+    output_mode = str(named_rows.pop("workbook_output_mode", "admin") or "admin").strip().lower()
     payloads = {name: [] for name in REQUIRED_SHEETS}
     if rows is not None:
         payloads["Summary"] = rows
@@ -946,11 +949,53 @@ def _build_sheet_payloads(
         if payloads.get(name):
             ordered.append((name, payloads[name]))
 
+    if country_scan_sheets:
+        labels_index = next((index for index, (name, _rows) in enumerate(ordered) if name == "Labels"), None)
+        insert_index = len(ordered) if labels_index is None else labels_index + 1
+        for offset, (name, sheet_rows) in enumerate(country_scan_sheets.items()):
+            if sheet_rows:
+                ordered.insert(insert_index + offset, (name, sheet_rows))
+                required_and_optional.add(name)
+
     for name, sheet_rows in payloads.items():
         if name not in required_and_optional and not name.startswith("Cost Summary -") and sheet_rows:
             ordered.append((name, sheet_rows))
 
+    if output_mode == "worker":
+        worker_sheet_names = {
+            "Summary",
+            "Cost Summary",
+            "Labels",
+            "VFI Intake Form",
+            "Optimized to Pack",
+            "Box Size Summary",
+            *country_scan_sheets.keys(),
+        }
+        # Future workbook sheets must be explicitly classified by the user as worker-facing,
+        # admin-only, or both before being added to this filter.
+        ordered = [
+            (name, sheet_rows)
+            for name, sheet_rows in ordered
+            if name in worker_sheet_names or name.startswith("Cost Summary -")
+        ]
+
     return ordered
+
+
+def _safe_sheet_names(names: list[str]) -> list[str]:
+    safe_names = []
+    used = set()
+    for name in names:
+        base = _safe_sheet_name(name)
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            suffix_text = f" {suffix}"
+            candidate = _safe_sheet_name(f"{base[:31 - len(suffix_text)]}{suffix_text}")
+            suffix += 1
+        used.add(candidate)
+        safe_names.append(candidate)
+    return safe_names
 
 
 def write_workbook(
@@ -964,7 +1009,7 @@ def write_workbook(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     sheet_payloads = _build_sheet_payloads(rows, sheets, **named_rows)
-    safe_names = [_safe_sheet_name(name) for name, _ in sheet_payloads]
+    safe_names = _safe_sheet_names([name for name, _ in sheet_payloads])
     labels_entry = next(((index, sheet_rows) for index, (name, sheet_rows) in enumerate(sheet_payloads, start=1) if name == "Labels"), None)
     label_qr_images = _label_qr_images(labels_entry[1]) if labels_entry else []
 

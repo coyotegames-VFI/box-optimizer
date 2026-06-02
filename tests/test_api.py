@@ -5,11 +5,15 @@ import re
 import zipfile
 from io import BytesIO, StringIO
 from pathlib import Path
+from xml.etree import ElementTree
 
 from fastapi.testclient import TestClient
 
 from box_optimizer import api as api_module
 from box_optimizer.api import app
+
+
+_XLSX_NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
 
 def _csv_bytes(rows: list[dict]) -> bytes:
@@ -391,6 +395,24 @@ def _minimal_xlsx_bytes(sheet_names: list[str]) -> bytes:
             "</workbook>",
         )
     return output.getvalue()
+
+
+def _sheet_names_from_xlsx_bytes(payload: bytes) -> list[str]:
+    with zipfile.ZipFile(BytesIO(payload)) as archive:
+        root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    return [
+        sheet.attrib["name"]
+        for sheet in root.findall("main:sheets/main:sheet", _XLSX_NS)
+    ]
+
+
+def _xlsx_xml_text(payload: bytes) -> str:
+    with zipfile.ZipFile(BytesIO(payload)) as archive:
+        return "\n".join(
+            archive.read(name).decode("utf-8", errors="ignore")
+            for name in archive.namelist()
+            if name.endswith(".xml")
+        )
 
 
 def test_optimize_base64_falls_back_to_default_download_filename(monkeypatch):
@@ -1328,3 +1350,129 @@ def test_upload_page_and_jobs_can_require_upload_token(monkeypatch, tmp_path):
     assert client.get(f"/jobs/{job_id}").status_code == 403
     assert client.get(f"/jobs/{job_id}?upload_token=team-token").status_code == 200
     assert client.get(f"/jobs/{job_id}/download?upload_token=team-token").content[:2] == b"PK"
+
+
+def test_employee_upload_token_gets_worker_workbook_when_admin_upload_token_is_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_ADMIN_UPLOAD_TOKEN", "admin-workbook-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "rate-admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku list.csv", _sku_master_file()[1], "text/csv"),
+            "orders_file": ("orders list.csv", _orders_file()[1], "text/csv"),
+        },
+        data={
+            "upload_token": "employee-token",
+            "config_json": '{"packing_mode":"fast","preserve_region_sheets":true,"campaign":{"code":"Worker"}}',
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = _extract_job_id(response.text)
+    download = client.get(f"/jobs/{job_id}/download?upload_token=employee-token")
+    sheet_names = _sheet_names_from_xlsx_bytes(download.content)
+
+    assert download.status_code == 200
+    assert sheet_names[:3] == ["Summary", "Cost Summary", "Labels"]
+    assert "United States" in sheet_names
+    assert "VFI Intake Form" in sheet_names
+    assert "Optimized to Pack" in sheet_names
+    assert "Box Size Summary" in sheet_names
+    assert "Label generator" not in sheet_names
+    assert "Order Volume Weights" not in sheet_names
+    assert "Debug Summary" not in sheet_names
+    assert "Box Consolidation What-If" not in sheet_names
+    assert "Errors and Warnings" not in sheet_names
+    assert "Region - NA" not in sheet_names
+    workbook_text = _xlsx_xml_text(download.content)
+    assert "Output Mode" in workbook_text
+    assert "Worker" in workbook_text
+
+
+def test_admin_upload_token_gets_full_workbook_when_admin_upload_token_is_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_ADMIN_UPLOAD_TOKEN", "admin-workbook-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "rate-admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku list.csv", _sku_master_file()[1], "text/csv"),
+            "orders_file": ("orders list.csv", _orders_file()[1], "text/csv"),
+        },
+        data={
+            "upload_token": "admin-workbook-token",
+            "config_json": '{"packing_mode":"fast","preserve_region_sheets":true,"campaign":{"code":"Admin"}}',
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = _extract_job_id(response.text)
+    download = client.get(f"/jobs/{job_id}/download?upload_token=admin-workbook-token")
+    sheet_names = _sheet_names_from_xlsx_bytes(download.content)
+
+    assert download.status_code == 200
+    assert "Debug Summary" in sheet_names
+    assert "Box Consolidation What-If" in sheet_names
+    assert "Label generator" in sheet_names
+    assert "Order Volume Weights" in sheet_names
+    assert "Region - NA" in sheet_names
+    workbook_text = _xlsx_xml_text(download.content)
+    assert "Output Mode" in workbook_text
+    assert "Admin" in workbook_text
+
+
+def test_upload_token_preserves_full_workbook_when_admin_upload_token_is_not_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.delenv("BOX_OPTIMIZER_ADMIN_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku list.csv", _sku_master_file()[1], "text/csv"),
+            "orders_file": ("orders list.csv", _orders_file()[1], "text/csv"),
+        },
+        data={
+            "upload_token": "employee-token",
+            "config_json": '{"packing_mode":"fast","preserve_region_sheets":true,"campaign":{"code":"Local"}}',
+        },
+    )
+
+    assert response.status_code == 200
+    job_id = _extract_job_id(response.text)
+    download = client.get(f"/jobs/{job_id}/download?upload_token=employee-token")
+    sheet_names = _sheet_names_from_xlsx_bytes(download.content)
+
+    assert "Debug Summary" in sheet_names
+    assert "Box Consolidation What-If" in sheet_names
+    assert "Order Volume Weights" in sheet_names
+
+
+def test_rate_admin_token_does_not_grant_admin_workbook_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOX_OPTIMIZER_UPLOAD_TOKEN", "employee-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_ADMIN_UPLOAD_TOKEN", "admin-workbook-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_ADMIN_TOKEN", "rate-admin-token")
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku list.csv", _sku_master_file()[1], "text/csv"),
+            "orders_file": ("orders list.csv", _orders_file()[1], "text/csv"),
+        },
+        data={
+            "upload_token": "rate-admin-token",
+            "config_json": '{"packing_mode":"fast"}',
+        },
+    )
+
+    assert response.status_code == 403

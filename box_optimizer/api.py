@@ -55,6 +55,7 @@ DEFAULT_UPLOAD_CONFIG = {
     "output_granularity": "order_summary",
     "preserve_region_sheets": False,
 }
+ADMIN_UPLOAD_TOKEN_ENV = "BOX_OPTIMIZER_ADMIN_UPLOAD_TOKEN"
 POWER_UPLOAD_CONFIG = {
     "debug": True,
     "packing_mode": "balanced",
@@ -600,6 +601,10 @@ def _upload_access_token() -> str:
     return (os.getenv("BOX_OPTIMIZER_UPLOAD_TOKEN") or "").strip()
 
 
+def _admin_upload_token() -> str:
+    return (os.getenv(ADMIN_UPLOAD_TOKEN_ENV) or "").strip()
+
+
 def _rate_admin_token() -> str:
     return (os.getenv(RATE_ADMIN_TOKEN_ENV) or "").strip()
 
@@ -609,11 +614,18 @@ def _rate_sync_token() -> str:
 
 
 def _require_upload_access(upload_token: str | None = None, token: str | None = None) -> str:
-    expected = _upload_access_token()
+    allowed_tokens = [value for value in [_upload_access_token(), _admin_upload_token()] if value]
     provided = (upload_token or token or "").strip()
-    if expected and provided != expected:
+    if allowed_tokens and provided not in allowed_tokens:
         raise HTTPException(status_code=403, detail="Invalid or missing upload access token")
     return provided
+
+
+def _workbook_output_mode_for_token(provided_token: str) -> str:
+    admin_token = _admin_upload_token()
+    if admin_token:
+        return "admin" if provided_token == admin_token else "worker"
+    return "admin"
 
 
 def _require_rate_upload_access(
@@ -641,8 +653,7 @@ def _require_rate_download_access(upload_token: str | None = None, token: str | 
 
 
 def _token_query(upload_token: str | None) -> str:
-    expected = _upload_access_token()
-    if not expected:
+    if not (_upload_access_token() or _admin_upload_token()):
         return ""
     return f"?upload_token={quote(upload_token or '')}"
 
@@ -1167,6 +1178,7 @@ def _run_upload_job(
             config = {**default_config, **submitted_config}
         else:
             config = final_config
+        config = {**config, "workbook_output_mode": _workbook_output_mode_for_token(provided_token)}
         if config.get("debug"):
             logger.setLevel(logging.DEBUG)
         output_filename = _campaign_download_filename(config)

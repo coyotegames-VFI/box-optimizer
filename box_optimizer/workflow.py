@@ -3306,6 +3306,7 @@ def _clean_summary_rows(
     unmatched_rows: list[dict],
     sku_rules: dict[str, SKUCampaignRule],
     factory_name: str = "",
+    country_package_count_rows: list[dict] | None = None,
 ) -> list[dict]:
     rows = [
         {
@@ -3318,6 +3319,12 @@ def _clean_summary_rows(
         {"Section": "Run Summary", "Metric": "Box Types", "Value": result["box_types"], "Detail": ""},
         {"Section": "Run Summary", "Metric": "Unmatched SKUs", "Value": result["unmatched_skus"], "Detail": ""},
         {"Section": "Run Summary", "Metric": "Factory", "Value": factory_name, "Detail": ""},
+        {
+            "Section": "Run Summary",
+            "Metric": "Output Mode",
+            "Value": result.get("workbook_output_mode", "Admin"),
+            "Detail": "",
+        },
         {
             "Section": "Cost Placeholder",
             "Metric": "Total Chargeable Cost",
@@ -3376,6 +3383,7 @@ def _clean_summary_rows(
             rows.append({"Section": "Rules Applied Summary", "Metric": "Rule", "Value": summary, "Detail": ""})
     else:
         rows.append({"Section": "Rules Applied Summary", "Metric": "Rules", "Value": 0, "Detail": "No special packing rules matched"})
+    rows.extend(country_package_count_rows or [])
     return rows
 
 
@@ -4229,6 +4237,7 @@ def _cost_summary_rows(
             {
                 "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id"]),
                 "VFI #": row.get("VFI #", ""),
+                "Country Number": row.get("Country Number", ""),
                 "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Name"]),
                 "phone": _first_present(row, ["phone", "Phone", "Address Phone Number"]),
                 "email": _first_present(row, ["email", "Email"]),
@@ -4241,14 +4250,140 @@ def _cost_summary_rows(
                 "Chargeable Weight kg": row.get("Chargeable Weight kg", ""),
                 "Chargeable Weight g": row.get("Chargeable Weight g", ""),
                 "Total Units": row.get("Total Units", ""),
-                "Box Qty": row.get("Box Qty", ""),
                 "Shipping Method": shipping_method,
                 "Hub Shipping Fee": hub_fee,
                 "Express": express_fee,
                 "Shipping Rate Note": combined_note,
+                "Box Qty": row.get("Box Qty", ""),
             }
         )
     return rows
+
+
+def _country_sequence_display(country: object) -> str:
+    text = str(country or "").strip()
+    return text or "Unknown"
+
+
+def _with_country_sequences(order_rows: list[dict]) -> tuple[list[dict], dict[str, dict[str, object]]]:
+    counters: Counter[str] = Counter()
+    by_order: dict[str, dict[str, object]] = {}
+    rows = []
+    for row in order_rows:
+        output = dict(row)
+        country = _country_sequence_display(output.get("Country", ""))
+        key = country.casefold()
+        counters[key] += 1
+        sequence = counters[key]
+        country_number = f"{country} {sequence}"
+        output["Country Number"] = country_number
+        output["Country Sequence"] = sequence
+        output["Country Sequence Country"] = country
+        order_id = str(output.get("Order ID", "") or "")
+        if order_id:
+            by_order[order_id] = {
+                "country": country,
+                "sequence": sequence,
+                "country_number": country_number,
+                "country_code": _country_code_for_label_row(output),
+            }
+        rows.append(output)
+    return rows, by_order
+
+
+def _country_package_code(country_code: object, sequence: object, box_number: object = "", box_qty: object = "") -> str:
+    code = re.sub(r"[^A-Za-z]", "", str(country_code or "")).upper()
+    if len(code) != 2:
+        code = "UN"
+    try:
+        sequence_number = int(float(sequence))
+    except (TypeError, ValueError):
+        sequence_number = 0
+    base = f"{code}  {sequence_number}" if sequence_number else code
+    try:
+        qty = int(float(box_qty or 0))
+        number = int(float(box_number or 0))
+    except (TypeError, ValueError):
+        qty = 0
+        number = 0
+    return f"{base}-{number}" if qty > 1 and number else base
+
+
+def _with_country_package_codes(box_rows: list[dict], sequence_by_order: dict[str, dict[str, object]]) -> list[dict]:
+    rows = []
+    for row in box_rows:
+        output = dict(row)
+        sequence = sequence_by_order.get(str(output.get("Order ID", "") or ""), {})
+        country = sequence.get("country") or _country_sequence_display(output.get("Country", ""))
+        country_number = sequence.get("country_number") or f"{country} 1"
+        country_sequence = sequence.get("sequence") or 1
+        country_code = sequence.get("country_code") or _country_code_for_label_row(output)
+        output["Country Number"] = country_number
+        output["Country Sequence"] = country_sequence
+        output["Country Package Code"] = _country_package_code(
+            country_code,
+            country_sequence,
+            output.get("Box Number", ""),
+            output.get("Box Qty", ""),
+        )
+        rows.append(output)
+    return rows
+
+
+def _country_package_count_rows(box_rows: list[dict]) -> list[dict]:
+    counts: dict[str, int] = {}
+    for row in box_rows:
+        country = _country_sequence_display(row.get("Country", ""))
+        counts[country] = counts.get(country, 0) + 1
+    return [
+        {"Section": "Country Package Counts", "Metric": country, "Value": count, "Detail": ""}
+        for country, count in counts.items()
+    ]
+
+
+def _country_scan_sheet_name(country: object, used: set[str]) -> str:
+    invalid = set("[]:*?/\\")
+    base = "".join("_" if char in invalid else char for char in _country_sequence_display(country)).strip()[:31] or "Unknown"
+    reserved = {
+        "Summary",
+        "Cost Summary",
+        "Labels",
+        "VFI Intake Form",
+        "Optimized to Pack",
+        "Label generator",
+        "Order Volume Weights",
+        "Box Size Summary",
+    }
+    if base in reserved or base.startswith("Cost Summary -"):
+        base = f"{base[:23]} Country".strip()[:31]
+    name = base
+    suffix = 2
+    while name in used:
+        suffix_text = f" {suffix}"
+        name = f"{base[:31 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    used.add(name)
+    return name
+
+
+def _country_scan_sheets(label_rows: list[dict]) -> dict[str, list[dict]]:
+    sheets: dict[str, list[dict]] = {}
+    name_by_country: dict[str, str] = {}
+    used_names = set()
+    for row in label_rows:
+        country = _country_sequence_display(_first_present(row, ["Country", "Country Name"]))
+        key = country.casefold()
+        if key not in name_by_country:
+            name_by_country[key] = _country_scan_sheet_name(country, used_names)
+            sheets[name_by_country[key]] = []
+        sheets[name_by_country[key]].append(
+            {
+                "Country Number": row.get("Country Number", ""),
+                "VFI #": row.get("Label Number", ""),
+                "Barcode Value": row.get("Label numbers", ""),
+            }
+        )
+    return sheets
 
 
 def _label_number_for_box(row: dict, campaign_label_prefix: str = "") -> str:
@@ -4299,6 +4434,9 @@ def _label_generator_rows(
                 "Label numbers": _label_number_for_box(row, campaign_label_prefix),
                 "Box Plan": row.get("Box Type", ""),
                 "Per-Box Chargeable Weight": row.get("Chargeable Weight kg", ""),
+                "Country Number": row.get("Country Number", ""),
+                "Country Package Code": row.get("Country Package Code", ""),
+                "Country Sequence": row.get("Country Sequence", ""),
                 "SKU Breakdown": row.get("Label SKUs in Box") or row.get("SKUs in Box", ""),
                 "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id", "Name Order ID", "Order #", "Order Number", "Order ID"]),
                 "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Backer Name", "Customer Name", "Name"]),
@@ -4439,10 +4577,12 @@ def _labels_rows(
             "Postal/Zip": label.get("Shipping Postal Code", ""),
             "Country": label.get("Country Name", ""),
             "Country Code": label.get("Ship to Country Code", ""),
-                "Phone": label.get("phone", ""),
-                "Email": label.get("email", ""),
-                "Notes": label.get("Notes", ""),
-                "Order ID": label.get("Order ID", ""),
+            "Country Number": label.get("Country Number", ""),
+            "Country Package Code": label.get("Country Package Code", ""),
+            "Phone": label.get("phone", ""),
+            "Email": label.get("email", ""),
+            "Notes": label.get("Notes", ""),
+            "Order ID": label.get("Order ID", ""),
             "Pledge Configuration": label.get("Pledge Configuration", ""),
             "Carton Box Designation": label.get("Box Plan", ""),
             "Box Plan": label.get("Box Plan", ""),
@@ -5791,7 +5931,8 @@ def optimize_workbook(
         ),
         vfi_by_order,
     )
-    cost_order_summary_rows = list(operational_order_summary_rows)
+    cost_order_summary_rows, country_sequence_by_order = _with_country_sequences(operational_order_summary_rows)
+    operational_box_rows = _with_country_package_codes(operational_box_rows, country_sequence_by_order)
     box_size_rows = _box_size_summary(operational_box_rows)
     unmatched_rows = _unmatched_rows(intake.unmatched_skus)
     optimized_to_pack_rows = _optimized_to_pack_rows(box_rows)
@@ -5818,12 +5959,17 @@ def optimize_workbook(
         warnings.append(rate_selection.warning)
         result["warning_count"] = len(warnings) + len(warning_rows)
     summary_result = dict(result)
+    workbook_output_mode = str(cfg.get("workbook_output_mode") or "admin").strip().lower()
+    if workbook_output_mode not in {"admin", "worker"}:
+        workbook_output_mode = "admin"
+    summary_result["workbook_output_mode"] = workbook_output_mode.title()
     summary_result["box_types"] = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
     label_generator_rows = _label_generator_rows(
         _box_rows_in_vfi_sequence(operational_box_rows, vfi_by_order),
         pledge_config_by_combo,
         _campaign_vfi_prefix(cfg),
     )
+    country_scan_sheets = _country_scan_sheets(label_generator_rows)
     vfi_intake_sources = _vfi_intake_source_rows(sku_master_path)
     vfi_intake_form_rows = _vfi_intake_form_rows_from_sources(vfi_intake_sources)
     factory_name = _factory_name_from_vfi_intake_sources(vfi_intake_sources)
@@ -5843,12 +5989,21 @@ def optimize_workbook(
     _log_event("excel_writing_started", output_path=str(Path(output_path).name))
     write_workbook(
         output_path,
-        summary_rows=_clean_summary_rows(summary_result, box_size_rows, unmatched_rows, sku_rules, factory_name=factory_name),
+        summary_rows=_clean_summary_rows(
+            summary_result,
+            box_size_rows,
+            unmatched_rows,
+            sku_rules,
+            factory_name=factory_name,
+            country_package_count_rows=_country_package_count_rows(operational_box_rows),
+        ),
         cost_summary_rows=cost_summary_rows,
         vfi_intake_form_rows=vfi_intake_form_rows,
         optimized_to_pack_rows=optimized_to_pack_rows,
         label_generator_rows=label_generator_rows,
         labels_rows=labels_rows,
+        country_scan_sheets=country_scan_sheets,
+        workbook_output_mode=workbook_output_mode,
         order_volume_weights_rows=order_rows,
         box_size_summary_rows=box_size_rows,
         unmatched_skus_rows=unmatched_rows,
