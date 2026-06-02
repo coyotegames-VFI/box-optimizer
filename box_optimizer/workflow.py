@@ -3307,6 +3307,7 @@ def _clean_summary_rows(
     sku_rules: dict[str, SKUCampaignRule],
     factory_name: str = "",
     country_package_count_rows: list[dict] | None = None,
+    sku_intake_summary_rows: list[dict] | None = None,
 ) -> list[dict]:
     rows = [
         {
@@ -3384,6 +3385,34 @@ def _clean_summary_rows(
     else:
         rows.append({"Section": "Rules Applied Summary", "Metric": "Rules", "Value": 0, "Detail": "No special packing rules matched"})
     rows.extend(country_package_count_rows or [])
+    if sku_intake_summary_rows:
+        sku_block_rows = [
+            {
+                "SKU": "SKU Intake Summary",
+                "Received Quantity": "",
+                "Required Quantity": "",
+                "Remaining": "",
+            },
+            {
+                "SKU": "SKU",
+                "Received Quantity": "Received Quantity",
+                "Required Quantity": "Required Quantity",
+                "Remaining": "Remaining",
+            },
+            *[
+                {
+                    "SKU": row.get("SKU", ""),
+                    "Received Quantity": row.get("Received Quantity", ""),
+                    "Required Quantity": row.get("Required Quantity", ""),
+                    "Remaining": row.get("Remaining", ""),
+                }
+                for row in sku_intake_summary_rows
+            ],
+        ]
+        while len(rows) < len(sku_block_rows):
+            rows.append({"Section": "", "Metric": "", "Value": "", "Detail": ""})
+        for index, sku_row in enumerate(sku_block_rows):
+            rows[index].update(sku_row)
     return rows
 
 
@@ -4673,13 +4702,148 @@ def _vfi_intake_source_rows(sku_master_path: str):
         return []
 
 
+_RECEIVED_QUANTITY_HEADER_ALIASES = {
+    "received",
+    "receivedquantity",
+    "stockreceived",
+    "collected",
+    "qtyreceived",
+    "quantity",
+    "数量",
+}
+
+
+def _received_quantity_header_key(value: object) -> str:
+    text = str(value or "").strip().casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+
+
+def _is_received_quantity_header(value: object) -> bool:
+    return _received_quantity_header_key(value) in _RECEIVED_QUANTITY_HEADER_ALIASES
+
+
+def _parse_report_quantity(value: object) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    match = re.search(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text.replace(",", ""))
+    if not match:
+        return 0
+    try:
+        return int(float(match.group(0)))
+    except ValueError:
+        return 0
+
+
+def _received_quantity_value(row: dict) -> object:
+    for header, value in row.items():
+        if _is_received_quantity_header(header):
+            return value
+    return ""
+
+
+def _vfi_intake_form_rows_with_received(rows: list[dict]) -> list[dict]:
+    updated_rows = []
+    for row in rows:
+        updated = dict(row)
+        if "Received" not in updated or str(updated.get("Received", "") or "").strip() == "":
+            updated["Received"] = _received_quantity_value(row)
+        updated_rows.append(updated)
+    return updated_rows
+
+
 def _vfi_intake_form_rows_from_sources(source_rows) -> list[dict]:
     if not source_rows:
-        return [{"Note": "No VFI Intake Form rows found in uploaded SKU file."}]
+        return _vfi_intake_form_rows_with_received(
+            [{"Note": "No VFI Intake Form rows found in uploaded SKU file."}]
+        )
     preserved_rows = getattr(source_rows[0], "preserved_rows", None) or []
     if preserved_rows:
-        return preserved_rows
-    return source_rows[0].rows or [{"Note": "VFI Intake Form source sheet was empty."}]
+        return _vfi_intake_form_rows_with_received(preserved_rows)
+    return _vfi_intake_form_rows_with_received(
+        source_rows[0].rows or [{"Note": "VFI Intake Form source sheet was empty."}]
+    )
+
+
+def _sku_key_for_report(value: object) -> str:
+    return normalize_sku(str(value or "").strip())
+
+
+def _sku_from_intake_row(row: dict) -> str:
+    for header, value in row.items():
+        if _sku_key_for_report(header) == "SKU":
+            return str(value or "").strip()
+    for header, value in row.items():
+        if "sku" in str(header or "").strip().casefold():
+            return str(value or "").strip()
+    return ""
+
+
+def _sku_intake_summary_rows(
+    sku_items: list[SKUItem],
+    order_lines: list[OrderLine],
+    vfi_intake_form_rows: list[dict],
+) -> list[dict]:
+    received_by_sku: dict[str, int] = {}
+    for row in vfi_intake_form_rows:
+        sku = _sku_from_intake_row(row)
+        sku_key = _sku_key_for_report(sku)
+        if not sku_key or sku_key == "SKU":
+            continue
+        received_by_sku.setdefault(sku_key, _parse_report_quantity(row.get("Received", "")))
+
+    required_by_sku: Counter[str] = Counter()
+    raw_by_sku: dict[str, str] = {}
+    for line in order_lines:
+        sku = line.canonical_sku or line.raw_sku
+        sku_key = _sku_key_for_report(sku)
+        if not sku_key:
+            continue
+        required_by_sku[sku_key] += int(line.quantity or 0)
+        raw_by_sku.setdefault(sku_key, str(sku))
+
+    ordered_keys: list[str] = []
+    seen = set()
+    for item in sku_items:
+        sku_key = _sku_key_for_report(item.canonical_sku or item.raw_sku)
+        if not sku_key or sku_key in seen:
+            continue
+        seen.add(sku_key)
+        ordered_keys.append(sku_key)
+        raw_by_sku.setdefault(sku_key, item.raw_sku or item.canonical_sku)
+    for row in vfi_intake_form_rows:
+        sku = _sku_from_intake_row(row)
+        sku_key = _sku_key_for_report(sku)
+        if not sku_key or sku_key == "SKU" or sku_key in seen:
+            continue
+        seen.add(sku_key)
+        ordered_keys.append(sku_key)
+        raw_by_sku.setdefault(sku_key, sku)
+    for line in order_lines:
+        sku_key = _sku_key_for_report(line.canonical_sku or line.raw_sku)
+        if not sku_key or sku_key in seen:
+            continue
+        seen.add(sku_key)
+        ordered_keys.append(sku_key)
+        raw_by_sku.setdefault(sku_key, line.raw_sku or line.canonical_sku)
+
+    rows = []
+    for sku_key in ordered_keys:
+        received = received_by_sku.get(sku_key, 0)
+        required = int(required_by_sku.get(sku_key, 0))
+        rows.append(
+            {
+                "Section": "",
+                "Metric": "",
+                "Value": "",
+                "Detail": "",
+                "SKU": raw_by_sku.get(sku_key, sku_key),
+                "Received Quantity": received,
+                "Required Quantity": required,
+                "Remaining": received - required,
+            }
+        )
+    return rows
 
 
 def _vfi_intake_form_rows(sku_master_path: str) -> list[dict]:
@@ -5987,6 +6151,11 @@ def optimize_workbook(
     country_scan_sheets = _country_scan_sheets(label_generator_rows)
     vfi_intake_sources = _vfi_intake_source_rows(sku_master_path)
     vfi_intake_form_rows = _vfi_intake_form_rows_from_sources(vfi_intake_sources)
+    sku_intake_summary_rows = _sku_intake_summary_rows(
+        intake.sku_items,
+        intake.order_lines,
+        vfi_intake_form_rows,
+    )
     factory_name = _factory_name_from_vfi_intake_sources(vfi_intake_sources)
     labels_rows = _labels_rows(
         label_generator_rows,
@@ -6011,6 +6180,7 @@ def optimize_workbook(
             sku_rules,
             factory_name=factory_name,
             country_package_count_rows=_country_package_count_rows(operational_box_rows),
+            sku_intake_summary_rows=sku_intake_summary_rows,
         ),
         cost_summary_rows=cost_summary_rows,
         vfi_intake_form_rows=vfi_intake_form_rows,

@@ -187,6 +187,35 @@ def test_vfi_intake_form_hides_database_upload_columns_without_deleting_data(tmp
     assert "value-27" in xml
 
 
+def test_summary_sku_intake_shortage_remaining_is_red(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        summary_rows=[
+            {
+                "Section": "",
+                "Metric": "",
+                "Value": "",
+                "Detail": "",
+                "SKU": "ORDERONLY",
+                "Received Quantity": 0,
+                "Required Quantity": 4,
+                "Remaining": -4,
+            }
+        ],
+    )
+
+    root = _worksheet_root(path, 1)
+    styles = _styles_root(path)
+
+    assert root.find(".//main:c[@r='H2']", NS).attrib["s"] == "20"
+    cell_formats = styles.findall("main:cellXfs/main:xf", NS)
+    assert cell_formats[20].attrib["fontId"] == "8"
+    fonts = styles.findall("main:fonts/main:font", NS)
+    assert fonts[8].find("main:color", NS).attrib["rgb"] == "FFFF0000"
+
+
 def test_labels_sheet_follows_campaign_suffixed_cost_summary(tmp_path):
     path = tmp_path / "report.xlsx"
 

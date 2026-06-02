@@ -134,6 +134,16 @@ def _cell_style_for_sheet_value(
         metric = str(row[1] if len(row) > 1 else "")
         if metric == "Total Chargeable Cost":
             return 9
+    if sheet_name == "Summary" and len(row) > 4:
+        sku_block_value = str(row[4] or "")
+        if sku_block_value in {"SKU Intake Summary", "SKU"} and column_index >= 4:
+            return 2
+        if header == "Remaining":
+            try:
+                if float(row[column_index] or 0) < 0:
+                    return 20
+            except (TypeError, ValueError):
+                pass
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee (USD)", "Express (USD)"}:
         return 19
     return None
@@ -857,7 +867,7 @@ def _styles_xml() -> str:
         '<numFmt numFmtId="164" formatCode="$#,##0.00&quot; (USD)&quot;"/>'
         '<numFmt numFmtId="165" formatCode="$#,##0.00"/>'
         '</numFmts>'
-        '<fonts count="8">'
+        '<fonts count="9">'
         '<font><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><sz val="12"/><name val="Calibri"/></font>'
@@ -866,6 +876,7 @@ def _styles_xml() -> str:
         '<font><b/><sz val="16"/><name val="Calibri"/></font>'
         '<font><b/><sz val="25"/><name val="Calibri"/></font>'
         '<font><b/><sz val="16"/><name val="Calibri"/></font>'
+        '<font><color rgb="FFFF0000"/><sz val="11"/><name val="Calibri"/></font>'
         "</fonts>"
         '<fills count="3">'
         '<fill><patternFill patternType="none"/></fill>'
@@ -878,7 +889,7 @@ def _styles_xml() -> str:
         '<border><left style="thick"><color auto="1"/></left><right style="thick"><color auto="1"/></right><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
         '</borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="20">'
+        '<cellXfs count="21">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
@@ -899,6 +910,7 @@ def _styles_xml() -> str:
         '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
         '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+        '<xf numFmtId="0" fontId="8" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"

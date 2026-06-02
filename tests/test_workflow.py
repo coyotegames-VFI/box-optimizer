@@ -44,6 +44,50 @@ def _order_line(order_id: str, sku: str, quantity: int = 1) -> OrderLine:
     return OrderLine(order_id=order_id, raw_sku=sku, canonical_sku=sku, quantity=quantity)
 
 
+def test_vfi_intake_received_column_maps_quantity_aliases_for_reporting():
+    rows = workflow_module._vfi_intake_form_rows_with_received(
+        [
+            {"SKU": "CORE", "quantity": "100"},
+            {"SKU": "EXP", "Quantity": "25"},
+            {"SKU": "TOKEN", "数量": "12"},
+            {"SKU": "ADDON", "Stock Received": "7"},
+        ]
+    )
+
+    assert [row["Received"] for row in rows] == ["100", "25", "12", "7"]
+
+
+def test_sku_intake_summary_rows_include_intake_and_order_skus_with_remaining_quantities():
+    sku_items = [
+        _sku_item("CORE", Dimensions(10, 10, 2)),
+        _sku_item("INTAKEONLY", Dimensions(5, 5, 1)),
+    ]
+    order_lines = [
+        _order_line("1", "CORE", 2),
+        _order_line("2", "CORE", 3),
+        _order_line("3", "ORDERONLY", 4),
+    ]
+    intake_rows = workflow_module._vfi_intake_form_rows_with_received(
+        [
+            {"SKU": "CORE", "quantity": "10"},
+            {"SKU": "INTAKEONLY", "quantity": "6"},
+        ]
+    )
+
+    rows = workflow_module._sku_intake_summary_rows(sku_items, order_lines, intake_rows)
+    by_sku = {row["SKU"]: row for row in rows}
+
+    assert list(by_sku) == ["CORE", "INTAKEONLY", "ORDERONLY"]
+    assert by_sku["CORE"]["Received Quantity"] == 10
+    assert by_sku["CORE"]["Required Quantity"] == 5
+    assert by_sku["CORE"]["Remaining"] == 5
+    assert by_sku["INTAKEONLY"]["Required Quantity"] == 0
+    assert by_sku["INTAKEONLY"]["Remaining"] == 6
+    assert by_sku["ORDERONLY"]["Received Quantity"] == 0
+    assert by_sku["ORDERONLY"]["Required Quantity"] == 4
+    assert by_sku["ORDERONLY"]["Remaining"] == -4
+
+
 def test_similar_footprint_items_bundle_before_padding_once():
     sku_lookup = {
         "A": _sku_item("A", Dimensions(30, 25, 6.5), 0.4),
@@ -348,6 +392,15 @@ def _sheet_xml(path: Path, sheet_name: str) -> str:
     raise AssertionError(f"Sheet not found: {sheet_name}")
 
 
+def _inline_cell_text(sheet_xml: str, reference: str) -> str:
+    root = ElementTree.fromstring(sheet_xml)
+    cell = root.find(f".//main:c[@r='{reference}']", _NS)
+    if cell is None:
+        return ""
+    text = cell.find(".//main:t", _NS)
+    return "" if text is None else text.text or ""
+
+
 def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
@@ -426,6 +479,74 @@ def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path
     assert order_volume_rows[0]["US State Abbreviation"] == "CA"
     assert order_volume_rows[0]["Pledge Level"] == "Deluxe"
     assert order_volume_rows[0]["SKU Breakdown"] == "CORE GAME x1"
+
+
+def test_output_workbook_includes_received_intake_column_and_sku_intake_summary(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized_shipping_plan.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {
+                "SKU": "CORE",
+                "Product Name": "Core Game",
+                "Length": "5",
+                "Width": "5",
+                "Height": "5",
+                "Weight kg": "1",
+                "quantity": "10",
+            },
+            {
+                "SKU": "EXTRA",
+                "Product Name": "Extra Item",
+                "Length": "2",
+                "Width": "2",
+                "Height": "2",
+                "Weight kg": "0.1",
+                "quantity": "6",
+            },
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1001", "SKU": "CORE", "Quantity": "2", "Country": "US"},
+            {"Order ID": "1002", "SKU": "CORE", "Quantity": "3", "Country": "US"},
+            {"Order ID": "1003", "SKU": "ORDERONLY", "Quantity": "4", "Country": "US"},
+        ],
+    )
+
+    optimize_workbook(
+        sku_master_path=str(sku_master_path),
+        orders_path=str(orders_path),
+        output_path=str(output_path),
+        config={},
+    )
+
+    intake_rows = _sheet_rows(output_path, "VFI Intake Form")
+    assert intake_rows[0]["Received"] == "10"
+    assert intake_rows[1]["Received"] == "6"
+
+    summary_rows = _sheet_rows(output_path, "Summary")
+    assert any(row["SKU"] == "SKU Intake Summary" for row in summary_rows)
+    summary_xml = _sheet_xml(output_path, "Summary")
+    assert _inline_cell_text(summary_xml, "E2") == "SKU Intake Summary"
+    assert _inline_cell_text(summary_xml, "E3") == "SKU"
+    assert _inline_cell_text(summary_xml, "F3") == "Received Quantity"
+    assert _inline_cell_text(summary_xml, "G3") == "Required Quantity"
+    assert _inline_cell_text(summary_xml, "H3") == "Remaining"
+    summary_by_sku = {row["SKU"]: row for row in summary_rows if row.get("SKU") in {"CORE", "EXTRA", "ORDERONLY"}}
+
+    assert int(summary_by_sku["CORE"]["Received Quantity"]) == 10
+    assert int(summary_by_sku["CORE"]["Required Quantity"]) == 5
+    assert int(summary_by_sku["CORE"]["Remaining"]) == 5
+    assert int(summary_by_sku["EXTRA"]["Received Quantity"]) == 6
+    assert int(summary_by_sku["EXTRA"]["Required Quantity"]) == 0
+    assert int(summary_by_sku["EXTRA"]["Remaining"]) == 6
+    assert int(summary_by_sku["ORDERONLY"]["Received Quantity"]) == 0
+    assert int(summary_by_sku["ORDERONLY"]["Required Quantity"]) == 4
+    assert int(summary_by_sku["ORDERONLY"]["Remaining"]) == -4
 
 
 def test_optimize_workbook_returns_config_warnings_for_unsupported_overrides(tmp_path):
