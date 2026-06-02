@@ -205,6 +205,26 @@ def test_labels_sheet_follows_campaign_suffixed_cost_summary(tmp_path):
     assert sheet_names.count("Cost Summary - Sordane") == 1
 
 
+def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        sheets={"Cost Summary - Sordane": [{"Order ID": "1", "Hub Shipping Fee": 12}]},
+        labels_rows=[{"Label Number": "39", "Barcode/QR Value": "OPR 39"}],
+        country_scan_sheets={
+            "Hong Kong": [{"Country Number": "Hong Kong 1", "VFI #": "39", "Barcode Value": "OPR 39"}],
+            "Singapore": [{"Country Number": "Singapore 1", "VFI #": "40", "Barcode Value": "OPR 40"}],
+        },
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+
+    assert sheet_names[1:5] == ["Cost Summary - Sordane", "Labels", "Hong Kong", "Singapore"]
+    hong_kong_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Hong Kong")
+    assert hong_kong_rows == [{"Country Number": "Hong Kong 1", "VFI #": "39", "Barcode Value": "OPR 39"}]
+
+
 def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
     path = tmp_path / "report.xlsx"
 

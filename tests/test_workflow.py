@@ -2586,6 +2586,41 @@ def test_country_scan_sheets_group_barcode_values_by_country_in_label_order():
     assert "Bad_Name 2" in sheets
 
 
+def test_country_scan_sheets_sort_country_numbers_numerically_and_keep_barcodes_paired():
+    sheets = workflow_module._country_scan_sheets(
+        [
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 10", "Label Number": "10", "Label numbers": "VEST 10"},
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 1", "Label Number": "1", "Label numbers": "VEST 1"},
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 3", "Label Number": "3", "Label numbers": "VEST 3"},
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 2", "Label Number": "2", "Label numbers": "VEST 2"},
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 21-2", "Label Number": "21-2", "Label numbers": "VEST 21-2"},
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 22-1", "Label Number": "22-1", "Label numbers": "VEST 22-1"},
+            {"Country Name": "Hong Kong", "Country Number": "Hong Kong 21-1", "Label Number": "21-1", "Label numbers": "VEST 21-1"},
+        ]
+    )
+
+    hong_kong_rows = sheets["Hong Kong"]
+
+    assert [row["Country Number"] for row in hong_kong_rows] == [
+        "Hong Kong 1",
+        "Hong Kong 2",
+        "Hong Kong 3",
+        "Hong Kong 10",
+        "Hong Kong 21-1",
+        "Hong Kong 21-2",
+        "Hong Kong 22-1",
+    ]
+    assert [row["Barcode Value"] for row in hong_kong_rows] == [
+        "VEST 1",
+        "VEST 2",
+        "VEST 3",
+        "VEST 10",
+        "VEST 21-1",
+        "VEST 21-2",
+        "VEST 22-1",
+    ]
+
+
 def test_label_generator_populates_simplified_chinese_country_from_two_letter_code():
     rows = workflow_module._label_generator_rows(
         [

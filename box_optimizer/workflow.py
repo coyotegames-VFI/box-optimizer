@@ -4366,23 +4366,38 @@ def _country_scan_sheet_name(country: object, used: set[str]) -> str:
     return name
 
 
+def _country_number_sort_key(country_number: object, original_index: int) -> tuple[str, int, int, int]:
+    text = str(country_number or "").strip()
+    match = re.match(r"^(?P<country>.*?)(?P<sequence>\d+)(?:-(?P<suffix>\d+))?\s*$", text)
+    if not match:
+        return (text.casefold(), 10**9, 10**9, original_index)
+    country = match.group("country").strip().casefold()
+    sequence = int(match.group("sequence"))
+    suffix_text = match.group("suffix")
+    suffix = int(suffix_text) if suffix_text is not None else 0
+    return (country, sequence, suffix, original_index)
+
+
 def _country_scan_sheets(label_rows: list[dict]) -> dict[str, list[dict]]:
     sheets: dict[str, list[dict]] = {}
     name_by_country: dict[str, str] = {}
     used_names = set()
-    for row in label_rows:
+    original_indexes: dict[int, int] = {}
+    for original_index, row in enumerate(label_rows):
         country = _country_sequence_display(_first_present(row, ["Country", "Country Name"]))
         key = country.casefold()
         if key not in name_by_country:
             name_by_country[key] = _country_scan_sheet_name(country, used_names)
             sheets[name_by_country[key]] = []
-        sheets[name_by_country[key]].append(
-            {
-                "Country Number": row.get("Country Number", ""),
-                "VFI #": row.get("Label Number", ""),
-                "Barcode Value": row.get("Label numbers", ""),
-            }
-        )
+        scan_row = {
+            "Country Number": row.get("Country Number", ""),
+            "VFI #": row.get("Label Number", ""),
+            "Barcode Value": row.get("Label numbers", ""),
+        }
+        original_indexes[id(scan_row)] = original_index
+        sheets[name_by_country[key]].append(scan_row)
+    for rows in sheets.values():
+        rows.sort(key=lambda row: _country_number_sort_key(row.get("Country Number", ""), original_indexes[id(row)]))
     return sheets
 
 
