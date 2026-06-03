@@ -3300,15 +3300,35 @@ def _backup_vendor_box_text(assignment: StandardizedBoxAssignment) -> str:
     return f"VB{assignment.backup_vendor_box_id} / {dimension_text}"
 
 
+INTAKE_SUMMARY_METADATA_ORDER = [
+    "Campaign Name",
+    "Commodity",
+    "Invoices To",
+    "Accounting Email",
+    "Email #2",
+    "Email #3",
+    "Email #4",
+    "Address Line 1",
+    "Address Line 2",
+    "Postal Code",
+    "Country",
+    "VAT/EORI/TAX ID",
+    "Additional Information",
+    "Inbound Fee",
+]
+
+
 def _clean_summary_rows(
     result: dict,
     box_size_rows: list[dict],
     unmatched_rows: list[dict],
     sku_rules: dict[str, SKUCampaignRule],
     factory_name: str = "",
+    intake_summary_metadata: dict[str, str] | None = None,
     country_package_count_rows: list[dict] | None = None,
     sku_intake_summary_rows: list[dict] | None = None,
 ) -> list[dict]:
+    intake_summary_metadata = intake_summary_metadata or {}
     rows = [
         {
             "Section": "Run Summary",
@@ -3319,20 +3339,29 @@ def _clean_summary_rows(
         {"Section": "Run Summary", "Metric": "Boxes Created", "Value": result["boxes_created"], "Detail": ""},
         {"Section": "Run Summary", "Metric": "Box Types", "Value": result["box_types"], "Detail": ""},
         {"Section": "Run Summary", "Metric": "Unmatched SKUs", "Value": result["unmatched_skus"], "Detail": ""},
-        {"Section": "Run Summary", "Metric": "Factory", "Value": factory_name, "Detail": ""},
-        {
+    ]
+    for label in INTAKE_SUMMARY_METADATA_ORDER:
+        value = str(intake_summary_metadata.get(label, "") or "").strip()
+        if value:
+            rows.append({"Section": "Run Summary", "Metric": label, "Value": value, "Detail": ""})
+    if factory_name:
+        rows.append({"Section": "Run Summary", "Metric": "Factory", "Value": factory_name, "Detail": ""})
+    rows.extend(
+        [
+            {
             "Section": "Run Summary",
             "Metric": "Output Mode",
             "Value": result.get("workbook_output_mode", "Admin"),
             "Detail": "",
-        },
-        {
+            },
+            {
             "Section": "Cost Placeholder",
             "Metric": "Total Chargeable Cost",
             "Value": result.get("total_shipping_cost", "Pending rate integration"),
             "Detail": result.get("total_shipping_cost_detail", "Hub Shipping Fee + Express") if "total_shipping_cost" in result else "",
-        },
-    ]
+            },
+        ]
+    )
     rows.append(
         {
             "Section": "Rate Sheet",
@@ -4864,6 +4893,18 @@ def _factory_name_from_vfi_intake_sources(source_rows) -> str:
     return ""
 
 
+def _intake_summary_metadata_from_vfi_intake_sources(source_rows) -> dict[str, str]:
+    summary_metadata: dict[str, str] = {}
+    for source in source_rows or []:
+        metadata = getattr(source, "metadata", {}) or {}
+        intake_metadata = metadata.get("intake_summary_metadata", {}) or {}
+        for label in INTAKE_SUMMARY_METADATA_ORDER:
+            value = str(intake_metadata.get(label, "") or "").strip()
+            if value and label not in summary_metadata:
+                summary_metadata[label] = value
+    return summary_metadata
+
+
 def _factory_name_from_vfi_intake_rows(rows: list[dict]) -> str:
     for row in rows:
         for key, value in row.items():
@@ -5465,20 +5506,43 @@ def _with_vfi_numbers(rows: list[dict], vfi_by_order: dict[str, str]) -> list[di
 
 def _combo_entries_for_optimized_to_pack(box_rows: list[dict]) -> list[tuple[str, dict]]:
     combos: dict[str, dict] = {}
-    for row in box_rows:
+    for row_index, row in enumerate(box_rows):
         combo = row["SKU Breakdown"]
         entry = combos.setdefault(
             combo,
             {
                 "order_ids": set(),
                 "boxes": defaultdict(list),
+                "countries": [],
+                "first_index": row_index,
             },
         )
         entry["order_ids"].add(row["Order ID"])
         entry["boxes"][int(float(row["Box Number"]))].append(row)
+        country = _normalize_country(row.get("Country", ""))
+        if country:
+            entry["countries"].append(country)
+
+    def single_order_country_key(entry: dict) -> tuple[int, str]:
+        country = next((str(country).strip() for country in entry.get("countries", []) if str(country).strip()), "")
+        return (1, "") if not country else (0, country.casefold())
+
+    def sort_key(item: tuple[str, dict]) -> tuple:
+        combo, entry = item
+        order_count = len(entry["order_ids"])
+        if order_count > 1:
+            return (0, -order_count, combo)
+        return (
+            1,
+            *single_order_country_key(entry),
+            combo,
+            sorted(str(order_id) for order_id in entry["order_ids"]),
+            entry.get("first_index", 0),
+        )
+
     return sorted(
         combos.items(),
-        key=lambda item: (-len(item[1]["order_ids"]), item[0]),
+        key=sort_key,
     )
 
 
@@ -6157,6 +6221,7 @@ def optimize_workbook(
         vfi_intake_form_rows,
     )
     factory_name = _factory_name_from_vfi_intake_sources(vfi_intake_sources)
+    intake_summary_metadata = _intake_summary_metadata_from_vfi_intake_sources(vfi_intake_sources)
     labels_rows = _labels_rows(
         label_generator_rows,
         cfg,
@@ -6179,6 +6244,7 @@ def optimize_workbook(
             unmatched_rows,
             sku_rules,
             factory_name=factory_name,
+            intake_summary_metadata=intake_summary_metadata,
             country_package_count_rows=_country_package_count_rows(operational_box_rows),
             sku_intake_summary_rows=sku_intake_summary_rows,
         ),

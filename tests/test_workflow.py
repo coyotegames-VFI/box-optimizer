@@ -88,6 +88,59 @@ def test_sku_intake_summary_rows_include_intake_and_order_skus_with_remaining_qu
     assert by_sku["ORDERONLY"]["Remaining"] == -4
 
 
+def test_single_order_configurations_sort_by_country_after_repeated_configurations():
+    box_rows = [
+        {"Order ID": "R1", "Box Number": 1, "SKU Breakdown": "REPEAT A x1", "Country": "Japan", "Box Type": "VB 1", "Chargeable Weight kg": 2},
+        {"Order ID": "R2", "Box Number": 1, "SKU Breakdown": "REPEAT A x1", "Country": "China", "Box Type": "VB 1", "Chargeable Weight kg": 2},
+        {"Order ID": "R3", "Box Number": 1, "SKU Breakdown": "REPEAT A x1", "Country": "Hong Kong", "Box Type": "VB 1", "Chargeable Weight kg": 2},
+        {"Order ID": "R4", "Box Number": 1, "SKU Breakdown": "REPEAT B x1", "Country": "Singapore", "Box Type": "VB 2", "Chargeable Weight kg": 3},
+        {"Order ID": "R5", "Box Number": 1, "SKU Breakdown": "REPEAT B x1", "Country": "Malaysia", "Box Type": "VB 2", "Chargeable Weight kg": 3},
+        {"Order ID": "S1", "Box Number": 1, "SKU Breakdown": "ALPHA JAPAN x1", "Country": "Japan", "Box Type": "VB 3", "Chargeable Weight kg": 4},
+        {"Order ID": "S2", "Box Number": 1, "SKU Breakdown": "OMEGA CHINA B x1", "Country": "China", "Box Type": "VB 4", "Chargeable Weight kg": 5},
+        {"Order ID": "S3", "Box Number": 1, "SKU Breakdown": "BETA HONG KONG x1", "Country": "Hong Kong", "Box Type": "VB 5", "Chargeable Weight kg": 6},
+        {"Order ID": "S4", "Box Number": 1, "SKU Breakdown": "DELTA CHINA A x1", "Country": "China", "Box Type": "VB 6", "Chargeable Weight kg": 7},
+        {"Order ID": "S5", "Box Number": 1, "SKU Breakdown": "AAA MISSING COUNTRY x1", "Country": "", "Box Type": "VB 7", "Chargeable Weight kg": 8},
+    ]
+
+    ordered_combos = [combo for combo, _entry in workflow_module._combo_entries_for_optimized_to_pack(box_rows)]
+    pledge_config_by_combo = workflow_module._pledge_config_by_combo(box_rows)
+
+    assert ordered_combos == [
+        "REPEAT A x1",
+        "REPEAT B x1",
+        "DELTA CHINA A x1",
+        "OMEGA CHINA B x1",
+        "BETA HONG KONG x1",
+        "ALPHA JAPAN x1",
+        "AAA MISSING COUNTRY x1",
+    ]
+    assert pledge_config_by_combo == {
+        "REPEAT A x1": 1,
+        "REPEAT B x1": 2,
+        "DELTA CHINA A x1": 3,
+        "OMEGA CHINA B x1": 4,
+        "BETA HONG KONG x1": 5,
+        "ALPHA JAPAN x1": 6,
+        "AAA MISSING COUNTRY x1": 7,
+    }
+    label_rows = workflow_module._label_generator_rows(box_rows, pledge_config_by_combo)
+    config_by_order = {row["Order ID"]: row["Pledge Configuration"] for row in label_rows}
+    assert config_by_order["S4"] == 3
+    assert config_by_order["S2"] == 4
+    assert config_by_order["S3"] == 5
+    assert config_by_order["S1"] == 6
+    assert config_by_order["S5"] == 7
+
+    ordered_entries = workflow_module._combo_entries_for_optimized_to_pack(box_rows)
+    all_order_ids = sorted(order_id for _combo, entry in ordered_entries for order_id in entry["order_ids"])
+    all_box_types = sorted(row["Box Type"] for _combo, entry in ordered_entries for rows in entry["boxes"].values() for row in rows)
+    all_weights = sorted(row["Chargeable Weight kg"] for _combo, entry in ordered_entries for rows in entry["boxes"].values() for row in rows)
+
+    assert all_order_ids == [row["Order ID"] for row in sorted(box_rows, key=lambda row: row["Order ID"])]
+    assert all_box_types == [row["Box Type"] for row in sorted(box_rows, key=lambda row: row["Box Type"])]
+    assert all_weights == [row["Chargeable Weight kg"] for row in sorted(box_rows, key=lambda row: row["Chargeable Weight kg"])]
+
+
 def test_similar_footprint_items_bundle_before_padding_once():
     sku_lookup = {
         "A": _sku_item("A", Dimensions(30, 25, 6.5), 0.4),
@@ -258,7 +311,7 @@ def _write_xlsx(path: Path, sheet_name: str, rows: list[dict]) -> None:
     xml_rows = []
     for row_number, row_values in enumerate(table, start=1):
         cells = [
-            _inline_cell(chr(ord("A") + column), row_number, value)
+            _inline_cell(excel_writer_module._column_letter(column), row_number, value)
             for column, value in enumerate(row_values)
         ]
         xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
@@ -293,7 +346,7 @@ def _write_xlsx_table(path: Path, sheet_name: str, table: list[list[object]]) ->
     xml_rows = []
     for row_number, row_values in enumerate(table, start=1):
         cells = [
-            _inline_cell(chr(ord("A") + column), row_number, value)
+            _inline_cell(excel_writer_module._column_letter(column), row_number, value)
             for column, value in enumerate(row_values)
         ]
         xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
@@ -332,7 +385,7 @@ def _write_xlsx_tables(path: Path, sheets: dict[str, list[list[object]]]) -> Non
         xml_rows = []
         for row_number, row_values in enumerate(table, start=1):
             cells = [
-                _inline_cell(chr(ord("A") + column), row_number, value)
+                _inline_cell(excel_writer_module._column_letter(column), row_number, value)
                 for column, value in enumerate(row_values)
             ]
             xml_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
@@ -369,6 +422,13 @@ def _write_xlsx_tables(path: Path, sheets: dict[str, list[list[object]]]) -> Non
         archive.writestr("xl/_rels/workbook.xml.rels", rels)
         for worksheet_path, worksheet_xml in worksheet_payloads:
             archive.writestr(worksheet_path, worksheet_xml)
+
+
+def _wide_row(width: int, values: dict[int, object]) -> list[object]:
+    row = [""] * width
+    for index, value in values.items():
+        row[index] = value
+    return row
 
 
 def _sheet_rows(path: Path, sheet_name: str) -> list[dict]:
@@ -4791,6 +4851,110 @@ def test_factory_name_detects_header_or_adjacent_vfi_intake_value():
     assert workflow_module._factory_name_from_vfi_intake_rows(
         [{"SKU": "CORE"}]
     ) == ""
+
+
+def test_intake_client_invoice_metadata_detects_raw_cells_far_to_the_right(tmp_path):
+    sku_master_path = tmp_path / "sku_master.xlsx"
+    _write_xlsx_table(
+        sku_master_path,
+        "stock",
+        [
+            _wide_row(43, {0: "SKU", 1: "Item name", 2: "Weight/g", 3: "L-cm", 4: "W-cm", 5: "H-cm"}),
+            _wide_row(43, {0: "CORE", 1: "Core Game", 2: "1000", 3: "10", 4: "8", 5: "4"}),
+            _wide_row(
+                43,
+                {
+                    8: "Address Line 1:",
+                    10: "123 Client Street",
+                    11: "FACTORY",
+                    12: "WHATZ",
+                    13: "VFI USE",
+                    14: "Internal review only",
+                    15: "Inbound Fee:",
+                    16: "$12.50",
+                    36: "CAMPAIGN NAME:",
+                    38: "Far Right Campaign",
+                    39: "Commodity:",
+                    40: "Board Games",
+                    41: "Accounting EMAIL:",
+                    42: "accounting@example.com",
+                },
+            ),
+        ],
+    )
+
+    source = read_workbook(str(sku_master_path))[0]
+    metadata = source.metadata["intake_summary_metadata"]
+
+    assert metadata["Campaign Name"] == "Far Right Campaign"
+    assert metadata["Commodity"] == "Board Games"
+    assert metadata["Address Line 1"] == "123 Client Street"
+    assert metadata["Factory"] == "WHATZ"
+    assert metadata["VFI Use"] == "Internal review only"
+    assert metadata["Inbound Fee"] == "$12.50"
+    assert metadata["Accounting Email"] == "accounting@example.com"
+    assert source.metadata["factory_name"] == "WHATZ"
+
+
+def test_intake_client_invoice_metadata_appears_in_summary_before_factory(tmp_path):
+    sku_master_path = tmp_path / "sku_master.xlsx"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_xlsx_table(
+        sku_master_path,
+        "stock",
+        [
+            _wide_row(44, {0: "SKU", 1: "Item name", 2: "Weight/g", 3: "L-cm", 4: "W-cm", 5: "H-cm"}),
+            _wide_row(44, {0: "CORE", 1: "Core Game", 2: "1000", 3: "10", 4: "8", 5: "4"}),
+            _wide_row(
+                44,
+                {
+                    7: "Country:",
+                    8: "United States",
+                    9: "VAT/EORI/TAX ID:",
+                    10: "VAT-123",
+                    11: "EMAIL #3:",
+                    36: "INVOICES TO:",
+                    37: "Client Finance",
+                    38: "EMAIL #2:",
+                    39: "finance2@example.com",
+                    40: "Additional Information:",
+                    41: "Use PO 456",
+                    42: "FACTORY",
+                    43: "WHATZ",
+                },
+            ),
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [{"Order ID": "1", "SKU": "CORE", "Quantity": "1", "Backer ID": "B-1", "Name": "Ada"}],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"packing_mode": "fast", "preserve_region_sheets": False},
+    )
+
+    run_summary_rows = [row for row in _sheet_rows(output_path, "Summary") if row["Section"] == "Run Summary"]
+    metrics = [row["Metric"] for row in run_summary_rows]
+    values = {row["Metric"]: row["Value"] for row in run_summary_rows}
+
+    assert metrics.index("Invoices To") < metrics.index("Email #2") < metrics.index("Country")
+    assert metrics.index("Additional Information") < metrics.index("Factory")
+    assert "Email #3" not in metrics
+    assert values["Invoices To"] == "Client Finance"
+    assert values["Email #2"] == "finance2@example.com"
+    assert values["Country"] == "United States"
+    assert values["VAT/EORI/TAX ID"] == "VAT-123"
+    assert values["Additional Information"] == "Use PO 456"
+    assert values["Factory"] == "WHATZ"
+
+    optimized_rows = _sheet_rows(output_path, "Optimized to Pack")
+    assert optimized_rows[0]["Total Pledges"] == "1"
+    assert "CORE x1" in optimized_rows[0]["All Items"]
 
 
 def test_adjacent_factory_metadata_appears_in_labels_header(tmp_path):

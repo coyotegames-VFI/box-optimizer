@@ -364,16 +364,59 @@ def _preserved_sheet_rows(table: list[list[object]]) -> list[dict]:
     ]
 
 
+_INTAKE_METADATA_LABELS = {
+    "campaignname": ("Campaign Name", "campaign_name"),
+    "commodity": ("Commodity", "commodity"),
+    "factory": ("Factory", "factory_name"),
+    "invoicesto": ("Invoices To", "invoices_to"),
+    "accountingemail": ("Accounting Email", "accounting_email"),
+    "email2": ("Email #2", "email_2"),
+    "email3": ("Email #3", "email_3"),
+    "email4": ("Email #4", "email_4"),
+    "addressline1": ("Address Line 1", "address_line_1"),
+    "addressline2": ("Address Line 2", "address_line_2"),
+    "postalcode": ("Postal Code", "postal_code"),
+    "country": ("Country", "country"),
+    "vateoritaxid": ("VAT/EORI/TAX ID", "vat_eori_tax_id"),
+    "additionalinformation": ("Additional Information", "additional_information"),
+    "vfiuse": ("VFI Use", "vfi_use"),
+    "inboundfee": ("Inbound Fee", "inbound_fee"),
+}
+
+
+def _intake_metadata_label_key(value: object) -> str:
+    text = str(value or "").strip().casefold()
+    text = re.sub(r":+\s*$", "", text)
+    return re.sub(r"[^0-9a-z]+", "", text)
+
+
+def _nearest_non_empty_right(row: list[object], index: int) -> str:
+    for value in row[index + 1 :]:
+        text = str(value or "").strip()
+        if text:
+            if _intake_metadata_label_key(text) in _INTAKE_METADATA_LABELS:
+                return ""
+            return text
+    return ""
+
+
 def _sheet_key_value_metadata(table: list[list[object]]) -> dict:
     metadata = {}
+    intake_metadata = {}
     for row in table:
-        for index, value in enumerate(row[:-1]):
-            key = str(value or "").strip()
-            if normalize_column_name(key) != "factory":
+        for index, value in enumerate(row):
+            label = _INTAKE_METADATA_LABELS.get(_intake_metadata_label_key(value))
+            if not label:
                 continue
-            factory_value = str(row[index + 1] or "").strip()
-            if factory_value:
-                metadata["factory_name"] = factory_value
+            display_label, metadata_key = label
+            metadata_value = _nearest_non_empty_right(row, index)
+            if not metadata_value:
+                continue
+            if metadata_key == "factory_name":
+                metadata.setdefault("factory_name", metadata_value)
+            intake_metadata.setdefault(display_label, metadata_value)
+    if intake_metadata:
+        metadata["intake_summary_metadata"] = intake_metadata
     return metadata
 
 
