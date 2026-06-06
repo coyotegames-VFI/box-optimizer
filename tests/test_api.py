@@ -673,6 +673,8 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     assert 'name="campaign_name"' in response.text
     assert 'name="packing_mode_choice"' in response.text
     assert 'name="ship_as_is_skus"' in response.text
+    assert 'name="separate_playmat_charge_skus"' in response.text
+    assert "separate_playmat_charge_amount" not in response.text
     assert 'name="no_padding_skus"' in response.text
     assert 'name="wrap_around_skus"' in response.text
     assert 'name="compressible_skus"' in response.text
@@ -682,6 +684,7 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     assert "recommended for Railway uploads" in response.text
     assert "Campaign setup" in response.text
     assert "Ship-as-is / do not touch packages" in response.text
+    assert "Separate Playmat Charge SKUs" in response.text
     assert 'value="railway_fast" selected' in response.text
     assert "Vendor measured-fit mode" not in response.text
     assert 'name="vendor_flex_mode"' not in response.text
@@ -1176,6 +1179,7 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
             "campaign_notes": "Internal note",
             "packing_mode_choice": "local_power_balanced_300",
             "ship_as_is_skus": "SHIP-001",
+            "separate_playmat_charge_skus": "PLAYMAT-CHARGE",
             "no_padding_skus": "DICE-001",
             "wrap_around_skus": "PLAYMAT-001",
             "wrapped_height_cm": "5",
@@ -1196,6 +1200,15 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
         "ships_alone": True,
         "can_mix_with_other_items": False,
         "box_type": "SHIP-001 shipping carton",
+    }
+    assert config["separate_playmat_charge_skus"] == ["PLAYMAT-CHARGE"]
+    assert config["sku_rules"]["PLAYMAT-CHARGE"] == {
+        "prepacked": True,
+        "no_padding": True,
+        "ships_alone": True,
+        "can_mix_with_other_items": False,
+        "separate_playmat_charge": True,
+        "box_type": "PLAYMAT-CHARGE separate playmat parcel",
     }
     assert config["sku_rules"]["DICE-001"] == {"no_padding": True}
     assert config["sku_rules"]["PLAYMAT-001"] == {

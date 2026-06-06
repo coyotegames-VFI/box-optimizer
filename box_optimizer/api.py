@@ -351,6 +351,9 @@ def _parse_config(config_json: str | dict[str, Any] | None) -> dict:
         raise HTTPException(status_code=400, detail='output_granularity must be "order_summary" or "box_detail"')
     if "sku_rules" in parsed and not isinstance(parsed["sku_rules"], dict):
         raise HTTPException(status_code=400, detail="sku_rules must be a JSON object")
+    if "separate_playmat_charge_skus" in parsed and parsed["separate_playmat_charge_skus"] is not None:
+        if not isinstance(parsed["separate_playmat_charge_skus"], list):
+            raise HTTPException(status_code=400, detail="separate_playmat_charge_skus must be a JSON array")
     if "box_menu" in parsed and not isinstance(parsed["box_menu"], list):
         raise HTTPException(status_code=400, detail="box_menu must be a JSON array")
     if "order_rules" in parsed and not isinstance(parsed["order_rules"], list):
@@ -422,6 +425,7 @@ def _structured_upload_config(
     campaign_notes: str | None = None,
     packing_mode_choice: str | None = None,
     ship_as_is_skus: str | None = None,
+    separate_playmat_charge_skus: str | None = None,
     no_padding_skus: str | None = None,
     wrap_around_skus: str | None = None,
     wrapped_height_cm: str | float | int | None = None,
@@ -449,6 +453,21 @@ def _structured_upload_config(
             "can_mix_with_other_items": False,
             "box_type": f"{sku} shipping carton",
         }
+    playmat_skus = _form_lines(separate_playmat_charge_skus)
+    if playmat_skus:
+        config["separate_playmat_charge_skus"] = playmat_skus
+        for sku in playmat_skus:
+            sku_rules[sku] = _merge_config(
+                sku_rules.get(sku, {}),
+                {
+                    "prepacked": True,
+                    "no_padding": True,
+                    "ships_alone": True,
+                    "can_mix_with_other_items": False,
+                    "separate_playmat_charge": True,
+                    "box_type": f"{sku} separate playmat parcel",
+                },
+            )
     for sku in _form_lines(no_padding_skus):
         sku_rules[sku] = _merge_config(sku_rules.get(sku, {}), {"no_padding": True})
     wrapped_height = _form_float(wrapped_height_cm, 4.0)
@@ -752,6 +771,10 @@ def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> 
     <label for="ship_as_is_box_type">Friendly box type label for ship-as-is items</label>
     <input id="ship_as_is_box_type" name="ship_as_is_box_type" type="text" placeholder="Example: Final factory shipping carton">
 
+    <label for="separate_playmat_charge_skus">Separate Playmat Charge SKUs</label>
+    <p class="help">Use for playmat SKUs that ship as their own no-touch parcel and receive the fixed $6 package weight charge per unit.</p>
+    <textarea id="separate_playmat_charge_skus" name="separate_playmat_charge_skus" placeholder="PLAYMAT-001&#10;PLAYMAT-002"></textarea>
+
     <label for="no_padding_skus">No-padding items</label>
     <p class="help">Use when the item does not need item-level padding. It may still share a box with other items unless another rule prevents mixing.</p>
     <textarea id="no_padding_skus" name="no_padding_skus" placeholder="SKU-003"></textarea>
@@ -868,6 +891,23 @@ def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> 
             };
             if (shipBoxType) rule.box_type = shipBoxType;
             applyRule(config, sku, rule);
+          });
+
+          var separatePlaymatSkus = lines("separate_playmat_charge_skus");
+          if (separatePlaymatSkus.length) {
+            config.separate_playmat_charge_skus = separatePlaymatSkus;
+          } else {
+            delete config.separate_playmat_charge_skus;
+          }
+          separatePlaymatSkus.forEach(function (sku) {
+            applyRule(config, sku, {
+              prepacked: true,
+              no_padding: true,
+              ships_alone: true,
+              can_mix_with_other_items: false,
+              separate_playmat_charge: true,
+              box_type: sku + " separate playmat parcel"
+            });
           });
 
           lines("no_padding_skus").forEach(function (sku) {
@@ -1260,6 +1300,7 @@ def upload_workbooks(
     campaign_notes: str | None = Form(default=None),
     packing_mode_choice: str | None = Form(default="railway_fast"),
     ship_as_is_skus: str | None = Form(default=None),
+    separate_playmat_charge_skus: str | None = Form(default=None),
     no_padding_skus: str | None = Form(default=None),
     wrap_around_skus: str | None = Form(default=None),
     wrapped_height_cm: str | None = Form(default=None),
@@ -1282,6 +1323,7 @@ def upload_workbooks(
         campaign_notes=campaign_notes,
         packing_mode_choice=packing_mode_choice,
         ship_as_is_skus=ship_as_is_skus,
+        separate_playmat_charge_skus=separate_playmat_charge_skus,
         no_padding_skus=no_padding_skus,
         wrap_around_skus=wrap_around_skus,
         wrapped_height_cm=wrapped_height_cm,

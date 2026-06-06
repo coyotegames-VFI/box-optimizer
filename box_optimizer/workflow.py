@@ -97,7 +97,10 @@ DEFAULT_CONFIG = {
     "vendor_box_fit_tolerance_guardrail": True,
     "vendor_box_fit_tolerance_max_chargeable_increase_kg": 1.0,
     "output_granularity": "order_summary",
+    "separate_playmat_charge_skus": [],
 }
+
+SEPARATE_PLAYMAT_CHARGE_AMOUNT = 6.0
 
 
 logger = logging.getLogger("box_optimizer")
@@ -181,6 +184,7 @@ class SKUCampaignRule:
     exclude_from_standardization: bool = False
     box_type: str | None = None
     warning_note: str = ""
+    separate_playmat_charge: bool = False
 
 
 _US_STATE_ABBREVIATIONS = {
@@ -727,6 +731,40 @@ def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
             exclude_from_standardization=_bool_from_config(rule.get("exclude_from_standardization"), False),
             box_type=rule.get("box_type"),
             warning_note=str(rule.get("warning_note", "") or ""),
+            separate_playmat_charge=_bool_from_config(rule.get("separate_playmat_charge"), False),
+        )
+    for key in config.get("separate_playmat_charge_skus") or []:
+        text_key = str(key or "").strip()
+        if not text_key:
+            continue
+        existing = parsed.get(text_key)
+        parsed[text_key] = SKUCampaignRule(
+            key=text_key,
+            no_padding=True,
+            prepacked=True,
+            ships_alone=True,
+            can_mix_with_other_items=False,
+            forced_box_cm=existing.forced_box_cm if existing else None,
+            must_stay_flat=existing.must_stay_flat if existing else False,
+            allow_rotation=existing.allow_rotation if existing else True,
+            allowed_orientations=existing.allowed_orientations if existing else None,
+            extra_padding_cm=existing.extra_padding_cm if existing else None,
+            wrap_around_largest_item=existing.wrap_around_largest_item if existing else False,
+            wrapped_height_cm=existing.wrapped_height_cm if existing else 4,
+            compressible=existing.compressible if existing else False,
+            compressed_height_ratio=existing.compressed_height_ratio if existing else 0.6,
+            compressed_volume_ratio=existing.compressed_volume_ratio if existing else 0.75,
+            exclude_from_standardization=existing.exclude_from_standardization if existing else False,
+            box_type=(existing.box_type if existing and existing.box_type else f"{text_key} separate playmat parcel"),
+            warning_note=" | ".join(
+                part
+                for part in [
+                    existing.warning_note if existing else "",
+                    "Separate playmat charge parcel.",
+                ]
+                if part
+            ),
+            separate_playmat_charge=True,
         )
     return parsed
 
@@ -2142,6 +2180,7 @@ def _rule_cache_signature(rule: SKUCampaignRule | None) -> dict:
         "exclude_from_standardization": rule.exclude_from_standardization,
         "box_type": rule.box_type,
         "warning_note": rule.warning_note,
+        "separate_playmat_charge": rule.separate_playmat_charge,
     }
 
 
@@ -2224,6 +2263,7 @@ def _config_cache_signature(cfg: dict) -> dict:
         "non_preferred_box_min_units": cfg.get("non_preferred_box_min_units"),
         "box_menu": cfg.get("box_menu"),
         "order_rules": cfg.get("order_rules"),
+        "separate_playmat_charge_skus": tuple(cfg.get("separate_playmat_charge_skus") or ()),
         "max_carton_cm": cfg.get("max_carton_cm"),
         "dimensional_divisor": cfg.get("dimensional_divisor"),
         "packing_weight_uplift": cfg.get("packing_weight_uplift"),
@@ -3256,6 +3296,8 @@ def _rule_summary(sku_rules: dict[str, SKUCampaignRule]) -> list[str]:
             flags.append(
                 f"compressible, height ratio {rule.compressed_height_ratio:g}, volume ratio {rule.compressed_volume_ratio:g}"
             )
+        if rule.separate_playmat_charge:
+            flags.append("separate playmat charge")
         if flags:
             summaries.append(f"{rule.key}: {', '.join(flags)}")
     return summaries
@@ -4203,6 +4245,40 @@ def _cost_summary_total_cost(rows: list[dict]) -> float:
     return round(total, 2)
 
 
+def _sku_quantities_from_breakdown(value: object) -> dict[str, int]:
+    quantities: dict[str, int] = {}
+    for part in str(value or "").split("|"):
+        text = part.strip()
+        if not text:
+            continue
+        match = re.match(r"^(.*?)\s+x\s*([0-9]+(?:\.[0-9]+)?)$", text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        sku = match.group(1).strip()
+        try:
+            quantity = int(float(match.group(2)))
+        except (TypeError, ValueError):
+            continue
+        quantities[sku] = quantities.get(sku, 0) + quantity
+    return quantities
+
+
+def _separate_playmat_charge_unit_count(row: dict, sku_rules: dict[str, SKUCampaignRule]) -> int:
+    quantities = _sku_quantities_from_breakdown(row.get("SKU Breakdown", ""))
+    if not quantities:
+        return 0
+    return sum(
+        quantity
+        for sku, quantity in quantities.items()
+        if sku_rules.get(sku) and sku_rules[sku].separate_playmat_charge
+    )
+
+
+def _separate_playmat_charge_note(units: int) -> str:
+    amount = round(units * SEPARATE_PLAYMAT_CHARGE_AMOUNT, 2)
+    return f"Separate Playmat Charge: {units} units x $6.00 = ${amount:.2f}"
+
+
 def _rate_lane_shipping_fee(
     weight_kg: object,
     zone: str,
@@ -4225,20 +4301,37 @@ def _rate_lane_shipping_fee(
     return round(charge + _customer_handling_fee(total_units, prepacked_no_touch), 2)
 
 
-def _shipping_fee_choice(row: dict, rate_sheet: CustomerRateSheet | None, hub_zone: str) -> tuple[float, float, str]:
+def _shipping_fee_choice(
+    row: dict,
+    rate_sheet: CustomerRateSheet | None,
+    hub_zone: str,
+    sku_rules: dict[str, SKUCampaignRule] | None = None,
+) -> tuple[float, float, str]:
+    playmat_units = _separate_playmat_charge_unit_count(row, sku_rules or {})
+    playmat_charge = round(playmat_units * SEPARATE_PLAYMAT_CHARGE_AMOUNT, 2)
+    playmat_note = _separate_playmat_charge_note(playmat_units) if playmat_units else ""
     if not rate_sheet:
-        return 0, 0, "Rate sheet unavailable."
+        note = "Rate sheet unavailable."
+        if playmat_note:
+            note = f"{note} {playmat_note} calculated but not applied because no shipping lane was selected."
+        return 0, 0, note
     weight = row.get("Chargeable Weight kg", "")
     total_units = row.get("Total Units", "")
     prepacked_no_touch = _is_prepacked_no_touch_row(row)
     hub_fee = _rate_lane_shipping_fee(weight, hub_zone, rate_sheet.hub, total_units, prepacked_no_touch)
     if hub_fee is not None:
-        return hub_fee, 0, ""
+        return round(hub_fee + playmat_charge, 2), 0, playmat_note
     express_zone = _express_zone_for_cost_summary_row(row, rate_sheet)
     express_fee = _rate_lane_shipping_fee(weight, express_zone, rate_sheet.express, total_units, prepacked_no_touch)
     if express_fee is not None:
-        return 0, express_fee, "Express fallback; hub unavailable."
-    return 0, 0, f"No hub or express rate found for {row.get('Country', '')} at {weight} kg."
+        note = "Express fallback; hub unavailable."
+        if playmat_note:
+            note = f"{note} {playmat_note}"
+        return 0, round(express_fee + playmat_charge, 2), note
+    note = f"No hub or express rate found for {row.get('Country', '')} at {weight} kg."
+    if playmat_note:
+        note = f"{note} {playmat_note} calculated but not applied because no shipping lane was selected."
+    return 0, 0, note
 
 
 def _shipping_method_for_cost_summary_row(
@@ -4321,13 +4414,15 @@ def _cost_summary_rows(
     order_rows: list[dict],
     cfg: dict,
     rate_selection: CustomerRateSheetSelection | None = None,
+    sku_rules: dict[str, SKUCampaignRule] | None = None,
 ) -> list[dict]:
     rows = []
     rate_selection = rate_selection or _resolve_customer_rate_sheet(cfg)
     rate_sheet = rate_selection.sheet
+    sku_rules = sku_rules if sku_rules is not None else _parse_sku_rules(cfg)
     for row in order_rows:
         zone = _zone_for_cost_summary_row(row, rate_sheet)
-        hub_fee, express_fee, shipping_note = _shipping_fee_choice(row, rate_sheet, zone)
+        hub_fee, express_fee, shipping_note = _shipping_fee_choice(row, rate_sheet, zone, sku_rules)
         shipping_method, method_note = _shipping_method_for_cost_summary_row(row, rate_sheet, hub_fee, express_fee)
         combined_note = " ".join(note for note in [shipping_note, method_note] if note)
         rows.append(
@@ -6295,7 +6390,7 @@ def optimize_workbook(
     pledge_config_by_combo = _pledge_config_by_combo(box_rows)
 
     rate_selection = _resolve_customer_rate_sheet(cfg)
-    cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg, rate_selection)
+    cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg, rate_selection, sku_rules)
     total_cost = _cost_summary_total_cost(cost_summary_rows)
     result["total_shipping_cost"] = total_cost
     result["total_shipping_cost_detail"] = "Hub Shipping Fee + Express"

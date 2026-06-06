@@ -1165,6 +1165,73 @@ def test_prepacked_final_ship_alone_quantity_creates_one_carton_per_unit(tmp_pat
     assert float(summary_row["Max Chargeable Weight kg"]) == 13.1
 
 
+def test_separate_playmat_charge_bucket_forces_ship_as_is_behavior(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "PLAYMAT", "Product Name": "Playmat", "Length": "60", "Width": "35", "Height": "2", "Weight kg": "0.5"},
+            {"SKU": "ADDON", "Product Name": "Addon", "Length": "8", "Width": "5", "Height": "2", "Weight kg": "0.2"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "PLAYMAT", "Quantity": "2"},
+            {"Order ID": "1", "SKU": "ADDON", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "separate_playmat_charge_skus": ["PLAYMAT"],
+            "sku_rules": {"PLAYMAT": {"can_mix_with_other_items": True, "no_padding": False}},
+            "preserve_region_sheets": False,
+        },
+    )
+
+    detail_rows = _sheet_rows(output_path, "Multi Box Detail")
+    playmat_rows = [row for row in detail_rows if row["SKUs in Box"] == "PLAYMAT x1"]
+    addon_rows = [row for row in detail_rows if row["SKUs in Box"] == "ADDON x1"]
+    assert len(playmat_rows) == 2
+    assert len(addon_rows) == 1
+    assert all(row["Vendor Box ID"] == "" for row in playmat_rows)
+    assert all(row["Box Selection Decision"] == "rule_assigned_box" for row in playmat_rows)
+    assert all(float(row["Length cm"]) == 60 for row in playmat_rows)
+    assert all(float(row["Width cm"]) == 35 for row in playmat_rows)
+    assert all(float(row["Height cm"]) == 2 for row in playmat_rows)
+    assert all("separate playmat charge" in row["Box Standardization Note"].lower() for row in playmat_rows)
+
+
+def test_playmat_name_without_config_bucket_does_not_get_special_rule(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [{"SKU": "PLAYMAT", "Product Name": "Playmat", "Length": "20", "Width": "10", "Height": "2", "Weight kg": "0.5"}],
+    )
+    _write_csv(orders_path, [{"Order ID": "1", "SKU": "PLAYMAT", "Quantity": "1"}])
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"packing_mode": "fast", "preserve_region_sheets": False, "use_vendor_box_menu": False},
+    )
+
+    detail_row = _sheet_rows(output_path, "Multi Box Detail")[0]
+    cost_row = _sheet_rows(output_path, "Cost Summary")[0]
+    assert detail_row["Rule Applied"] == ""
+    assert "Separate Playmat Charge" not in cost_row.get("Shipping Rate Note", "")
+
+
 def test_forced_box_validation_warnings_do_not_crash(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
@@ -4334,6 +4401,108 @@ def test_cost_summary_uses_customer_rate_sheet_for_zone_and_shipping_fee(tmp_pat
     assert "Estimated VFI Cost" not in rows[0]
     assert "Picking Fee" not in rows[0]
     assert "Margin" not in rows[0]
+
+
+def test_cost_summary_adds_fixed_separate_playmat_charge_to_active_hub_fee(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    rate_path = tmp_path / "rates.xlsx"
+    _write_xlsx_table(
+        rate_path,
+        "Zone Key",
+        [
+            ["HUB", "", "", ""],
+            ["KG", 0.5, 1, 1.5],
+            ["Zone USA", 11.15, 12.25, 13.35],
+            ["", "", "", ""],
+            ["Zone 0", "Zone USA"],
+            ["United States", "USA"],
+        ],
+    )
+    cfg = {
+        **workflow_module.DEFAULT_CONFIG,
+        "rate_sheet_path": str(rate_path),
+        "separate_playmat_charge_skus": ["PLAYMAT"],
+    }
+    sku_rules = workflow_module._parse_sku_rules(cfg)
+
+    rows = workflow_module._cost_summary_rows(
+        [
+            {
+                "Country": "United States",
+                "US State Abbreviation": "CA",
+                "Chargeable Weight kg": 1.1,
+                "Total Units": 3,
+                "SKU Breakdown": "PLAYMAT x2 | ADDON x1",
+            },
+        ],
+        cfg,
+        sku_rules=sku_rules,
+    )
+
+    assert rows[0]["Hub Shipping Fee"] == 27.85
+    assert rows[0]["Express"] == 0
+    assert "Separate Playmat Charge: 2 units x $6.00 = $12.00" in rows[0]["Shipping Rate Note"]
+    assert "Separate Playmat Charge" not in rows[0]
+    assert workflow_module._cost_summary_total_cost(rows) == 27.85
+    summary_rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "total_shipping_cost": workflow_module._cost_summary_total_cost(rows),
+            "total_shipping_cost_detail": "Hub Shipping Fee + Express",
+        },
+        [],
+        [],
+        sku_rules,
+    )
+    total_row = next(row for row in summary_rows if row["Metric"] == "Total Chargeable Cost")
+    assert total_row["Value"] == 27.85
+
+
+def test_cost_summary_adds_fixed_separate_playmat_charge_to_express_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    rate_path = tmp_path / "Rate and Zone.xlsx"
+    zone_key = [[""] for _ in range(37)]
+    zone_key[0] = ["HUB"]
+    zone_key[1] = ["KG", 0.5, 1, 1.5]
+    zone_key[2] = ["Zone 9", "", "", ""]
+    zone_key[31] = ["Express"]
+    zone_key[32] = ["KG", 0.5, 1, 1.5]
+    zone_key[33] = ["Zone 2", 201, 211, 221]
+    sheet2 = [
+        ["", "HUB", "", "", "", "", "", "", "Express", "", "", ""],
+        ["", "COUNTRY", "A2 (ISO)", "Ship by", "Zone", "ship by", "ship to contact", "", "COUNTRY", "", "A2 (ISO)", "Zone"],
+        ["", "Fallbackia", "FB", "Hub", "Zone 9", "ship to fallback", "", "", "Fallbackia", "", "FB", "Zone 2"],
+    ]
+    _write_xlsx_tables(rate_path, {"Zone Key": zone_key, "Sheet2": sheet2})
+    cfg = {
+        **workflow_module.DEFAULT_CONFIG,
+        "rate_sheet_path": str(rate_path),
+        "separate_playmat_charge_skus": ["PLAYMAT"],
+    }
+    sku_rules = workflow_module._parse_sku_rules(cfg)
+
+    rows = workflow_module._cost_summary_rows(
+        [
+            {
+                "Country": "Fallbackia",
+                "Chargeable Weight kg": 0.6,
+                "Total Units": 1,
+                "SKU Breakdown": "PLAYMAT x1",
+            },
+        ],
+        cfg,
+        sku_rules=sku_rules,
+    )
+
+    assert rows[0]["Hub Shipping Fee"] == 0
+    assert rows[0]["Express"] == 219
+    assert "Express fallback; hub unavailable." in rows[0]["Shipping Rate Note"]
+    assert "Separate Playmat Charge: 1 units x $6.00 = $6.00" in rows[0]["Shipping Rate Note"]
 
 
 def test_cost_summary_uses_express_fallback_from_rate_and_zone_sheet(tmp_path, monkeypatch):
