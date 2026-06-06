@@ -3471,7 +3471,7 @@ def test_identical_sku_combinations_reuse_packing_plan_and_preserve_metadata(tmp
 
     monkeypatch.setattr("box_optimizer.workflow.split_order_into_cartons", fake_split_order_into_cartons)
 
-    optimize_workbook(
+    summary = optimize_workbook(
         str(sku_master_path),
         str(orders_path),
         str(output_path),
@@ -3483,15 +3483,103 @@ def test_identical_sku_combinations_reuse_packing_plan_and_preserve_metadata(tmp
     )
 
     assert calls["count"] == 1
+    assert summary["parsed_order_count"] == 2
+    assert summary["unique_packing_cache_key_count"] == 1
+    assert summary["packing_solve_cache_miss_count"] == 1
+    assert summary["packing_cache_reuse_count"] == 1
     order_rows = {row["Order ID"]: row for row in _sheet_rows(output_path, "Order Volume Weights")}
     assert order_rows["1001"]["Name"] == "Alice"
     assert order_rows["1002"]["Name"] == "Bob"
+    assert [row["VFI #"] for row in sorted(order_rows.values(), key=lambda row: row["Order ID"])] == ["VFI-1", "VFI-2"]
     detail_rows = sorted(_sheet_rows(output_path, "Multi Box Detail"), key=lambda row: row["Order ID"])
     assert [row["Order Box ID"] for row in detail_rows] == ["1001-1", "1002-1"]
     assert {row["Length cm"] for row in detail_rows} == {"23"}
+    label_rows = sorted(_sheet_rows(output_path, "Label generator"), key=lambda row: row["Order ID"])
+    assert [row["Order ID"] for row in label_rows] == ["1001", "1002"]
+    cost_rows = sorted(_sheet_rows(output_path, "Cost Summary"), key=lambda row: row["Backer ID"])
+    assert len(cost_rows) == 2
+    assert [row["VFI #"] for row in cost_rows] == ["VFI-1", "VFI-2"]
+    debug_rows = {
+        row["Metric"]: row["Value"]
+        for row in _sheet_rows(output_path, "Debug Summary")
+        if row["Section"] == "Performance"
+    }
+    assert debug_rows["Unique Packing Cache Keys"] == "1"
+    assert debug_rows["Representative Packing Solves"] == "1"
+    assert debug_rows["Packing Cache Reuses"] == "1"
     summary_rows = _sheet_rows(output_path, "Box Size Summary")
     assert len(summary_rows) == 1
     assert int(float(summary_rows[0]["Box Count"])) == 2
+
+
+def test_same_sku_quantities_with_different_packing_cache_keys_solve_separately(tmp_path, monkeypatch):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "Core", "Product Name": "Core", "Length": "10", "Width": "8", "Height": "4", "Weight kg": "1"},
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1001", "SKU": "Core", "Quantity": "1", "Country": "United States"},
+            {"Order ID": "1002", "SKU": "Core", "Quantity": "1", "Country": "Canada"},
+        ],
+    )
+    calls = {"count": 0}
+
+    def fake_split_order_into_cartons(items, packing_mode="normal", force_simple_split=False, **kwargs):
+        calls["count"] += 1
+        item = items[0]
+        length = 20 + calls["count"]
+        return SplitResult(
+            success=True,
+            box_qty=1,
+            cartons=[
+                SplitCarton(
+                    box_number=1,
+                    result=OptimizedCartonResult(
+                        success=True,
+                        length_cm=length,
+                        width_cm=12,
+                        height_cm=8,
+                        chargeable_weight_kg=1,
+                        volume_cm3=length * 12 * 8,
+                        placements=[Placement(item.canonical_sku, 1, item.padded_dimensions, (0, 0, 0), item.weight_kg)],
+                        unplaced_items=[],
+                    ),
+                )
+            ],
+            unplaced_items=[],
+        )
+
+    monkeypatch.setattr("box_optimizer.workflow.split_order_into_cartons", fake_split_order_into_cartons)
+
+    summary = optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "use_vendor_box_menu": False,
+            "preserve_region_sheets": False,
+            "company_protection_rate_bands": {"default": {"1": 1}},
+            "company_protection_country_zones": {"Canada": "Zone Canada", "default": "Zone Other"},
+        },
+    )
+
+    assert calls["count"] == 2
+    assert summary["parsed_order_count"] == 2
+    assert summary["unique_packing_cache_key_count"] == 2
+    assert summary["packing_solve_cache_miss_count"] == 2
+    assert summary["packing_cache_reuse_count"] == 0
+    detail_rows = sorted(_sheet_rows(output_path, "Multi Box Detail"), key=lambda row: row["Order ID"])
+    assert [row["Order ID"] for row in detail_rows] == ["1001", "1002"]
+    assert len(_sheet_rows(output_path, "Label generator")) == 2
+    assert len(_sheet_rows(output_path, "Cost Summary")) == 2
 
 
 def test_all_in_ship_alone_does_not_force_every_sku_into_own_carton(tmp_path):
@@ -4955,6 +5043,90 @@ def test_intake_client_invoice_metadata_appears_in_summary_before_factory(tmp_pa
     optimized_rows = _sheet_rows(output_path, "Optimized to Pack")
     assert optimized_rows[0]["Total Pledges"] == "1"
     assert "CORE x1" in optimized_rows[0]["All Items"]
+
+
+def test_fast_production_workbook_keeps_operational_sheets_and_internal_calculations(tmp_path):
+    sku_master_path = tmp_path / "sku_master.xlsx"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_xlsx_table(
+        sku_master_path,
+        "stock",
+        [
+            _wide_row(44, {0: "SKU", 1: "Item name", 2: "Weight/g", 3: "L-cm", 4: "W-cm", 5: "H-cm"}),
+            _wide_row(44, {0: "CORE", 1: "Core Game", 2: "1000", 3: "10", 4: "8", 5: "4"}),
+            _wide_row(
+                44,
+                {
+                    7: "Country:",
+                    8: "United States",
+                    9: "VAT/EORI/TAX ID:",
+                    10: "VAT-123",
+                    36: "INVOICES TO:",
+                    37: "Client Finance",
+                    40: "Additional Information:",
+                    41: "Use PO 456",
+                    42: "FACTORY",
+                    43: "WHATZ",
+                },
+            ),
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {"Order ID": "1", "SKU": "CORE", "Quantity": "1", "Backer ID": "B-1", "Name": "Ada", "Country": "United States"},
+            {"Order ID": "2", "SKU": "CORE", "Quantity": "1", "Backer ID": "B-2", "Name": "Grace", "Country": "Canada"},
+        ],
+    )
+
+    summary = optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "preserve_region_sheets": False,
+            "workbook_output_mode": "fast_production",
+        },
+    )
+
+    sheet_names = [sheet.sheet_name for sheet in read_workbook(str(output_path))]
+    assert sheet_names[:3] == ["Summary", "Cost Summary", "Labels"]
+    for required_sheet in ["United States", "Canada", "VFI Intake Form", "Optimized to Pack", "Box Size Summary"]:
+        assert required_sheet in sheet_names
+    for skipped_sheet in [
+        "Label generator",
+        "Order Volume Weights",
+        "Pledge Combination Summary",
+        "Packing Detail",
+        "Multi Box Detail",
+        "Debug Summary",
+        "Input Column Mapping",
+        "Errors and Warnings",
+    ]:
+        assert skipped_sheet not in sheet_names
+
+    assert summary["workbook_output_mode"] == "fast_production"
+    assert summary["country_sheet_count"] == 2
+    assert "Label generator" in summary["sheets_skipped"]
+    assert "Order Volume Weights" in summary["sheets_skipped"]
+    assert summary["qr_images_written"] == 2
+    assert summary["boxes_created"] == 2
+
+    summary_rows = _sheet_rows(output_path, "Summary")
+    run_summary = {row["Metric"]: row["Value"] for row in summary_rows if row["Section"] == "Run Summary"}
+    assert run_summary["Output Mode"] == "fast_production"
+    assert run_summary["Invoices To"] == "Client Finance"
+    assert run_summary["Factory"] == "WHATZ"
+    assert any(row.get("SKU") == "SKU Intake Summary" for row in summary_rows)
+
+    cost_rows = _sheet_rows(output_path, "Cost Summary")
+    assert len(cost_rows) == 2
+    assert {row["VFI #"] for row in cost_rows} == {"VFI-1", "VFI-2"}
+    labels_xml = _sheet_xml(output_path, "Labels")
+    assert "B-1" in labels_xml
+    assert "B-2" in labels_xml
 
 
 def test_adjacent_factory_metadata_appears_in_labels_header(tmp_path):

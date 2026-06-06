@@ -28,6 +28,20 @@ OPTIONAL_SHEETS = [
     "Errors and Warnings",
 ]
 
+FAST_PRODUCTION_SKIPPED_SHEETS = {
+    "Label generator",
+    "Order Volume Weights",
+    "Packing Detail",
+    "Multi Box Detail",
+    "Pledge Combination Summary",
+    "Debug Summary",
+    "Input Column Mapping",
+    "Errors and Warnings",
+}
+
+MAX_LABELS_PER_SHEET = 1000
+MAX_MANUAL_ROW_BREAKS_PER_SHEET = 1026
+
 ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Region",
     "Order ID",
@@ -550,11 +564,15 @@ def _labels_sheet_xml(rows: list[dict], include_drawing: bool = False) -> str:
         f'<col min="{index + 1}" max="{index + 1}" width="{width}" customWidth="1"/>'
         for index, width in enumerate(widths)
     )
-    breaks_xml = "".join(
-        f'<brk id="{row}" max="16383" man="1"/>'
-        for row in page_breaks[:-1]
-    )
-    row_breaks_xml = f'<rowBreaks count="{len(page_breaks) - 1}" manualBreakCount="{len(page_breaks) - 1}">{breaks_xml}</rowBreaks>' if len(page_breaks) > 1 else ""
+    manual_break_count = len(page_breaks) - 1
+    if 0 < manual_break_count <= MAX_MANUAL_ROW_BREAKS_PER_SHEET:
+        breaks_xml = "".join(
+            f'<brk id="{row}" max="16383" man="1"/>'
+            for row in page_breaks[:-1]
+        )
+        row_breaks_xml = f'<rowBreaks count="{manual_break_count}" manualBreakCount="{manual_break_count}">{breaks_xml}</rowBreaks>'
+    else:
+        row_breaks_xml = ""
 
     drawing_xml = '<drawing r:id="rId1"/>' if include_drawing else ""
     merge_xml = (
@@ -601,6 +619,15 @@ def _label_qr_images(rows: list[dict]) -> list[tuple[int, bytes]]:
     return images
 
 
+def _label_qr_image_count(rows: list[dict]) -> int:
+    return sum(
+        1
+        for label in rows
+        if not label.get("Label Continuation")
+        and str(label.get("Barcode/QR Value") or label.get("Label Value") or "").strip()
+    )
+
+
 def _worksheet_rels_xml(drawing_id: int) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -639,10 +666,10 @@ def _drawing_xml(image_count: int, start_rows: list[int]) -> str:
     )
 
 
-def _drawing_rels_xml(image_count: int) -> str:
+def _drawing_rels_xml(image_filenames: list[str]) -> str:
     relationships = "".join(
-        f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/label_qr_{index}.png"/>'
-        for index in range(1, image_count + 1)
+        f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{filename}"/>'
+        for index, filename in enumerate(image_filenames, start=1)
     )
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -923,7 +950,7 @@ def _build_sheet_payloads(
     **named_rows: list[dict],
 ) -> list[tuple[str, list[dict]]]:
     country_scan_sheets = named_rows.pop("country_scan_sheets", None) or {}
-    output_mode = str(named_rows.pop("workbook_output_mode", "admin") or "admin").strip().lower()
+    output_mode = _normalized_workbook_output_mode(named_rows.pop("workbook_output_mode", "full"))
     payloads = {name: [] for name in REQUIRED_SHEETS}
     if rows is not None:
         payloads["Summary"] = rows
@@ -952,6 +979,7 @@ def _build_sheet_payloads(
             payloads[sheet_name] = named_rows[key]
 
     ordered = [(name, payloads.get(name, [])) for name in REQUIRED_SHEETS]
+    ordered = _split_label_sheet_payloads(ordered)
     required_and_optional = {*REQUIRED_SHEETS, *OPTIONAL_SHEETS}
     for name, sheet_rows in payloads.items():
         if name.startswith("Cost Summary -") and sheet_rows:
@@ -962,7 +990,12 @@ def _build_sheet_payloads(
             ordered.append((name, payloads[name]))
 
     if country_scan_sheets:
-        labels_index = next((index for index, (name, _rows) in enumerate(ordered) if name == "Labels"), None)
+        labels_indexes = [
+            index
+            for index, (name, _rows) in enumerate(ordered)
+            if _is_labels_sheet_name(name)
+        ]
+        labels_index = labels_indexes[-1] if labels_indexes else None
         insert_index = len(ordered) if labels_index is None else labels_index + 1
         for offset, (name, sheet_rows) in enumerate(country_scan_sheets.items()):
             if sheet_rows:
@@ -973,25 +1006,83 @@ def _build_sheet_payloads(
         if name not in required_and_optional and not name.startswith("Cost Summary -") and sheet_rows:
             ordered.append((name, sheet_rows))
 
-    if output_mode == "worker":
-        worker_sheet_names = {
+    if output_mode == "fast_production":
+        operational_sheet_names = {
             "Summary",
             "Cost Summary",
-            "Labels",
             "VFI Intake Form",
             "Optimized to Pack",
             "Box Size Summary",
             *country_scan_sheets.keys(),
         }
-        # Future workbook sheets must be explicitly classified by the user as worker-facing,
-        # admin-only, or both before being added to this filter.
         ordered = [
             (name, sheet_rows)
             for name, sheet_rows in ordered
-            if name in worker_sheet_names or name.startswith("Cost Summary -")
+            if name in operational_sheet_names or _is_labels_sheet_name(name) or name.startswith("Cost Summary -")
         ]
 
     return ordered
+
+
+def _is_labels_sheet_name(name: str) -> bool:
+    return name == "Labels" or (name.startswith("Labels ") and name.removeprefix("Labels ").isdigit())
+
+
+def _split_label_sheet_payloads(
+    ordered: list[tuple[str, list[dict]]],
+) -> list[tuple[str, list[dict]]]:
+    output = []
+    for name, sheet_rows in ordered:
+        if name != "Labels" or len(sheet_rows) <= MAX_LABELS_PER_SHEET:
+            output.append((name, sheet_rows))
+            continue
+        for index in range(0, len(sheet_rows), MAX_LABELS_PER_SHEET):
+            chunk = sheet_rows[index : index + MAX_LABELS_PER_SHEET]
+            sheet_number = index // MAX_LABELS_PER_SHEET + 1
+            sheet_name = "Labels" if sheet_number == 1 else f"Labels {sheet_number}"
+            output.append((sheet_name, chunk))
+    return output
+
+
+def _normalized_workbook_output_mode(value: object) -> str:
+    mode = str(value or "full").strip().lower()
+    if mode in {"admin", "full"}:
+        return "full"
+    if mode in {"worker", "fast_production"}:
+        return "fast_production"
+    return "full"
+
+
+def workbook_sheet_stats(
+    rows: list[dict] | None = None,
+    sheets: dict[str, list[dict]] | None = None,
+    **named_rows: list[dict],
+) -> dict:
+    """Return sheet-writing stats for a workbook payload without rendering XML."""
+    output_mode = _normalized_workbook_output_mode(named_rows.get("workbook_output_mode", "full"))
+    full_named_rows = dict(named_rows)
+    full_named_rows["workbook_output_mode"] = "full"
+    full_payloads = _build_sheet_payloads(rows, sheets, **full_named_rows)
+    filtered_payloads = _build_sheet_payloads(rows, sheets, **named_rows)
+    full_names = [name for name, _sheet_rows in full_payloads]
+    filtered_names = [name for name, _sheet_rows in filtered_payloads]
+    skipped = [name for name in full_names if name not in filtered_names]
+    labels_rows = [
+        label
+        for name, sheet_rows in filtered_payloads
+        if _is_labels_sheet_name(name)
+        for label in sheet_rows
+    ]
+    country_scan_sheets = named_rows.get("country_scan_sheets") or {}
+    return {
+        "workbook_output_mode": output_mode,
+        "sheets_written": filtered_names,
+        "sheets_skipped": skipped,
+        "sheets_written_count": len(filtered_names),
+        "sheets_skipped_count": len(skipped),
+        "country_sheet_count": sum(1 for _name, sheet_rows in country_scan_sheets.items() if sheet_rows),
+        "qr_images_written": _label_qr_image_count(labels_rows),
+    }
 
 
 def _safe_sheet_names(names: list[str]) -> list[str]:
@@ -1022,34 +1113,60 @@ def write_workbook(
 
     sheet_payloads = _build_sheet_payloads(rows, sheets, **named_rows)
     safe_names = _safe_sheet_names([name for name, _ in sheet_payloads])
-    labels_entry = next(((index, sheet_rows) for index, (name, sheet_rows) in enumerate(sheet_payloads, start=1) if name == "Labels"), None)
-    label_qr_images = _label_qr_images(labels_entry[1]) if labels_entry else []
+    label_drawing_entries = []
+    next_media_index = 1
+    for sheet_index, (sheet_name, sheet_rows) in enumerate(sheet_payloads, start=1):
+        if not _is_labels_sheet_name(sheet_name):
+            continue
+        qr_images = _label_qr_images(sheet_rows)
+        if not qr_images:
+            continue
+        drawing_id = len(label_drawing_entries) + 1
+        image_filenames = []
+        for _start_row, _image in qr_images:
+            image_filenames.append(f"label_qr_{next_media_index}.png")
+            next_media_index += 1
+        label_drawing_entries.append(
+            {
+                "sheet_index": sheet_index,
+                "drawing_id": drawing_id,
+                "images": qr_images,
+                "image_filenames": image_filenames,
+            }
+        )
+    drawing_id_by_sheet_index = {
+        entry["sheet_index"]: entry["drawing_id"]
+        for entry in label_drawing_entries
+    }
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", _content_types(len(sheet_payloads), drawing_count=1 if label_qr_images else 0))
+        archive.writestr("[Content_Types].xml", _content_types(len(sheet_payloads), drawing_count=len(label_drawing_entries)))
         archive.writestr("_rels/.rels", _root_rels())
         archive.writestr("xl/workbook.xml", _workbook_xml(safe_names))
         archive.writestr("xl/_rels/workbook.xml.rels", _workbook_rels(len(sheet_payloads)))
         archive.writestr("xl/styles.xml", _styles_xml())
         for index, (sheet_name, sheet_rows) in enumerate(sheet_payloads, start=1):
             sheet_xml = (
-                _labels_sheet_xml(sheet_rows, include_drawing=bool(label_qr_images))
-                if sheet_name == "Labels"
+                _labels_sheet_xml(sheet_rows, include_drawing=index in drawing_id_by_sheet_index)
+                if _is_labels_sheet_name(sheet_name)
                 else _worksheet_xml(sheet_name, sheet_rows)
             )
             archive.writestr(
                 f"xl/worksheets/sheet{index}.xml",
                 sheet_xml,
             )
-        if labels_entry and label_qr_images:
-            labels_sheet_index = labels_entry[0]
-            archive.writestr(f"xl/worksheets/_rels/sheet{labels_sheet_index}.xml.rels", _worksheet_rels_xml(1))
+        for entry in label_drawing_entries:
+            sheet_index = entry["sheet_index"]
+            drawing_id = entry["drawing_id"]
+            images = entry["images"]
+            image_filenames = entry["image_filenames"]
+            archive.writestr(f"xl/worksheets/_rels/sheet{sheet_index}.xml.rels", _worksheet_rels_xml(drawing_id))
             archive.writestr(
-                "xl/drawings/drawing1.xml",
-                _drawing_xml(len(label_qr_images), [start_row for start_row, _image in label_qr_images]),
+                f"xl/drawings/drawing{drawing_id}.xml",
+                _drawing_xml(len(images), [start_row for start_row, _image in images]),
             )
-            archive.writestr("xl/drawings/_rels/drawing1.xml.rels", _drawing_rels_xml(len(label_qr_images)))
-            for image_index, (_start_row, image) in enumerate(label_qr_images, start=1):
-                archive.writestr(f"xl/media/label_qr_{image_index}.png", image)
+            archive.writestr(f"xl/drawings/_rels/drawing{drawing_id}.xml.rels", _drawing_rels_xml(image_filenames))
+            for filename, (_start_row, image) in zip(image_filenames, images, strict=True):
+                archive.writestr(f"xl/media/{filename}", image)
 
     return str(output_path)

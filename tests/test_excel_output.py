@@ -3,7 +3,13 @@ import struct
 from xml.etree import ElementTree
 
 from box_optimizer.io.excel_reader import read_workbook
-from box_optimizer.io.excel_writer import _column_letter, write_workbook
+from box_optimizer.io.excel_writer import (
+    MAX_LABELS_PER_SHEET,
+    MAX_MANUAL_ROW_BREAKS_PER_SHEET,
+    _column_letter,
+    workbook_sheet_stats,
+    write_workbook,
+)
 
 
 NS = {
@@ -29,6 +35,34 @@ def _worksheet_root(path, sheet_index):
         return ElementTree.fromstring(
             archive.read(f"xl/worksheets/sheet{sheet_index}.xml")
         )
+
+
+def _worksheet_xml(path, sheet_name):
+    sheet_names = _workbook_sheet_names(path)
+    sheet_index = sheet_names.index(sheet_name) + 1
+    with zipfile.ZipFile(path) as archive:
+        return archive.read(f"xl/worksheets/sheet{sheet_index}.xml").decode("utf-8")
+
+
+def _row_break_count(path, sheet_name):
+    sheet_names = _workbook_sheet_names(path)
+    sheet_index = sheet_names.index(sheet_name) + 1
+    root = _worksheet_root(path, sheet_index)
+    row_breaks = root.find("main:rowBreaks", NS)
+    return 0 if row_breaks is None else int(row_breaks.attrib["count"])
+
+
+def _label_rows(count, *, with_qr=False):
+    return [
+        {
+            "Label Number": f"LBL-{index:04d}",
+            "Barcode/QR Value": f"QR-{index:04d}" if with_qr else "",
+            "From": "VFI",
+            "To Name": f"Backer {index}",
+            "Items to Pack Column 1": "CORE x1",
+        }
+        for index in range(1, count + 1)
+    ]
 
 
 def _styles_root(path):
@@ -60,6 +94,166 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
         "Box Size Summary",
     ]
     assert sheet_names[8:] == ["Unmatched SKUs"]
+
+
+def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        summary_rows=[{"Metric": "Orders", "Value": 2}],
+        cost_summary_rows=[{"Backer ID": "1", "VFI #": "VFI-1"}],
+        labels_rows=[{"Label Number": "VFI-1", "Barcode/QR Value": "VFI-1"}],
+        vfi_intake_form_rows=[{"Campaign Name": "Campaign"}],
+        optimized_to_pack_rows=[{"Pledge Configuration": 1}],
+        label_generator_rows=[{"Order ID": "1"}],
+        order_volume_weights_rows=[{"Order ID": "1"}],
+        packing_detail_rows=[{"Order ID": "1"}],
+        multi_box_detail_rows=[{"Order ID": "1"}],
+        pledge_combination_summary_rows=[{"SKU Breakdown": "CORE x1"}],
+        debug_summary_rows=[{"Metric": "Debug"}],
+        input_column_mapping_rows=[{"workbook": "orders.csv"}],
+        errors_and_warnings_rows=[{"Message": "warning"}],
+        country_scan_sheets={"US": [{"Barcode/QR Value": "VFI-1"}]},
+        workbook_output_mode="fast_production",
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+
+    assert sheet_names == [
+        "Summary",
+        "Cost Summary",
+        "Labels",
+        "US",
+        "VFI Intake Form",
+        "Optimized to Pack",
+        "Box Size Summary",
+    ]
+    assert "Label generator" not in sheet_names
+    assert "Order Volume Weights" not in sheet_names
+    assert "Packing Detail" not in sheet_names
+    assert "Multi Box Detail" not in sheet_names
+    assert "Pledge Combination Summary" not in sheet_names
+    assert "Debug Summary" not in sheet_names
+
+    stats = workbook_sheet_stats(
+        summary_rows=[{"Metric": "Orders", "Value": 2}],
+        cost_summary_rows=[{"Backer ID": "1", "VFI #": "VFI-1"}],
+        labels_rows=[{"Label Number": "VFI-1", "Barcode/QR Value": "VFI-1"}],
+        vfi_intake_form_rows=[{"Campaign Name": "Campaign"}],
+        optimized_to_pack_rows=[{"Pledge Configuration": 1}],
+        label_generator_rows=[{"Order ID": "1"}],
+        order_volume_weights_rows=[{"Order ID": "1"}],
+        packing_detail_rows=[{"Order ID": "1"}],
+        multi_box_detail_rows=[{"Order ID": "1"}],
+        pledge_combination_summary_rows=[{"SKU Breakdown": "CORE x1"}],
+        debug_summary_rows=[{"Metric": "Debug"}],
+        input_column_mapping_rows=[{"workbook": "orders.csv"}],
+        errors_and_warnings_rows=[{"Message": "warning"}],
+        country_scan_sheets={"US": [{"Barcode/QR Value": "VFI-1"}]},
+        workbook_output_mode="fast_production",
+    )
+    assert stats["sheets_written"] == sheet_names
+    assert stats["country_sheet_count"] == 1
+    assert stats["qr_images_written"] == 1
+    assert {"Label generator", "Order Volume Weights", "Packing Detail"} <= set(stats["sheets_skipped"])
+
+
+def test_write_workbook_creates_single_labels_sheet_for_1000_or_fewer_labels(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), labels_rows=_label_rows(MAX_LABELS_PER_SHEET))
+
+    sheet_names = _workbook_sheet_names(path)
+
+    assert "Labels" in sheet_names
+    assert "Labels 2" not in sheet_names
+    assert _row_break_count(path, "Labels") == MAX_LABELS_PER_SHEET - 1
+
+
+def test_write_workbook_splits_labels_after_1000_label_blocks(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), labels_rows=_label_rows(MAX_LABELS_PER_SHEET + 1))
+
+    sheet_names = _workbook_sheet_names(path)
+
+    assert "Labels" in sheet_names
+    assert "Labels 2" in sheet_names
+    assert "Labels 3" not in sheet_names
+    assert _row_break_count(path, "Labels") == MAX_LABELS_PER_SHEET - 1
+    assert _row_break_count(path, "Labels 2") == 0
+    labels_xml = _worksheet_xml(path, "Labels")
+    labels_2_xml = _worksheet_xml(path, "Labels 2")
+    assert "LBL-1000" in labels_xml
+    assert "LBL-1001" not in labels_xml
+    assert "LBL-1001" in labels_2_xml
+
+
+def test_write_workbook_splits_labels_into_third_sheet_after_2000_label_blocks(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), labels_rows=_label_rows((MAX_LABELS_PER_SHEET * 2) + 1))
+
+    sheet_names = _workbook_sheet_names(path)
+
+    assert "Labels" in sheet_names
+    assert "Labels 2" in sheet_names
+    assert "Labels 3" in sheet_names
+    assert "Labels 4" not in sheet_names
+    for sheet_name in ["Labels", "Labels 2", "Labels 3"]:
+        assert _row_break_count(path, sheet_name) <= MAX_MANUAL_ROW_BREAKS_PER_SHEET
+    assert "LBL-2000" in _worksheet_xml(path, "Labels 2")
+    assert "LBL-2001" not in _worksheet_xml(path, "Labels 2")
+    assert "LBL-2001" in _worksheet_xml(path, "Labels 3")
+
+
+def test_write_workbook_fast_production_keeps_split_printable_labels(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        labels_rows=_label_rows(MAX_LABELS_PER_SHEET + 1),
+        label_generator_rows=[{"Order ID": "1"}],
+        country_scan_sheets={"US": [{"Barcode/QR Value": "VFI-1"}]},
+        workbook_output_mode="fast_production",
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+
+    assert "Labels" in sheet_names
+    assert "Labels 2" in sheet_names
+    assert sheet_names.index("US") > sheet_names.index("Labels 2")
+    assert "Label generator" not in sheet_names
+
+
+def test_split_labels_sheets_have_drawing_relationships_for_qr_images(tmp_path, monkeypatch):
+    path = tmp_path / "report.xlsx"
+    monkeypatch.setattr(
+        "box_optimizer.io.excel_writer.qr_png",
+        lambda _value, scale=8, border=4: b"\x89PNG\r\n\x1a\nFAKE",
+    )
+
+    write_workbook(str(path), labels_rows=_label_rows(MAX_LABELS_PER_SHEET + 1, with_qr=True))
+
+    sheet_names = _workbook_sheet_names(path)
+    labels_index = sheet_names.index("Labels") + 1
+    labels_2_index = sheet_names.index("Labels 2") + 1
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        labels_rels = archive.read(f"xl/worksheets/_rels/sheet{labels_index}.xml.rels").decode("utf-8")
+        labels_2_rels = archive.read(f"xl/worksheets/_rels/sheet{labels_2_index}.xml.rels").decode("utf-8")
+        drawing_1_rels = archive.read("xl/drawings/_rels/drawing1.xml.rels").decode("utf-8")
+        drawing_2_rels = archive.read("xl/drawings/_rels/drawing2.xml.rels").decode("utf-8")
+
+    assert "xl/drawings/drawing1.xml" in names
+    assert "xl/drawings/drawing2.xml" in names
+    assert 'Target="../drawings/drawing1.xml"' in labels_rels
+    assert 'Target="../drawings/drawing2.xml"' in labels_2_rels
+    assert 'Target="../media/label_qr_1.png"' in drawing_1_rels
+    assert 'Target="../media/label_qr_1000.png"' in drawing_1_rels
+    assert 'Target="../media/label_qr_1001.png"' in drawing_2_rels
+    assert "xl/media/label_qr_1001.png" in names
 
 
 def test_write_workbook_freezes_headers_applies_filters_and_widths(tmp_path):

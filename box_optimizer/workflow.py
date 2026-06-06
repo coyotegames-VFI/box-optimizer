@@ -16,7 +16,7 @@ from pathlib import Path
 
 from box_optimizer.bundling import sku_combination_key
 from box_optimizer.io.excel_reader import IntakeResult, read_intake, read_workbook
-from box_optimizer.io.excel_writer import write_workbook
+from box_optimizer.io.excel_writer import workbook_sheet_stats, write_workbook
 from box_optimizer.models import Dimensions, OrderLine, PackedItem, SKUItem
 from box_optimizer.normalize import normalize_sku
 from box_optimizer.packing.geometry import volume
@@ -3351,7 +3351,31 @@ def _clean_summary_rows(
             {
             "Section": "Run Summary",
             "Metric": "Output Mode",
-            "Value": result.get("workbook_output_mode", "Admin"),
+            "Value": result.get("workbook_output_mode", "Full"),
+            "Detail": "",
+            },
+            {
+            "Section": "Run Summary",
+            "Metric": "Sheets Written",
+            "Value": result.get("sheets_written_count", ""),
+            "Detail": result.get("sheets_written", ""),
+            },
+            {
+            "Section": "Run Summary",
+            "Metric": "Sheets Skipped",
+            "Value": result.get("sheets_skipped_count", ""),
+            "Detail": result.get("sheets_skipped", ""),
+            },
+            {
+            "Section": "Run Summary",
+            "Metric": "Country Sheets Written",
+            "Value": result.get("country_sheet_count", ""),
+            "Detail": "",
+            },
+            {
+            "Section": "Run Summary",
+            "Metric": "QR Images Written",
+            "Value": result.get("qr_images_written", ""),
             "Detail": "",
             },
             {
@@ -3500,6 +3524,21 @@ def _debug_summary_rows(
             )
     else:
         rows.append({"Section": "Unmatched SKU Summary", "Metric": "Unmatched SKUs", "Value": 0, "Detail": "None"})
+
+    performance_metrics = [
+        ("Parsed Orders", result.get("parsed_order_count", "")),
+        ("Unique Packing Cache Keys", result.get("unique_packing_cache_key_count", "")),
+        ("Representative Packing Solves", result.get("packing_solve_cache_miss_count", "")),
+        ("Packing Cache Reuses", result.get("packing_cache_reuse_count", "")),
+        ("Packing Context Build Seconds", result.get("packing_context_build_seconds", "")),
+        ("Unique Packing Solve Seconds", result.get("unique_packing_solve_seconds", "")),
+        ("Packing Cache Expansion Seconds", result.get("packing_cache_expansion_seconds", "")),
+        ("Order Output Expansion Seconds", result.get("order_output_expansion_seconds", "")),
+    ]
+    for metric, value in performance_metrics:
+        if value == "":
+            continue
+        rows.append({"Section": "Performance", "Metric": metric, "Value": value, "Detail": ""})
 
     unique_warning_messages = list(dict.fromkeys(warning.message for warning in warning_rows))
     if unique_warning_messages:
@@ -5750,6 +5789,7 @@ def optimize_workbook(
 
     packing_mode = cfg.get("packing_mode", "normal")
     _log_event("packing_started", order_count=len(grouped_orders), packing_mode=packing_mode)
+    context_build_started = time.perf_counter()
     order_contexts: list[PackingOrderContext] = []
     for first_index, (order_id, lines) in enumerate(grouped_orders.items()):
         order_started = time.perf_counter()
@@ -5793,6 +5833,7 @@ def optimize_workbook(
                 elapsed_seconds=round(time.perf_counter() - order_started, 3),
             )
 
+    context_build_seconds = time.perf_counter() - context_build_started
     cache_key_counts = Counter(context.cache_key for context in order_contexts)
     first_index_by_cache_key: dict[str, int] = {}
     for context in order_contexts:
@@ -5810,6 +5851,17 @@ def optimize_workbook(
     else:
         packing_order = order_contexts
 
+    contexts_by_cache_key: dict[str, list[PackingOrderContext]] = defaultdict(list)
+    for context in order_contexts:
+        contexts_by_cache_key[context.cache_key].append(context)
+    representative_contexts = []
+    seen_cache_keys = set()
+    for context in packing_order:
+        if context.cache_key in seen_cache_keys:
+            continue
+        seen_cache_keys.add(context.cache_key)
+        representative_contexts.append(context)
+
     packing_budget_start = time.perf_counter()
     packing_budget_seconds = (
         float(cfg.get("max_optimization_seconds") or DEFAULT_CONFIG["max_optimization_seconds"])
@@ -5817,7 +5869,10 @@ def optimize_workbook(
         else None
     )
 
-    for context in packing_order:
+    solve_unique_started = time.perf_counter()
+    cache_solve_failures: dict[str, Exception] = {}
+    effective_mode_by_cache_key: dict[str, str] = {}
+    for context in representative_contexts:
         order_started = time.perf_counter()
         order_id = context.order_id
         lines = context.lines
@@ -5840,55 +5895,98 @@ def optimize_workbook(
             item_count=item_count,
         )
         try:
-            cached_plan = packing_cache.get(cache_key)
-            if cached_plan is not None:
-                split_result = _clone_split_result(cached_plan.split_result)
-                warning_rows.extend(
-                    _materialize_cached_warnings(cached_plan.group_warnings, order_id, combo)
-                )
-            else:
-                effective_packing_mode = packing_mode
-                fallback_reason = ""
-                remaining_budget = None
-                if packing_mode == "balanced" and packing_budget_seconds is not None:
-                    elapsed_budget = time.perf_counter() - packing_budget_start
-                    remaining_budget = packing_budget_seconds - elapsed_budget
-                    min_remaining = float(cfg.get("balanced_min_remaining_seconds", 3))
-                    low_budget_threshold = max(min_remaining, packing_budget_seconds * 0.1)
-                    max_deep_items = int(cfg.get("balanced_max_items_for_deep_search", 18))
-                    if remaining_budget <= low_budget_threshold:
-                        effective_packing_mode = "fast"
-                        fallback_reason = "budget_exhausted"
-                    elif item_count > max_deep_items:
-                        effective_packing_mode = "fast"
-                        fallback_reason = "combo_too_complex"
-                    if fallback_reason:
-                        _log_event(
-                            "balanced_fallback_fast",
-                            order_id=order_id,
-                            combo_rank=combo_rank,
-                            combo_hash=_short_hash(cache_key),
-                            pledge_count=cache_key_counts[cache_key],
-                            reason=fallback_reason,
-                            elapsed_seconds=round(elapsed_budget, 3),
-                            remaining_seconds=round(max(remaining_budget, 0), 3),
-                            item_count=item_count,
-                            mode="balanced_fallback_fast",
-                        )
+            effective_packing_mode = packing_mode
+            fallback_reason = ""
+            remaining_budget = None
+            if packing_mode == "balanced" and packing_budget_seconds is not None:
+                elapsed_budget = time.perf_counter() - packing_budget_start
+                remaining_budget = packing_budget_seconds - elapsed_budget
+                min_remaining = float(cfg.get("balanced_min_remaining_seconds", 3))
+                low_budget_threshold = max(min_remaining, packing_budget_seconds * 0.1)
+                max_deep_items = int(cfg.get("balanced_max_items_for_deep_search", 18))
+                if remaining_budget <= low_budget_threshold:
+                    effective_packing_mode = "fast"
+                    fallback_reason = "budget_exhausted"
+                elif item_count > max_deep_items:
+                    effective_packing_mode = "fast"
+                    fallback_reason = "combo_too_complex"
+                if fallback_reason:
+                    _log_event(
+                        "balanced_fallback_fast",
+                        order_id=order_id,
+                        combo_rank=combo_rank,
+                        combo_hash=_short_hash(cache_key),
+                        pledge_count=cache_key_counts[cache_key],
+                        reason=fallback_reason,
+                        elapsed_seconds=round(elapsed_budget, 3),
+                        remaining_seconds=round(max(remaining_budget, 0), 3),
+                        item_count=item_count,
+                        mode="balanced_fallback_fast",
+                    )
 
-                split_result, group_warnings_for_cache = _select_chargeable_weight_plan(
-                    context=context,
-                    sku_items=sku_items,
-                    sku_rules=sku_rules,
-                    packing_mode=effective_packing_mode,
-                    cfg=cfg,
-                    remaining_budget_seconds=remaining_budget,
+            split_result, group_warnings_for_cache = _select_chargeable_weight_plan(
+                context=context,
+                sku_items=sku_items,
+                sku_rules=sku_rules,
+                packing_mode=effective_packing_mode,
+                cfg=cfg,
+                remaining_budget_seconds=remaining_budget,
+            )
+            effective_mode_by_cache_key[cache_key] = effective_packing_mode
+            packing_cache[cache_key] = CachedPackingPlan(
+                split_result=_clone_split_result(split_result),
+                group_warnings=tuple(group_warnings_for_cache),
+            )
+        except Exception as exc:
+            cache_solve_failures[cache_key] = exc
+            effective_mode_by_cache_key[cache_key] = effective_packing_mode or requested_mode
+            _log_event(
+                "order_packing_failed",
+                order_id=order_id,
+                error_type=type(exc).__name__,
+                elapsed_seconds=round(time.perf_counter() - order_started, 3),
+            )
+
+    solve_unique_seconds = time.perf_counter() - solve_unique_started
+
+    cache_expand_started = time.perf_counter()
+    for context in packing_order:
+        order_started = time.perf_counter()
+        order_id = context.order_id
+        lines = context.lines
+        combo = context.combo
+        items = context.items
+        groups = context.groups
+        cache_key = context.cache_key
+        combo_rank = cache_key_rank.get(cache_key, context.first_index + 1)
+        effective_packing_mode = effective_mode_by_cache_key.get(cache_key, "cached")
+        try:
+            if cache_key in cache_solve_failures:
+                exc = cache_solve_failures[cache_key]
+                failed_orders.append(order_id)
+                message = f"Order packing failed and was skipped: {exc}"
+                warning_rows.append(
+                    WorkflowWarning(
+                        order_id=order_id,
+                        stage="packing",
+                        error_type=type(exc).__name__,
+                        message=message,
+                        sku_breakdown=combo,
+                    )
                 )
-                warning_rows.extend(group_warnings_for_cache)
-                packing_cache[cache_key] = CachedPackingPlan(
-                    split_result=_clone_split_result(split_result),
-                    group_warnings=tuple(group_warnings_for_cache),
+                _log_event(
+                    "order_packing_failed",
+                    order_id=order_id,
+                    error_type=type(exc).__name__,
+                    elapsed_seconds=round(time.perf_counter() - order_started, 3),
                 )
+                continue
+
+            cached_plan = packing_cache[cache_key]
+            split_result = _clone_split_result(cached_plan.split_result)
+            warning_rows.extend(
+                _materialize_cached_warnings(cached_plan.group_warnings, order_id, combo)
+            )
             rule_split_message = _rule_split_message(groups)
             if rule_split_message:
                 warning_rows.append(
@@ -5906,7 +6004,7 @@ def optimize_workbook(
                 order_id=order_id,
                 combo_rank=combo_rank,
                 combo_hash=_short_hash(cache_key),
-                mode=effective_packing_mode or requested_mode,
+                mode=effective_packing_mode,
                 cartons=split_result.box_qty,
                 success=split_result.success,
                 elapsed_seconds=round(time.perf_counter() - order_started, 3),
@@ -5952,6 +6050,8 @@ def optimize_workbook(
                 error_type=type(exc).__name__,
                 elapsed_seconds=round(time.perf_counter() - order_started, 3),
             )
+
+    cache_expand_seconds = time.perf_counter() - cache_expand_started
 
     if packing_mode == "balanced":
         split_results = {order_id: split_results[order_id] for order_id in grouped_orders if order_id in split_results}
@@ -5999,6 +6099,7 @@ def optimize_workbook(
     assignments_by_key = _assignment_lookup(assignments)
     box_rows = []
 
+    order_output_expand_started = time.perf_counter()
     for order_id, lines in grouped_orders.items():
         if order_id not in split_results:
             continue
@@ -6096,6 +6197,7 @@ def optimize_workbook(
         )
         if retail_warning:
             warning_rows.append(retail_warning)
+    order_output_expand_seconds = time.perf_counter() - order_output_expand_started
 
     for order_id, lines in grouped_orders.items():
         if order_id not in split_results or not lines:
@@ -6147,6 +6249,17 @@ def optimize_workbook(
             for warning in warning_rows
             if warning.error_type in {"ChargeableWeightPlanSelected", "OversizedVendorBoxPlanSelected"}
         ),
+        "parsed_order_count": len(grouped_orders),
+        "unique_packing_cache_key_count": len(cache_key_counts),
+        "packing_solve_cache_miss_count": len(representative_contexts),
+        "packing_cache_reuse_count": sum(
+            max(len(contexts) - 1, 0)
+            for contexts in contexts_by_cache_key.values()
+        ),
+        "packing_context_build_seconds": round(context_build_seconds, 3),
+        "unique_packing_solve_seconds": round(solve_unique_seconds, 3),
+        "packing_cache_expansion_seconds": round(cache_expand_seconds, 3),
+        "order_output_expansion_seconds": round(order_output_expand_seconds, 3),
     }
 
     region_sheets = {}
@@ -6201,12 +6314,13 @@ def optimize_workbook(
     if rate_selection.warning:
         warnings.append(rate_selection.warning)
         result["warning_count"] = len(warnings) + len(warning_rows)
-    summary_result = dict(result)
-    workbook_output_mode = str(cfg.get("workbook_output_mode") or "admin").strip().lower()
-    if workbook_output_mode not in {"admin", "worker"}:
-        workbook_output_mode = "admin"
-    summary_result["workbook_output_mode"] = workbook_output_mode.title()
-    summary_result["box_types"] = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
+    workbook_output_mode = str(cfg.get("workbook_output_mode") or "full").strip().lower()
+    if workbook_output_mode not in {"full", "fast_production", "admin", "worker"}:
+        workbook_output_mode = "full"
+    result["workbook_output_mode"] = (
+        "fast_production" if workbook_output_mode in {"fast_production", "worker"} else "full"
+    )
+    summary_box_types = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
     label_generator_rows = _label_generator_rows(
         _box_rows_in_vfi_sequence(operational_box_rows, vfi_by_order),
         pledge_config_by_combo,
@@ -6235,7 +6349,55 @@ def optimize_workbook(
     if cost_sheet_name != "Cost Summary":
         workbook_sheets[cost_sheet_name] = cost_summary_rows
 
+    debug_summary_rows = _debug_summary_rows(result, box_size_rows, unmatched_rows, warning_rows, sku_rules)
+    sheet_stats = workbook_sheet_stats(
+        summary_rows=[{}],
+        cost_summary_rows=cost_summary_rows,
+        vfi_intake_form_rows=vfi_intake_form_rows,
+        optimized_to_pack_rows=optimized_to_pack_rows,
+        label_generator_rows=label_generator_rows,
+        labels_rows=labels_rows,
+        country_scan_sheets=country_scan_sheets,
+        workbook_output_mode=workbook_output_mode,
+        order_volume_weights_rows=order_rows,
+        box_size_summary_rows=box_size_rows,
+        unmatched_skus_rows=unmatched_rows,
+        packing_detail_rows=_packing_detail_rows(split_results),
+        multi_box_detail_rows=_multi_box_rows(box_rows),
+        pledge_combination_summary_rows=_pledge_combination_summary_rows_from_boxes(box_rows),
+        debug_summary_rows=debug_summary_rows,
+        input_column_mapping_rows=intake.column_mappings,
+        errors_and_warnings_rows=[
+            {
+                "Order ID": "",
+                "SKU": "",
+                "Stage": "workflow",
+                "Error Type": "Warning",
+                "Message": warning,
+                "Rule Applied": "",
+                "SKU Breakdown": "",
+            }
+            for warning in warnings
+        ]
+        + [_warning_row(warning) for warning in warning_rows],
+        sheets=workbook_sheets,
+    )
+    result.update(
+        {
+            "sheets_written": " | ".join(sheet_stats["sheets_written"]),
+            "sheets_skipped": " | ".join(sheet_stats["sheets_skipped"]),
+            "sheets_written_count": sheet_stats["sheets_written_count"],
+            "sheets_skipped_count": sheet_stats["sheets_skipped_count"],
+            "country_sheet_count": sheet_stats["country_sheet_count"],
+            "qr_images_written": sheet_stats["qr_images_written"],
+        }
+    )
+    summary_result = dict(result)
+    summary_result["workbook_output_mode"] = result["workbook_output_mode"]
+    summary_result["box_types"] = summary_box_types
+
     _log_event("excel_writing_started", output_path=str(Path(output_path).name))
+    workbook_write_started = time.perf_counter()
     write_workbook(
         output_path,
         summary_rows=_clean_summary_rows(
@@ -6261,7 +6423,7 @@ def optimize_workbook(
         packing_detail_rows=_packing_detail_rows(split_results),
         multi_box_detail_rows=_multi_box_rows(box_rows),
         pledge_combination_summary_rows=_pledge_combination_summary_rows_from_boxes(box_rows),
-        debug_summary_rows=_debug_summary_rows(result, box_size_rows, unmatched_rows, warning_rows, sku_rules),
+        debug_summary_rows=debug_summary_rows,
         input_column_mapping_rows=intake.column_mappings,
         errors_and_warnings_rows=[
             {
@@ -6278,6 +6440,8 @@ def optimize_workbook(
         + [_warning_row(warning) for warning in warning_rows],
         sheets=workbook_sheets,
     )
+    workbook_writing_seconds = time.perf_counter() - workbook_write_started
+    result["workbook_writing_seconds"] = round(workbook_writing_seconds, 3)
     _log_event(
         "excel_writing_finished",
         output_path=str(Path(output_path).name),
