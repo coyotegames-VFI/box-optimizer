@@ -1179,6 +1179,7 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
             "campaign_notes": "Internal note",
             "packing_mode_choice": "local_power_balanced_300",
             "ship_as_is_skus": "SHIP-001",
+            "ship_as_is_box_type": "All In",
             "separate_playmat_charge_skus": "PLAYMAT-CHARGE",
             "no_padding_skus": "DICE-001",
             "wrap_around_skus": "PLAYMAT-001",
@@ -1200,6 +1201,7 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
         "ships_alone": True,
         "can_mix_with_other_items": False,
         "box_type": "SHIP-001 shipping carton",
+        "label_box_type": "All In",
     }
     assert config["separate_playmat_charge_skus"] == ["PLAYMAT-CHARGE"]
     assert config["sku_rules"]["PLAYMAT-CHARGE"] == {

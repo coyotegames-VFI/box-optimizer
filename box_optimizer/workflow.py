@@ -183,6 +183,7 @@ class SKUCampaignRule:
     compressed_volume_ratio: float = 0.75
     exclude_from_standardization: bool = False
     box_type: str | None = None
+    label_box_type: str | None = None
     warning_note: str = ""
     separate_playmat_charge: bool = False
 
@@ -730,6 +731,7 @@ def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
             compressed_volume_ratio=float(rule.get("compressed_volume_ratio", 0.75) or 0.75),
             exclude_from_standardization=_bool_from_config(rule.get("exclude_from_standardization"), False),
             box_type=rule.get("box_type"),
+            label_box_type=rule.get("label_box_type"),
             warning_note=str(rule.get("warning_note", "") or ""),
             separate_playmat_charge=_bool_from_config(rule.get("separate_playmat_charge"), False),
         )
@@ -756,6 +758,7 @@ def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
             compressed_volume_ratio=existing.compressed_volume_ratio if existing else 0.75,
             exclude_from_standardization=existing.exclude_from_standardization if existing else False,
             box_type=(existing.box_type if existing and existing.box_type else f"{text_key} separate playmat parcel"),
+            label_box_type=existing.label_box_type if existing else None,
             warning_note=" | ".join(
                 part
                 for part in [
@@ -2179,6 +2182,7 @@ def _rule_cache_signature(rule: SKUCampaignRule | None) -> dict:
         "compressed_volume_ratio": float(rule.compressed_volume_ratio),
         "exclude_from_standardization": rule.exclude_from_standardization,
         "box_type": rule.box_type,
+        "label_box_type": rule.label_box_type,
         "warning_note": rule.warning_note,
         "separate_playmat_charge": rule.separate_playmat_charge,
     }
@@ -2928,6 +2932,23 @@ def _assigned_carton_dimensions_and_type(
     if cutdown_note:
         carton_box_type = f"{carton_box_type} cutdown"
     return assigned_dimensions, carton_box_type, cutdown_note
+
+
+def _label_box_type_for_carton(
+    carton: SplitCarton,
+    carton_box_type: str,
+    sku_rules: dict[str, SKUCampaignRule],
+) -> str:
+    if not _carton_is_prepacked_final(carton, sku_rules):
+        return carton_box_type
+    labels = []
+    for placement in carton.result.placements:
+        rule = sku_rules.get(placement.canonical_sku)
+        label = str((rule.label_box_type if rule else "") or "").strip()
+        if label:
+            labels.append(label)
+    unique_labels = list(dict.fromkeys(labels))
+    return unique_labels[0] if len(unique_labels) == 1 else carton_box_type
 
 
 def _score_assigned_split_result(
@@ -4381,6 +4402,23 @@ def _country_name_zh_hans(country_code: object) -> str:
     return COUNTRY_NAME_ZH_HANS_BY_CODE.get(code, "")
 
 
+def _country_code_from_country_name(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    upper = raw.upper().replace(".", "")
+    if upper in _COUNTRY_NAME_BY_CODE:
+        return upper
+    key = _normalize_lookup_key(raw)
+    alias_code = _COUNTRY_ALIASES.get(key)
+    if alias_code:
+        return alias_code
+    for code, name in _COUNTRY_NAME_BY_CODE.items():
+        if _normalize_lookup_key(name) == key:
+            return code
+    return ""
+
+
 def _country_code_for_label_row(row: dict) -> str:
     value = _first_present(
         row,
@@ -4393,7 +4431,21 @@ def _country_code_for_label_row(row: dict) -> str:
         ],
     )
     code = re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
-    return code if len(code) == 2 else ""
+    if len(code) == 2:
+        return code
+    country_name = _first_present(
+        row,
+        [
+            "Country",
+            "Country Name",
+            "Full Country",
+            "Shipping Country",
+            "Ship To Country",
+            "Ship to Country",
+            "Address Country",
+        ],
+    )
+    return _country_code_from_country_name(country_name)
 
 
 def _valid_order_notes_header(header: object) -> bool:
@@ -4639,7 +4691,7 @@ def _label_generator_rows(
                 "Order ID": row.get("Order ID", ""),
                 "Total Units": row.get("Label Unit Count", row.get("Unit Count", "")),
                 "Label numbers": _label_number_for_box(row, campaign_label_prefix),
-                "Box Plan": row.get("Box Type", ""),
+                "Box Plan": row.get("Label Box Type") or row.get("Box Type", ""),
                 "Per-Box Chargeable Weight": row.get("Chargeable Weight kg", ""),
                 "Country Number": row.get("Country Number", ""),
                 "Country Package Code": row.get("Country Package Code", ""),
@@ -6244,6 +6296,7 @@ def optimize_workbook(
                 "Label Unit Count": sum(label_skus_in_box.values()),
                 "Box Qty": split_result.box_qty,
                 "Box Type": carton_box_type,
+                "Label Box Type": _label_box_type_for_carton(carton, carton_box_type, sku_rules),
                 "Vendor Box ID": vendor_box_id,
                 "Backup Vendor Box": "N/A" if carton.box_type else _backup_vendor_box_text(assignment),
                 "Box Selection Decision": selection_decision,

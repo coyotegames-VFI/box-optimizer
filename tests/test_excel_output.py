@@ -256,6 +256,74 @@ def test_split_labels_sheets_have_drawing_relationships_for_qr_images(tmp_path, 
     assert "xl/media/label_qr_1001.png" in names
 
 
+def test_split_labels_preserve_country_package_code_and_chinese_on_later_sheets(tmp_path):
+    path = tmp_path / "report.xlsx"
+    labels = _label_rows(MAX_LABELS_PER_SHEET + 1)
+    labels[-1].update(
+        {
+            "Country": "Germany",
+            "Country Code": "DE",
+            "Country Package Code": "DE  2-1",
+            "Country Name Chinese": "\u5fb7\u56fd",
+        }
+    )
+
+    write_workbook(str(path), labels_rows=labels)
+
+    labels_2_xml = _worksheet_xml(path, "Labels 2")
+
+    assert 'r="E1" t="inlineStr" s="17"><is><t>DE  2-1</t></is></c>' in labels_2_xml
+    assert "\u5fb7\u56fd" in labels_2_xml
+    assert "UN  2-1" not in labels_2_xml
+
+
+def test_fast_production_split_labels_preserve_country_package_code_and_chinese(tmp_path):
+    path = tmp_path / "report.xlsx"
+    labels = _label_rows(MAX_LABELS_PER_SHEET + 1)
+    labels[-1].update(
+        {
+            "Country": "France",
+            "Country Code": "FR",
+            "Country Package Code": "FR  1",
+            "Country Name Chinese": "\u6cd5\u56fd",
+        }
+    )
+
+    write_workbook(
+        str(path),
+        labels_rows=labels,
+        label_generator_rows=[{"Order ID": "1"}],
+        workbook_output_mode="fast_production",
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    labels_2_xml = _worksheet_xml(path, "Labels 2")
+
+    assert "Labels 2" in sheet_names
+    assert "Label generator" not in sheet_names
+    assert 'r="E1" t="inlineStr" s="17"><is><t>FR  1</t></is></c>' in labels_2_xml
+    assert "\u6cd5\u56fd" in labels_2_xml
+    assert "UN  1" not in labels_2_xml
+
+
+def test_split_labels_preserve_friendly_carton_box_designation_on_later_sheets(tmp_path):
+    path = tmp_path / "report.xlsx"
+    labels = _label_rows(MAX_LABELS_PER_SHEET + 1)
+    labels[-1].update(
+        {
+            "Carton Box Designation": "All In",
+            "Items to Pack Column 1": "CORE x1",
+        }
+    )
+
+    write_workbook(str(path), labels_rows=labels)
+
+    labels_2_xml = _worksheet_xml(path, "Labels 2")
+
+    assert "All In" in labels_2_xml
+    assert "Earth Under Siege All In Storage shipping carton" not in labels_2_xml
+
+
 def test_write_workbook_freezes_headers_applies_filters_and_widths(tmp_path):
     path = tmp_path / "report.xlsx"
 
@@ -594,8 +662,8 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert 'r="B1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
     assert 'r="C1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
     assert 'r="D1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert 'r="E1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert 'r="F1" t="inlineStr" s="17"><is><t>NZ</t></is></c>' in xml
+    assert 'r="E1" t="inlineStr" s="17"><is><t>NZ</t></is></c>' in xml
+    assert 'r="F1" t="inlineStr" s="17"><is><t></t></is></c>' in xml
     assert "Barcode / QR Value" not in xml
     assert "Country CN" not in xml
     assert "Total Value USD" not in xml
@@ -664,7 +732,9 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert "<pageSetup" in xml
     assert "<rowBreaks" in xml
     assert '<mergeCell ref="A12:F12"/>' in xml
-    assert '<mergeCell ref="A1:E1"/>' in xml
+    assert '<mergeCell ref="A1:D1"/>' in xml
+    assert '<mergeCell ref="E1:F1"/>' in xml
+    assert '<mergeCell ref="A1:E1"/>' not in xml
     assert '<mergeCell ref="B13:C13"/>' in xml
     assert '<mergeCell ref="E13:F13"/>' in xml
     assert '<mergeCell ref="B14:C14"/>' in xml
@@ -735,6 +805,33 @@ def test_labels_sheet_leaves_notes_area_unblocked_when_note_is_blank(tmp_path):
     assert 'r="F8"' not in xml
     assert 'r="E9"' not in xml
     assert 'r="F9"' not in xml
+
+
+def test_labels_sheet_top_right_header_uses_country_package_code_in_ef_merge(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        labels_rows=[
+            {
+                "Label Number": "42",
+                "Barcode/QR Value": "OPR 42",
+                "Country Code": "DE",
+                "Country Package Code": "DE  2-1",
+                "Country Name Chinese": "\u5fb7\u56fd",
+                "Items to Pack Column 1": "CORE x1",
+            },
+        ],
+    )
+
+    xml = _worksheet_xml(path, "Labels")
+
+    assert 'r="E1" t="inlineStr" s="17"><is><t>DE  2-1</t></is></c>' in xml
+    assert 'r="F1" t="inlineStr" s="17"><is><t></t></is></c>' in xml
+    assert '<mergeCell ref="A1:D1"/>' in xml
+    assert '<mergeCell ref="E1:F1"/>' in xml
+    assert "UN  2-1" not in xml
+    assert "\u5fb7\u56fd" in xml
 
 
 def test_labels_sheet_splits_long_address_one_before_notes_box(tmp_path):
@@ -881,10 +978,12 @@ def test_labels_sheet_prints_continuation_label_for_overflow_items(tmp_path):
     assert '<c r="B21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
     assert '<c r="C21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
     assert '<c r="D21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert '<c r="E21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert '<c r="F21" t="inlineStr" s="7"><is><t>NZ</t></is></c>' in xml
+    assert '<c r="E21" t="inlineStr" s="17"><is><t>NZ</t></is></c>' in xml
+    assert '<c r="F21" t="inlineStr" s="17"><is><t></t></is></c>' in xml
     assert '<c r="B22" t="inlineStr" s="2"><is><t>39  CONTINUED  Config: 4</t></is></c>' in xml
-    assert '<mergeCell ref="A21:E21"/>' in xml
+    assert '<mergeCell ref="A21:D21"/>' in xml
+    assert '<mergeCell ref="E21:F21"/>' in xml
+    assert '<mergeCell ref="A21:E21"/>' not in xml
     assert '<mergeCell ref="C21:E21"/>' not in xml
     assert '<mergeCell ref="C21:D21"/>' not in xml
     assert '<mergeCell ref="B23:C23"/>' in xml
@@ -921,9 +1020,9 @@ def test_labels_sheet_embeds_qr_pngs_for_barcode_values(tmp_path):
         qr_png = archive.read("xl/media/label_qr_1.png")
 
     assert '<drawing r:id="rId1"/>' in labels_xml
-    assert '<xdr:col>4</xdr:col>' in drawing_xml
+    assert '<xdr:col>3</xdr:col>' in drawing_xml
     assert '<xdr:row>0</xdr:row>' in drawing_xml
-    assert '<xdr:colOff>57150</xdr:colOff>' in drawing_xml
+    assert '<xdr:colOff>457200</xdr:colOff>' in drawing_xml
     assert '<xdr:rowOff>57150</xdr:rowOff>' in drawing_xml
     assert '<xdr:ext cx="1524000" cy="1524000"/>' in drawing_xml
     assert 'Target="../media/label_qr_1.png"' in drawing_rels

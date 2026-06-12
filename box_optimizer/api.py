@@ -425,6 +425,7 @@ def _structured_upload_config(
     campaign_notes: str | None = None,
     packing_mode_choice: str | None = None,
     ship_as_is_skus: str | None = None,
+    ship_as_is_box_type: str | None = None,
     separate_playmat_charge_skus: str | None = None,
     no_padding_skus: str | None = None,
     wrap_around_skus: str | None = None,
@@ -445,14 +446,18 @@ def _structured_upload_config(
         config["campaign"] = campaign
 
     sku_rules: dict[str, dict[str, Any]] = {}
+    ship_as_is_label = str(ship_as_is_box_type or "").strip()
     for sku in _form_lines(ship_as_is_skus):
-        sku_rules[sku] = {
+        rule = {
             "prepacked": True,
             "no_padding": True,
             "ships_alone": True,
             "can_mix_with_other_items": False,
             "box_type": f"{sku} shipping carton",
         }
+        if ship_as_is_label:
+            rule["label_box_type"] = ship_as_is_label
+        sku_rules[sku] = rule
     playmat_skus = _form_lines(separate_playmat_charge_skus)
     if playmat_skus:
         config["separate_playmat_charge_skus"] = playmat_skus
@@ -887,9 +892,10 @@ def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> 
               prepacked: true,
               no_padding: true,
               ships_alone: true,
-              can_mix_with_other_items: false
+              can_mix_with_other_items: false,
+              box_type: sku + " shipping carton"
             };
-            if (shipBoxType) rule.box_type = shipBoxType;
+            if (shipBoxType) rule.label_box_type = shipBoxType;
             applyRule(config, sku, rule);
           });
 
@@ -1300,6 +1306,7 @@ def upload_workbooks(
     campaign_notes: str | None = Form(default=None),
     packing_mode_choice: str | None = Form(default="railway_fast"),
     ship_as_is_skus: str | None = Form(default=None),
+    ship_as_is_box_type: str | None = Form(default=None),
     separate_playmat_charge_skus: str | None = Form(default=None),
     no_padding_skus: str | None = Form(default=None),
     wrap_around_skus: str | None = Form(default=None),
@@ -1323,6 +1330,7 @@ def upload_workbooks(
         campaign_notes=campaign_notes,
         packing_mode_choice=packing_mode_choice,
         ship_as_is_skus=ship_as_is_skus,
+        ship_as_is_box_type=ship_as_is_box_type,
         separate_playmat_charge_skus=separate_playmat_charge_skus,
         no_padding_skus=no_padding_skus,
         wrap_around_skus=wrap_around_skus,

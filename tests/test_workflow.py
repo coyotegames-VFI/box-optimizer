@@ -2743,6 +2743,65 @@ def test_country_package_codes_keep_order_sequence_and_add_carton_suffix():
     assert workflow_module._country_package_code("SG", 1, 1, 1) == "SG  1"
 
 
+def test_label_country_code_resolves_from_full_country_names_and_alias_fields():
+    rows = [
+        {"Country": "Germany"},
+        {"Country Name": "France"},
+        {"Shipping Country": "Netherlands"},
+        {"Ship To Country": "Hong Kong"},
+        {"Ship to Country": "China"},
+        {"Address Country": "United Kingdom"},
+    ]
+
+    assert [workflow_module._country_code_for_label_row(row) for row in rows] == [
+        "DE",
+        "FR",
+        "NL",
+        "HK",
+        "CN",
+        "GB",
+    ]
+
+
+def test_label_country_code_keeps_explicit_code_first_and_does_not_invent_unknowns():
+    assert workflow_module._country_code_for_label_row({"Country": "Germany", "Country Code": "FR"}) == "FR"
+    assert workflow_module._country_code_for_label_row({"Country": "Atlantis"}) == ""
+    assert workflow_module._country_package_code("", 12) == "UN  12"
+
+
+def test_country_package_codes_use_country_name_fallback_before_un_fallback():
+    _sequenced_rows, by_order = workflow_module._with_country_sequences(
+        [
+            {"Order ID": "1", "Country": "Germany"},
+            {"Order ID": "2", "Country": "Germany"},
+            {"Order ID": "3", "Country": "France"},
+            {"Order ID": "4", "Country": "Netherlands"},
+            {"Order ID": "5", "Country": "Atlantis"},
+        ]
+    )
+
+    box_rows = workflow_module._with_country_package_codes(
+        [
+            {"Order ID": "1", "Country": "Germany", "Box Number": 1, "Box Qty": 1},
+            {"Order ID": "2", "Country": "Germany", "Box Number": 1, "Box Qty": 2},
+            {"Order ID": "2", "Country": "Germany", "Box Number": 2, "Box Qty": 2},
+            {"Order ID": "3", "Country": "France", "Box Number": 1, "Box Qty": 1},
+            {"Order ID": "4", "Country": "Netherlands", "Box Number": 1, "Box Qty": 1},
+            {"Order ID": "5", "Country": "Atlantis", "Box Number": 1, "Box Qty": 1},
+        ],
+        by_order,
+    )
+
+    assert [row["Country Package Code"] for row in box_rows] == [
+        "DE  1",
+        "DE  2-1",
+        "DE  2-2",
+        "FR  1",
+        "NL  1",
+        "UN  1",
+    ]
+
+
 def test_cost_summary_country_number_is_column_c_and_keeps_shipping_fee_columns_q_r():
     rows = workflow_module._cost_summary_rows(
         [
@@ -2798,8 +2857,8 @@ def test_label_generator_and_label_header_carry_country_package_code_to_continua
     assert label_rows[0]["Country Package Code"] == "HK  2-1"
     assert label_rows[1]["Label Continuation"] is True
     assert label_rows[1]["Country Package Code"] == "HK  2-1"
-    assert excel_writer_module._label_block_rows(label_rows[0])[0][5] == "HK  2-1"
-    assert excel_writer_module._label_block_rows(label_rows[1])[0][5] == "HK  2-1"
+    assert excel_writer_module._label_block_rows(label_rows[0])[0][4] == "HK  2-1"
+    assert excel_writer_module._label_block_rows(label_rows[1])[0][4] == "HK  2-1"
 
 
 def test_country_package_count_rows_count_physical_packages_not_continuation_labels():
@@ -2916,6 +2975,44 @@ def test_label_generator_populates_simplified_chinese_country_from_two_letter_co
     assert rows[2]["Country Name Chinese"] == ""
     assert workflow_module._country_name_zh_hans("HK") == "中国香港"
 
+def test_label_generator_populates_country_code_and_chinese_from_country_name():
+    rows = workflow_module._label_generator_rows(
+        [
+            {
+                "Order ID": "1",
+                "VFI #": "1",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "VB 25",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Country": "Germany",
+                "Country Package Code": "DE  1",
+            },
+            {
+                "Order ID": "2",
+                "VFI #": "2",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "VB 25",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Country": "Germany",
+                "Country Name Chinese": "è‡ªå®šä¹‰å¾·å›½",
+            },
+        ],
+        {"CORE x1": 1},
+        "OPR",
+    )
+
+    assert rows[0]["Ship to Country Code"] == "DE"
+    assert rows[0]["Country Name Chinese"] == workflow_module._country_name_zh_hans("DE")
+    assert rows[0]["Country Package Code"] == "DE  1"
+    assert rows[1]["Country Name Chinese"] == "è‡ªå®šä¹‰å¾·å›½"
+
+
 def test_label_generator_uses_backer_data_aliases_for_addresses_country_code_and_order_id():
     rows = workflow_module._label_generator_rows(
         [
@@ -2959,7 +3056,7 @@ def test_label_generator_uses_backer_data_aliases_for_addresses_country_code_and
     assert rows[0]["Shipping State"] == "HK"
 
 
-def test_label_country_code_does_not_use_full_country_name_as_two_letter_code():
+def test_label_country_code_resolves_full_country_name_but_not_unknown_country():
     rows = workflow_module._label_generator_rows(
         [
             {
@@ -2979,8 +3076,30 @@ def test_label_country_code_does_not_use_full_country_name_as_two_letter_code():
         "OPR",
     )
 
-    assert rows[0]["Ship to Country Code"] == ""
-    assert rows[0]["Country Name Chinese"] == ""
+    assert rows[0]["Ship to Country Code"] == "NZ"
+    assert rows[0]["Country Name Chinese"] == workflow_module._country_name_zh_hans("NZ")
+
+    unknown_rows = workflow_module._label_generator_rows(
+        [
+            {
+                "Order ID": "2",
+                "VFI #": "2",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "VB 25",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Address Country": "Atlantis",
+                "Country": "Atlantis",
+            }
+        ],
+        {"CORE x1": 1},
+        "OPR",
+    )
+
+    assert unknown_rows[0]["Ship to Country Code"] == ""
+    assert unknown_rows[0]["Country Name Chinese"] == ""
 
 
 def test_labels_rows_are_generated_one_per_carton_from_label_generator_rows():
@@ -3710,6 +3829,114 @@ def test_all_in_ship_alone_does_not_force_every_sku_into_own_carton(tmp_path):
     warning_messages = [row["Message"] for row in _sheet_rows(output_path, "Errors and Warnings")]
     assert any("Order split due to ships_alone=true" in message for message in warning_messages)
     assert all("prepacked/forced-box" not in message for message in warning_messages)
+
+
+def test_ship_as_is_friendly_label_displays_on_printable_labels_only(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    ship_as_is_sku = "Earth Under Siege All In Storage"
+    full_carton_name = f"{ship_as_is_sku} shipping carton"
+    _write_csv(
+        sku_master_path,
+        [
+            {
+                "SKU": ship_as_is_sku,
+                "Product Name": ship_as_is_sku,
+                "Length": "60",
+                "Width": "30",
+                "Height": "30",
+                "Weight kg": "2",
+            },
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [{"Order ID": "1", "SKU": ship_as_is_sku, "Quantity": "1", "Country": "Germany"}],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={
+            "packing_mode": "fast",
+            "preserve_region_sheets": False,
+            "sku_rules": {
+                ship_as_is_sku: {
+                    "prepacked": True,
+                    "no_padding": True,
+                    "ships_alone": True,
+                    "can_mix_with_other_items": False,
+                    "box_type": full_carton_name,
+                    "label_box_type": "All In",
+                }
+            },
+        },
+    )
+
+    label_generator_row = _sheet_rows(output_path, "Label generator")[0]
+    labels_xml = _sheet_xml(output_path, "Labels")
+    multi_box_row = _sheet_rows(output_path, "Multi Box Detail")[0]
+    box_size_row = _sheet_rows(output_path, "Box Size Summary")[0]
+
+    assert label_generator_row["Box Plan"] == "All In"
+    assert "All In" in labels_xml
+    assert full_carton_name not in labels_xml
+    assert multi_box_row["Box Type"] == full_carton_name
+    assert box_size_row["Box Type"] == full_carton_name
+
+
+def test_blank_ship_as_is_friendly_label_keeps_carton_name_on_printable_labels():
+    rows = workflow_module._label_generator_rows(
+        [
+            {
+                "Order ID": "1",
+                "VFI #": "1",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "Earth Under Siege All In Storage shipping carton",
+                "Label Box Type": "",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Country": "Germany",
+            }
+        ],
+        {"CORE x1": 1},
+        "EUS",
+    )
+
+    label_rows = workflow_module._labels_rows(rows)
+
+    assert rows[0]["Box Plan"] == "Earth Under Siege All In Storage shipping carton"
+    assert label_rows[0]["Carton Box Designation"] == "Earth Under Siege All In Storage shipping carton"
+
+
+def test_normal_vendor_box_label_display_ignores_unrelated_friendly_labels():
+    rows = workflow_module._label_generator_rows(
+        [
+            {
+                "Order ID": "1",
+                "VFI #": "1",
+                "Box Number": 1,
+                "Box Qty": 1,
+                "Unit Count": 1,
+                "Box Type": "VB 25",
+                "Label Box Type": "",
+                "SKU Breakdown": "CORE x1",
+                "SKUs in Box": "CORE x1",
+                "Country": "Germany",
+            }
+        ],
+        {"CORE x1": 1},
+        "EUS",
+    )
+
+    label_rows = workflow_module._labels_rows(rows)
+
+    assert rows[0]["Box Plan"] == "VB 25"
+    assert label_rows[0]["Carton Box Designation"] == "VB 25"
 
 
 def test_string_false_can_mix_config_still_forces_separation(tmp_path):
