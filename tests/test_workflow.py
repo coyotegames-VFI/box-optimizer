@@ -2857,8 +2857,8 @@ def test_label_generator_and_label_header_carry_country_package_code_to_continua
     assert label_rows[0]["Country Package Code"] == "HK  2-1"
     assert label_rows[1]["Label Continuation"] is True
     assert label_rows[1]["Country Package Code"] == "HK  2-1"
-    assert excel_writer_module._label_block_rows(label_rows[0])[0][4] == "HK  2-1"
-    assert excel_writer_module._label_block_rows(label_rows[1])[0][4] == "HK  2-1"
+    assert excel_writer_module._label_block_rows(label_rows[0])[0][4] == "HK"
+    assert excel_writer_module._label_block_rows(label_rows[1])[0][4] == "HK"
 
 
 def test_country_package_count_rows_count_physical_packages_not_continuation_labels():
@@ -3177,6 +3177,23 @@ def test_labels_rows_are_generated_one_per_carton_from_label_generator_rows():
     assert label_rows[1]["Items to Pack Column 2"] == ""
 
 
+def test_label_visible_header_shows_number_before_project_without_changing_barcode_value():
+    label_rows = workflow_module._labels_rows(
+        [
+            {
+                "Order ID": "1",
+                "Label numbers": "emerald 28-1",
+                "Ship to Country Code": "HK",
+                "Country Package Code": "HK  3-1",
+                "SKU Breakdown": "CORE x1",
+            }
+        ]
+    )
+
+    assert label_rows[0]["Barcode/QR Value"] == "emerald 28-1"
+    assert excel_writer_module._label_block_rows(label_rows[0])[0] == ["28-1 emerald", "", "", "", "HK", ""]
+
+
 def test_labels_rows_prefix_item_lines_with_intake_picking_order():
     label_rows = workflow_module._labels_rows(
         [
@@ -3199,7 +3216,7 @@ def test_labels_rows_prefix_item_lines_with_intake_picking_order():
     assert label_rows[0]["Items to Pack Column 2"] == ""
 
 
-def test_labels_rows_print_order_groups_by_pledge_then_country_stably():
+def test_labels_rows_print_order_groups_by_country_then_pledge_stably():
     label_rows = [
         {
             "Pledge Configuration": 2,
@@ -3235,16 +3252,16 @@ def test_labels_rows_print_order_groups_by_pledge_then_country_stably():
 
     ordered_rows = workflow_module._labels_rows_in_print_order(label_rows)
 
-    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 1, 1, 2, 2]
     assert [row["Country"] for row in ordered_rows] == [
         "Canada",
         "Canada",
-        "United States",
         "China",
         "United States",
+        "United States",
     ]
-    assert [row["Order ID"] for row in ordered_rows] == ["C", "D", "B", "E", "A"]
-    assert [row["Label Value"] for row in ordered_rows] == ["LC 2", "LC 3", "LC 1", "LC 5", "LC 4"]
+    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 1, 2, 1, 2]
+    assert [row["Order ID"] for row in ordered_rows] == ["C", "D", "E", "B", "A"]
+    assert [row["Label Value"] for row in ordered_rows] == ["LC 2", "LC 3", "LC 5", "LC 1", "LC 4"]
 
 
 def test_labels_rows_respect_campaign_item_line_controls_and_report_overflow():
@@ -5312,7 +5329,7 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     labels_xml = _sheet_xml(output_path, "Labels")
     assert "VFI #" not in labels_xml
     assert "Barcode / QR Value" not in labels_xml
-    assert "LC 1" in labels_xml
+    assert "1 LC" in labels_xml
     assert "Longhai Printworks" in labels_xml
     assert "Launch Campaign" in labels_xml
     assert "Config:" in labels_xml
@@ -5556,7 +5573,7 @@ def test_adjacent_factory_metadata_appears_in_labels_header(tmp_path):
     labels_xml = _sheet_xml(output_path, "Labels")
 
     assert any(row["Metric"] == "Factory" and row["Value"] == "WHATZ" for row in summary_rows)
-    assert 'r="C1" t="inlineStr" s="7"><is><t></t></is></c>' in labels_xml
+    assert 'r="C1" t="inlineStr" s="24"><is><t></t></is></c>' in labels_xml
     assert "WHATZ" in labels_xml
 
 

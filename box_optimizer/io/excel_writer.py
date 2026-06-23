@@ -1,6 +1,7 @@
 """Excel output helpers."""
 
 from pathlib import Path
+import re
 from xml.sax.saxutils import escape
 import zipfile
 
@@ -188,10 +189,12 @@ def _label_cell_style(row_offset: int, column_index: int, value: object) -> int 
 
 def _split_label_from_line(value: object) -> tuple[str, str]:
     text = str(value or "").strip()
+    if text == "No.23 Baosheng Rd.,Bld2, 3rd Floor, Longhai, Fujian, China 363107":
+        return "No.23 Baosheng Rd.,Bld2, 3rd Floor,", "Longhai, Fujian, China 363107"
     marker = "Longhai,"
     if marker in text:
         first, second = text.split(marker, 1)
-        return f"{first}{marker[:-1]}".strip(), second.strip(" ,")
+        return first.strip(" ,"), f"{marker} {second.strip(' ,')}".strip()
     return text, ""
 
 
@@ -236,12 +239,24 @@ def _label_config_text(label: dict) -> str:
 
 
 def _label_visible_id(label: dict) -> str:
-    return str(
+    value = str(
         label.get("Barcode/QR Value")
         or label.get("Label Value")
         or label.get("Label Number")
         or ""
     ).strip()
+    match = re.match(r"^(?P<project>.+?)\s+(?P<number>\d+(?:-\d+)?)$", value)
+    if match:
+        return f"{match.group('number')} {match.group('project')}"
+    return value
+
+
+def _label_header_country_code(label: dict) -> str:
+    for key in ["Country Code", "Country Package Code"]:
+        match = re.match(r"\s*([A-Za-z]{2})", str(label.get(key, "") or ""))
+        if match:
+            return match.group(1).upper()
+    return ""
 
 
 def _label_continuation_header_text(label: dict) -> str:
@@ -295,12 +310,12 @@ def _label_display_addresses(label: dict) -> tuple[str, str, bool]:
 def _label_block_rows(label: dict) -> list[list[object]]:
     items_column_1 = str(label.get("Items to Pack Column 1", "") or "").splitlines()
     items_column_2 = str(label.get("Items to Pack Column 2", "") or "").splitlines()
-    country_package_code = label.get("Country Package Code") or label.get("Country Code", "")
+    country_code = _label_header_country_code(label)
     if label.get("Label Continuation"):
         original_label = _continuation_original_label_number(label)
         continuation_items = [item for item in [*items_column_1, *items_column_2] if str(item or "").strip()]
         rows = [
-            [original_label, "", "", "", "", country_package_code],
+            [_label_visible_id({"Barcode/QR Value": original_label}), "", "", "", country_code, ""],
             ["Continuation for", f"{original_label}  {_label_continuation_header_text(label)}", "", "", "", ""],
             ["Qty", "SKU", "", "Qty", "SKU", ""],
         ]
@@ -325,7 +340,7 @@ def _label_block_rows(label: dict) -> list[list[object]]:
     address_1, address_2, address_needs_notes_space = _label_display_addresses(label)
     notes_text = f"Notes: {notes}" if notes and not address_needs_notes_space else ""
     rows = [
-        [_label_visible_id(label), "", "", "", "", country_package_code],
+        [_label_visible_id(label), "", "", "", country_code, ""],
         ["Origin:", label.get("Origin", ""), "", "", "", ""],
         ["", "", "", "", "", ""],
         ["From", from_line_1, "", "", "", ""],
@@ -419,7 +434,7 @@ def _label_block_cell_style(
 ) -> int | None:
     if label.get("Label Continuation"):
         if row_offset == 0:
-            style = 7
+            style = 24
         elif row_offset == 1:
             style = 2
         elif row_offset == 2:
@@ -438,12 +453,17 @@ def _label_block_cell_style(
                 style = 14
         else:
             style = _label_cell_style(row_offset, column_index, value)
-        if row_offset == 0 and column_index == 5:
-            return style
+        if row_offset == 0 and column_index in {4, 5}:
+            return _label_right_aligned_style(style)
         return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
 
     footer_offsets = {len(block_rows) - 3, len(block_rows) - 2, len(block_rows) - 1}
-    if row_offset == 0 or row_offset in footer_offsets:
+    if row_offset == 0:
+        style = 24
+        if column_index in {4, 5}:
+            return _label_right_aligned_style(style)
+        return style
+    if row_offset in footer_offsets:
         style = 7
         if row_offset in {len(block_rows) - 2, len(block_rows) - 1} and column_index in {4, 5}:
             return _label_right_aligned_style(style)
@@ -451,7 +471,7 @@ def _label_block_cell_style(
     detail_offset = _label_detail_offset(block_rows)
     has_notes = len(block_rows) > 8 and any(str(block_rows[offset][4] or "").startswith("Notes:") for offset in range(6, 9))
     if has_notes and 6 <= row_offset <= 8 and column_index in {4, 5}:
-        return 18
+        return 22
     item_block_end = _label_item_block_end_offset(block_rows)
     qty_header_offset = detail_offset + 1 if detail_offset >= 0 else -1
     if detail_offset >= 0 and detail_offset <= row_offset <= item_block_end:
@@ -471,12 +491,23 @@ def _label_block_cell_style(
             return 14
         return 14
     style = _label_cell_style(row_offset, column_index, value)
+    if (
+        style is None
+        and str(value or "").strip()
+        and row_offset in {1, 3, 4, 6, 7, 8, 9, 10}
+        and column_index in {0, 1, 4, 5}
+    ):
+        style = 21
     return _label_right_aligned_style(style) if column_index == 5 and str(value or "").strip() else style
 
 
 def _label_right_aligned_style(style: int | None) -> int:
     if style == 7:
         return 17
+    if style == 21:
+        return 23
+    if style == 24:
+        return 25
     return 16
 
 
@@ -485,7 +516,7 @@ def _merge_range(row_index: int, start_column: int, end_column: int) -> str:
 
 
 def _label_merge_ranges(block_rows: list[list[object]], current_row: int) -> list[str]:
-    merges = [_merge_range(current_row, 0, 4)]
+    merges = [_merge_range(current_row, 0, 3), _merge_range(current_row, 4, 5)]
     if len(block_rows) > 1 and str(block_rows[1][0] or "") == "Continuation for":
         for offset in range(2, max(len(block_rows) - 1, 2)):
             merges.append(_merge_range(current_row + offset, 1, 2))
@@ -545,7 +576,9 @@ def _labels_sheet_xml(rows: list[dict], include_drawing: bool = False) -> str:
             detail_offset = _label_detail_offset(block_rows)
             item_block_end = len(block_rows) - 2 if label.get("Label Continuation") else _label_item_block_end_offset(block_rows)
             qty_header_offset = detail_offset + 1 if detail_offset >= 0 else 2 if label.get("Label Continuation") else -1
-            if offset == 0 or offset in footer_offsets:
+            if offset == 0:
+                height = ' ht="36" customHeight="1"'
+            elif offset in footer_offsets:
                 height = ' ht="28" customHeight="1"'
             elif offset in spacer_offsets:
                 height = ' ht="10" customHeight="1"'
@@ -642,7 +675,7 @@ def _drawing_xml(image_count: int, start_rows: list[int]) -> str:
     for index, start_row in enumerate(start_rows, start=1):
         anchors.append(
             '<xdr:oneCellAnchor>'
-            '<xdr:from><xdr:col>4</xdr:col><xdr:colOff>57150</xdr:colOff>'
+            '<xdr:from><xdr:col>3</xdr:col><xdr:colOff>457200</xdr:colOff>'
             f'<xdr:row>{max(start_row - 1, 0)}</xdr:row><xdr:rowOff>57150</xdr:rowOff></xdr:from>'
             '<xdr:ext cx="1524000" cy="1524000"/>'
             '<xdr:pic>'
@@ -894,7 +927,7 @@ def _styles_xml() -> str:
         '<numFmt numFmtId="164" formatCode="$#,##0.00&quot; (USD)&quot;"/>'
         '<numFmt numFmtId="165" formatCode="$#,##0.00"/>'
         '</numFmts>'
-        '<fonts count="9">'
+        '<fonts count="11">'
         '<font><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><sz val="12"/><name val="Calibri"/></font>'
@@ -904,6 +937,8 @@ def _styles_xml() -> str:
         '<font><b/><sz val="25"/><name val="Calibri"/></font>'
         '<font><b/><sz val="16"/><name val="Calibri"/></font>'
         '<font><color rgb="FFFF0000"/><sz val="11"/><name val="Calibri"/></font>'
+        '<font><sz val="15"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="31"/><name val="Calibri"/></font>'
         "</fonts>"
         '<fills count="3">'
         '<fill><patternFill patternType="none"/></fill>'
@@ -916,7 +951,7 @@ def _styles_xml() -> str:
         '<border><left style="thick"><color auto="1"/></left><right style="thick"><color auto="1"/></right><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
         '</borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="21">'
+        '<cellXfs count="26">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
@@ -938,6 +973,11 @@ def _styles_xml() -> str:
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
         '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
         '<xf numFmtId="0" fontId="8" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="9" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="9" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="9" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
+        '<xf numFmtId="0" fontId="10" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="10" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"

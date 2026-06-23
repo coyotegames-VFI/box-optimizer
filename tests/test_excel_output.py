@@ -256,7 +256,7 @@ def test_split_labels_sheets_have_drawing_relationships_for_qr_images(tmp_path, 
     assert "xl/media/label_qr_1001.png" in names
 
 
-def test_split_labels_preserve_country_package_code_and_chinese_on_later_sheets(tmp_path):
+def test_split_labels_display_country_code_and_preserve_chinese_on_later_sheets(tmp_path):
     path = tmp_path / "report.xlsx"
     labels = _label_rows(MAX_LABELS_PER_SHEET + 1)
     labels[-1].update(
@@ -272,12 +272,13 @@ def test_split_labels_preserve_country_package_code_and_chinese_on_later_sheets(
 
     labels_2_xml = _worksheet_xml(path, "Labels 2")
 
-    assert 'r="E1" t="inlineStr" s="17"><is><t>DE  2-1</t></is></c>' in labels_2_xml
+    assert 'r="E1" t="inlineStr" s="25"><is><t>DE</t></is></c>' in labels_2_xml
     assert "\u5fb7\u56fd" in labels_2_xml
+    assert "DE  2-1" not in labels_2_xml
     assert "UN  2-1" not in labels_2_xml
 
 
-def test_fast_production_split_labels_preserve_country_package_code_and_chinese(tmp_path):
+def test_fast_production_split_labels_display_country_code_and_preserve_chinese(tmp_path):
     path = tmp_path / "report.xlsx"
     labels = _label_rows(MAX_LABELS_PER_SHEET + 1)
     labels[-1].update(
@@ -301,8 +302,9 @@ def test_fast_production_split_labels_preserve_country_package_code_and_chinese(
 
     assert "Labels 2" in sheet_names
     assert "Label generator" not in sheet_names
-    assert 'r="E1" t="inlineStr" s="17"><is><t>FR  1</t></is></c>' in labels_2_xml
+    assert 'r="E1" t="inlineStr" s="25"><is><t>FR</t></is></c>' in labels_2_xml
     assert "\u6cd5\u56fd" in labels_2_xml
+    assert "FR  1" not in labels_2_xml
     assert "UN  1" not in labels_2_xml
 
 
@@ -658,18 +660,20 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert "VFI #" not in xml
     assert "Longhai Printworks" in xml
     assert "Campaign</t>" not in xml
-    assert 'r="A1" t="inlineStr" s="7"><is><t>OPR 39</t></is></c>' in xml
-    assert 'r="B1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert 'r="C1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert 'r="D1" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert 'r="E1" t="inlineStr" s="17"><is><t>NZ</t></is></c>' in xml
-    assert 'r="F1" t="inlineStr" s="17"><is><t></t></is></c>' in xml
+    assert 'r="A1" t="inlineStr" s="24"><is><t>39 OPR</t></is></c>' in xml
+    assert 'r="B1" t="inlineStr" s="24"><is><t></t></is></c>' in xml
+    assert 'r="C1" t="inlineStr" s="24"><is><t></t></is></c>' in xml
+    assert 'r="D1" t="inlineStr" s="24"><is><t></t></is></c>' in xml
+    assert 'r="E1" t="inlineStr" s="25"><is><t>NZ</t></is></c>' in xml
+    assert 'r="F1" t="inlineStr" s="25"><is><t></t></is></c>' in xml
     assert "Barcode / QR Value" not in xml
     assert "Country CN" not in xml
     assert "Total Value USD" not in xml
-    assert "OPR 39" in xml
-    assert "No.23 Baosheng Rd.,Bld2, 3rd Floor, Longhai" in xml
-    assert "Fujian, China 363107" in xml
+    assert "39 OPR" in xml
+    assert 'r="B4" t="inlineStr" s="21"><is><t>No.23 Baosheng Rd.,Bld2, 3rd Floor,</t></is></c>' in xml
+    assert 'r="B5" t="inlineStr" s="21"><is><t>Longhai, Fujian, China 363107</t></is></c>' in xml
+    assert "No.23 Baosheng Rd.,Bld2, 3rd Floor, Longhai" not in xml
+    assert "64 BATKIN ROAD" in xml
     assert "Ada Lovelace  Backer ID B-1" in xml
     assert "Notes: Leave package at front desk" in xml
     assert "CORE" in xml
@@ -704,7 +708,7 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert 'r="C7"' not in xml
     assert 'r="D7"' not in xml
     assert 'r="F10"' not in xml
-    assert 'r="A1" t="inlineStr" s="7"' in xml
+    assert 'r="A1" t="inlineStr" s="24"' in xml
     assert 'r="A12" t="inlineStr" s="10"' in xml
     assert 'r="A13" t="inlineStr" s="11"' in xml
     assert 'r="B13" t="inlineStr" s="12"' in xml
@@ -721,7 +725,8 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert 'r="F21" t="inlineStr" s="17"><is><t></t></is></c>' in xml
     assert 'r="B16"' not in xml
     assert '<font><sz val="18"/><name val="Calibri"/></font>' in styles_xml
-    assert '<font><b/><sz val="25"/><name val="Calibri"/></font>' in styles_xml
+    assert '<font><b/><sz val="31"/><name val="Calibri"/></font>' in styles_xml
+    assert '<font><sz val="15"/><name val="Calibri"/></font>' in styles_xml
     assert '<xf numFmtId="0" fontId="6" fillId="0" borderId="0" xfId="0" applyFont="1"/>' in styles_xml
     assert '<alignment vertical="top" wrapText="1"/>' in styles_xml
     assert '<borders count="3">' in styles_xml
@@ -741,7 +746,7 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert '<mergeCell ref="E14:F14"/>' in xml
     assert '<mergeCell ref="E10:F10"/>' in xml
     assert '<mergeCell ref="E7:F9"/>' in xml
-    assert 'r="E7" t="inlineStr" s="18"><is><t>Notes: Leave package at front desk</t></is></c>' in xml
+    assert 'r="E7" t="inlineStr" s="22"><is><t>Notes: Leave package at front desk</t></is></c>' in xml
     assert '<mergeCell ref="A19:F19"/>' in xml
     assert '<mergeCell ref="A20:B20"/>' in xml
     assert '<mergeCell ref="E20:F20"/>' in xml
@@ -759,7 +764,7 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     rows = root.findall(".//main:sheetData/main:row", NS)
     cols = root.findall(".//main:cols/main:col", NS)
     assert rows[0].attrib["r"] == "1"
-    assert rows[0].attrib["ht"] == "28"
+    assert rows[0].attrib["ht"] == "36"
     assert rows[5].attrib["ht"] == "10"
     assert rows[17].attrib["ht"] == "10"
     assert rows[13].attrib["ht"] == "22"
@@ -807,7 +812,7 @@ def test_labels_sheet_leaves_notes_area_unblocked_when_note_is_blank(tmp_path):
     assert 'r="F9"' not in xml
 
 
-def test_labels_sheet_top_right_header_uses_country_package_code_in_ef_merge(tmp_path):
+def test_labels_sheet_top_right_header_uses_country_code_only_in_ef_merge(tmp_path):
     path = tmp_path / "report.xlsx"
 
     write_workbook(
@@ -816,7 +821,6 @@ def test_labels_sheet_top_right_header_uses_country_package_code_in_ef_merge(tmp
             {
                 "Label Number": "42",
                 "Barcode/QR Value": "OPR 42",
-                "Country Code": "DE",
                 "Country Package Code": "DE  2-1",
                 "Country Name Chinese": "\u5fb7\u56fd",
                 "Items to Pack Column 1": "CORE x1",
@@ -826,10 +830,11 @@ def test_labels_sheet_top_right_header_uses_country_package_code_in_ef_merge(tmp
 
     xml = _worksheet_xml(path, "Labels")
 
-    assert 'r="E1" t="inlineStr" s="17"><is><t>DE  2-1</t></is></c>' in xml
-    assert 'r="F1" t="inlineStr" s="17"><is><t></t></is></c>' in xml
+    assert 'r="E1" t="inlineStr" s="25"><is><t>DE</t></is></c>' in xml
+    assert 'r="F1" t="inlineStr" s="25"><is><t></t></is></c>' in xml
     assert '<mergeCell ref="A1:D1"/>' in xml
     assert '<mergeCell ref="E1:F1"/>' in xml
+    assert "DE  2-1" not in xml
     assert "UN  2-1" not in xml
     assert "\u5fb7\u56fd" in xml
 
@@ -974,12 +979,12 @@ def test_labels_sheet_prints_continuation_label_for_overflow_items(tmp_path):
     assert '<c r="A25" t="inlineStr" s="13"><is><t>1</t></is></c>' in xml
     assert '<c r="D25" t="inlineStr" s="13"><is><t></t></is></c>' in xml
     assert xml.count("64 BATKIN ROAD") == 1
-    assert '<c r="A21" t="inlineStr" s="7"><is><t>39</t></is></c>' in xml
-    assert '<c r="B21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert '<c r="C21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert '<c r="D21" t="inlineStr" s="7"><is><t></t></is></c>' in xml
-    assert '<c r="E21" t="inlineStr" s="17"><is><t>NZ</t></is></c>' in xml
-    assert '<c r="F21" t="inlineStr" s="17"><is><t></t></is></c>' in xml
+    assert '<c r="A21" t="inlineStr" s="24"><is><t>39</t></is></c>' in xml
+    assert '<c r="B21" t="inlineStr" s="24"><is><t></t></is></c>' in xml
+    assert '<c r="C21" t="inlineStr" s="24"><is><t></t></is></c>' in xml
+    assert '<c r="D21" t="inlineStr" s="24"><is><t></t></is></c>' in xml
+    assert '<c r="E21" t="inlineStr" s="25"><is><t>NZ</t></is></c>' in xml
+    assert '<c r="F21" t="inlineStr" s="25"><is><t></t></is></c>' in xml
     assert '<c r="B22" t="inlineStr" s="2"><is><t>39  CONTINUED  Config: 4</t></is></c>' in xml
     assert '<mergeCell ref="A21:D21"/>' in xml
     assert '<mergeCell ref="E21:F21"/>' in xml

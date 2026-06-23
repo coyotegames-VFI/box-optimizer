@@ -4902,8 +4902,8 @@ def _labels_rows_in_print_order(rows: list[dict]) -> list[dict]:
         for _, row in sorted(
             indexed_rows,
             key=lambda item: (
-                _label_print_pledge_sort_key(item[1].get("Pledge Configuration", "")),
                 str(item[1].get("Country") or item[1].get("Country Code") or "").strip().casefold(),
+                _label_print_pledge_sort_key(item[1].get("Pledge Configuration", "")),
                 item[0],
             ),
         )
