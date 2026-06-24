@@ -128,6 +128,7 @@ def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
         "VFI Intake Form",
         "Optimized to Pack",
         "Box Size Summary",
+        "Errors and Warnings",
     ]
     assert "Label generator" not in sheet_names
     assert "Order Volume Weights" not in sheet_names
@@ -135,6 +136,7 @@ def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
     assert "Multi Box Detail" not in sheet_names
     assert "Pledge Combination Summary" not in sheet_names
     assert "Debug Summary" not in sheet_names
+    assert "Errors and Warnings" in sheet_names
 
     stats = workbook_sheet_stats(
         summary_rows=[{"Metric": "Orders", "Value": 2}],
@@ -506,8 +508,8 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
         sheets={"Cost Summary - Sordane": [{"Order ID": "1", "Hub Shipping Fee": 12}]},
         labels_rows=[{"Label Number": "39", "Barcode/QR Value": "OPR 39"}],
         country_scan_sheets={
-            "Hong Kong": [{"Country Number": "Hong Kong 1", "VFI #": "39", "Barcode Value": "OPR 39"}],
-            "Singapore": [{"Country Number": "Singapore 1", "VFI #": "40", "Barcode Value": "OPR 40"}],
+            "Hong Kong": [{"Country": "Hong Kong", "VFI #": "OPR 39", "": ""}],
+            "Singapore": [{"Country": "Singapore", "VFI #": "OPR 40", "": ""}],
         },
     )
 
@@ -515,7 +517,7 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
 
     assert sheet_names[1:5] == ["Cost Summary - Sordane", "Labels", "Hong Kong", "Singapore"]
     hong_kong_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Hong Kong")
-    assert hong_kong_rows == [{"Country Number": "Hong Kong 1", "VFI #": "39", "Barcode Value": "OPR 39"}]
+    assert hong_kong_rows == [{"Country": "Hong Kong", "VFI #": "OPR 39"}]
 
 
 def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
@@ -750,7 +752,7 @@ def test_labels_sheet_uses_printable_carrier_block_layout(tmp_path):
     assert '<mergeCell ref="A19:F19"/>' in xml
     assert '<mergeCell ref="A20:B20"/>' in xml
     assert '<mergeCell ref="E20:F20"/>' in xml
-    assert '<mergeCell ref="A21:B21"/>' in xml
+    assert '<mergeCell ref="A21:D21"/>' in xml
     assert '<mergeCell ref="E21:F21"/>' in xml
     assert '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>' in xml
     assert '<printOptions horizontalCentered="1"/>' in xml

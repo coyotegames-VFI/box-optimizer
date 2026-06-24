@@ -37,7 +37,6 @@ FAST_PRODUCTION_SKIPPED_SHEETS = {
     "Pledge Combination Summary",
     "Debug Summary",
     "Input Column Mapping",
-    "Errors and Warnings",
 }
 
 MAX_LABELS_PER_SHEET = 1000
@@ -108,6 +107,12 @@ def _header_with_units(header: str) -> str:
 def _display_header_for_sheet(sheet_name: str, header: str) -> str:
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee", "Express"}:
         return f"{header} (USD)"
+    if header == "Country Detail":
+        return "Country"
+    if header in {"_Country Scan Blank Column C", "_Country Scan Future Cost Blank"}:
+        return ""
+    if header.startswith("_Country Scan Metadata Blank "):
+        return ""
     return _header_with_units(header)
 
 
@@ -542,7 +547,10 @@ def _label_merge_ranges(block_rows: list[list[object]], current_row: int) -> lis
             merges.append(_merge_range(row_index, 0, 1))
             merges.append(_merge_range(row_index, 4, 5))
         if offset == len(block_rows) - 1:
-            merges.append(_merge_range(row_index, 0, 1))
+            if len(row) > 3 and not str(row[2] or "").strip() and not str(row[3] or "").strip():
+                merges.append(_merge_range(row_index, 0, 3))
+            else:
+                merges.append(_merge_range(row_index, 0, 1))
             merges.append(_merge_range(row_index, 4, 5))
     return merges
 
@@ -722,6 +730,8 @@ def _headers_for_sheet(sheet_name: str, rows: list[dict]) -> list[str]:
 
     for row in rows:
         for key in row:
+            if key == "_Country Scan Metadata":
+                continue
             if key not in seen:
                 seen.add(key)
                 headers.append(key)
@@ -1053,6 +1063,7 @@ def _build_sheet_payloads(
             "VFI Intake Form",
             "Optimized to Pack",
             "Box Size Summary",
+            "Errors and Warnings",
             *country_scan_sheets.keys(),
         }
         ordered = [

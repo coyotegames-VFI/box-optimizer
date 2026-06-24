@@ -761,8 +761,8 @@ def test_single_item_larger_than_cap_is_warned_not_fatal(tmp_path):
     _write_csv(
         orders_path,
         [
-            {"Order ID": "OK-1", "SKU": "Good", "Quantity": "1"},
-            {"Order ID": "BAD-1", "SKU": "Huge", "Quantity": "1"},
+            {"Order ID": "OK-1", "SKU": "Good", "Quantity": "1", "Country": "", "Backer ID": ""},
+            {"Order ID": "BAD-1", "SKU": "Huge", "Quantity": "1", "Country": "Germany", "Backer ID": "B-BAD"},
         ],
     )
 
@@ -783,7 +783,73 @@ def test_single_item_larger_than_cap_is_warned_not_fatal(tmp_path):
     warning_rows = next(
         sheet.rows for sheet in workbook_rows if sheet.sheet_name == "Errors and Warnings"
     )
-    assert any(row["Order ID"] == "BAD-1" and row["Error Type"] == "OversizedItem" for row in warning_rows)
+    oversized = next(row for row in warning_rows if row["Order ID"] == "BAD-1" and row["Error Type"] == "OversizedItem")
+    assert oversized["Severity"] == "Error"
+    assert oversized["SKU"] == "HUGE"
+    assert oversized["Backer ID"] == "B-BAD"
+    assert oversized["Country"] == "Germany"
+    assert "74 x 37 x 44 cm" in oversized["Message"]
+    assert "Carton cap: 74 x 37 x 44 cm" in oversized["Box/Fit Context"]
+
+    summary_rows = next(sheet.rows for sheet in workbook_rows if sheet.sheet_name == "Summary")
+    summary_warning = next(
+        row for row in summary_rows if row["Section"] == "Packing Errors" and row.get("SKU") == "HUGE"
+    )
+    assert summary_warning["Severity"] == "Error"
+    assert summary_warning["SKU"] == "HUGE"
+    assert summary_warning["Order ID"] == "BAD-1"
+    assert summary_warning["Backer ID"] == "B-BAD"
+    assert summary_warning["Country"] == "Germany"
+    assert "74 x 37 x 44 cm" in summary_warning["Reason / Message"]
+
+
+def test_summary_shows_errors_only_and_keeps_nonblocking_warnings_off_front_sheet():
+    rows = workflow_module._clean_summary_rows(
+        {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+        },
+        [],
+        [],
+        {},
+        errors_and_warnings_rows=[
+            {
+                "Severity": "Warning",
+                "Order ID": "WARN-1",
+                "Backer ID": "B-WARN",
+                "Country": "France",
+                "SKU": "CORE",
+                "Stage": "report",
+                "Error Type": "RetailBulkReview",
+                "Message": "Non-blocking review warning.",
+                "Box/Fit Context": "VB 1",
+            },
+            {
+                "Severity": "Error",
+                "Order ID": "ERR-1",
+                "Backer ID": "B-ERR",
+                "Country": "Germany",
+                "SKU": "HUGE",
+                "Stage": "packing",
+                "Error Type": "OversizedItem",
+                "Message": "SKU HUGE could not be packed: exceeds carton cap.",
+                "Box/Fit Context": "Carton cap: 74 x 37 x 44 cm",
+            },
+        ],
+    )
+
+    error_rows = [row for row in rows if row["Section"] == "Packing Errors"]
+    assert len(error_rows) == 1
+    assert error_rows[0]["Severity"] == "Error"
+    assert error_rows[0]["SKU"] == "HUGE"
+    assert error_rows[0]["Reason / Message"] == "SKU HUGE could not be packed: exceeds carton cap."
+    assert error_rows[0]["Order ID"] == "ERR-1"
+    assert error_rows[0]["Backer ID"] == "B-ERR"
+    assert error_rows[0]["Country"] == "Germany"
+    assert error_rows[0]["Box/Fit Context"] == "Carton cap: 74 x 37 x 44 cm"
+    assert all(row.get("SKU") != "CORE" for row in rows if row["Section"] == "Packing Errors")
 
 
 def test_optimized_carton_dimensions_remain_capped_but_vendor_assignment_can_exceed_old_cap(tmp_path):
@@ -1787,6 +1853,77 @@ def test_order_metadata_columns_survive_at_end_of_order_volume_weights(tmp_path)
     assert row["Shipping Method"] == "Courier"
     assert row["Notes"] == "Leave with desk"
     assert headers.index("Backer Number") > headers.index("SKU Breakdown")
+
+
+def test_country_tab_uses_raw_order_volume_metadata_and_preserves_nonstandard_headers(tmp_path):
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [{"SKU": "Core", "Product Name": "Core", "Length": "5", "Width": "5", "Height": "5", "Weight kg": "1"}],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {
+                "Order ID": "1",
+                "SKU": "Core",
+                "Quantity": "1",
+                "Country": "Hong Kong",
+                "Backer Number": "BK-7",
+                "Name": "Ada Lovelace",
+                "Email": "ada@example.com",
+                "Address 1": "1 Algorithm Ave",
+                "Address 2": "Unit 9",
+                "Add to": "Apartment call box 7",
+                "Tax ID number": "HK-TAX",
+                "Shipping Method": "Courier",
+            }
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config={"preserve_region_sheets": False, "campaign_label_prefix": "TEST"},
+    )
+
+    order_row = _sheet_rows(output_path, "Order Volume Weights")[0]
+    country_row = _sheet_rows(output_path, "Hong Kong")[0]
+    metadata_headers = [
+        "Backer Number",
+        "Name",
+        "Email",
+        "Address 1",
+        "Address 2",
+        "Add to",
+        "Tax ID number",
+        "Shipping Method",
+    ]
+    assert country_row["SKU"] == order_row["SKU"]
+    assert country_row["Quantity"] == order_row["Quantity"]
+    for header in metadata_headers:
+        assert country_row[header] == order_row[header]
+    assert "Original Optimized Box Type" not in country_row
+    assert "Shipping name" not in country_row
+    assert "Address Line 1" not in country_row
+    assert "Address Line 2" not in country_row
+
+    hong_kong_xml = _sheet_xml(output_path, "Hong Kong")
+    assert [_inline_cell_text(hong_kong_xml, cell) for cell in ["A1", "B1", "C1", "D1", "M1", "N1", "O1"]] == [
+        "Country",
+        "VFI #",
+        "",
+        "SKU",
+        "Shipping Method",
+        "",
+        "Items in this box / SKU contents",
+    ]
+    assert _inline_cell_text(hong_kong_xml, "L2") == "HK-TAX"
+    assert _inline_cell_text(hong_kong_xml, "N2") == ""
+    assert _inline_cell_text(hong_kong_xml, "O2") == "(1)  CORE x1"
 
 
 def test_clean_default_order_volume_weights_hides_audit_columns(tmp_path):
@@ -2802,7 +2939,7 @@ def test_country_package_codes_use_country_name_fallback_before_un_fallback():
     ]
 
 
-def test_cost_summary_country_number_is_column_c_and_keeps_shipping_fee_columns_q_r():
+def test_cost_summary_removes_country_number_and_keeps_destination_country_and_vfi():
     rows = workflow_module._cost_summary_rows(
         [
             {
@@ -2818,10 +2955,10 @@ def test_cost_summary_country_number_is_column_c_and_keeps_shipping_fee_columns_
         workflow_module.CustomerRateSheetSelection(sheet=None, path="", filename="", source="missing"),
     )
 
-    assert list(rows[0])[:3] == ["Backer ID", "VFI #", "Country Number"]
-    assert list(rows[0]).index("Shipping Method") == 15
-    assert list(rows[0]).index("Hub Shipping Fee") == 16
-    assert list(rows[0]).index("Express") == 17
+    assert "Country Number" not in rows[0]
+    assert list(rows[0])[:3] == ["Backer ID", "VFI #", "Shipping name"]
+    assert rows[0]["VFI #"] == "1"
+    assert rows[0]["Country"] == "Hong Kong"
 
 
 def test_label_generator_and_label_header_carry_country_package_code_to_continuations():
@@ -2887,13 +3024,14 @@ def test_country_scan_sheets_group_barcode_values_by_country_in_label_order():
         ]
     )
 
-    assert [row["Barcode Value"] for row in sheets["Hong Kong"]] == ["VEST 1", "VEST 3"]
-    assert sheets["Singapore"][0]["Barcode Value"] == "VEST 2"
-    assert "Bad_Name" in sheets
-    assert "Bad_Name 2" in sheets
+    assert [row["VFI #"] for row in sheets["Hong Kong"]] == ["VEST 1", "VEST 3"]
+    assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["VEST 4", "VEST 5", "VEST 2"]
+    assert "Barcode Value" not in sheets["Hong Kong"][0]
+    assert "Bad_Name" not in sheets
+    assert "Bad_Name 2" not in sheets
 
 
-def test_country_scan_sheets_sort_country_numbers_numerically_and_keep_barcodes_paired():
+def test_country_scan_sheets_keep_final_label_order_and_use_vfi_barcode_values():
     sheets = workflow_module._country_scan_sheets(
         [
             {"Country Name": "Hong Kong", "Country Number": "Hong Kong 10", "Label Number": "10", "Label numbers": "VEST 10"},
@@ -2908,24 +3046,18 @@ def test_country_scan_sheets_sort_country_numbers_numerically_and_keep_barcodes_
 
     hong_kong_rows = sheets["Hong Kong"]
 
-    assert [row["Country Number"] for row in hong_kong_rows] == [
-        "Hong Kong 1",
-        "Hong Kong 2",
-        "Hong Kong 3",
-        "Hong Kong 10",
-        "Hong Kong 21-1",
-        "Hong Kong 21-2",
-        "Hong Kong 22-1",
-    ]
-    assert [row["Barcode Value"] for row in hong_kong_rows] == [
-        "VEST 1",
-        "VEST 2",
-        "VEST 3",
+    assert "Country Number" not in hong_kong_rows[0]
+    assert [row["VFI #"] for row in hong_kong_rows] == [
         "VEST 10",
-        "VEST 21-1",
+        "VEST 1",
+        "VEST 3",
+        "VEST 2",
         "VEST 21-2",
         "VEST 22-1",
+        "VEST 21-1",
     ]
+    assert list(hong_kong_rows[0])[:2] == ["Country", "VFI #"]
+    assert "Barcode Value" not in hong_kong_rows[0]
 
 
 def test_label_generator_populates_simplified_chinese_country_from_two_letter_code():
@@ -3216,7 +3348,7 @@ def test_labels_rows_prefix_item_lines_with_intake_picking_order():
     assert label_rows[0]["Items to Pack Column 2"] == ""
 
 
-def test_labels_rows_print_order_groups_by_country_then_pledge_stably():
+def test_labels_rows_print_order_groups_hub_countries_first_then_pledge_stably():
     label_rows = [
         {
             "Pledge Configuration": 2,
@@ -3248,6 +3380,18 @@ def test_labels_rows_print_order_groups_by_country_then_pledge_stably():
             "Order ID": "E",
             "Label Value": "LC 5",
         },
+        {
+            "Pledge Configuration": "10",
+            "Country": "Germany",
+            "Order ID": "F",
+            "Label Value": "LC 6",
+        },
+        {
+            "Pledge Configuration": "2",
+            "Country": "France",
+            "Order ID": "G",
+            "Label Value": "LC 7",
+        },
     ]
 
     ordered_rows = workflow_module._labels_rows_in_print_order(label_rows)
@@ -3258,10 +3402,115 @@ def test_labels_rows_print_order_groups_by_country_then_pledge_stably():
         "China",
         "United States",
         "United States",
+        "France",
+        "Germany",
     ]
-    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 1, 2, 1, 2]
-    assert [row["Order ID"] for row in ordered_rows] == ["C", "D", "E", "B", "A"]
-    assert [row["Label Value"] for row in ordered_rows] == ["LC 2", "LC 3", "LC 5", "LC 1", "LC 4"]
+    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 1, 2, 1, 2, "2", "10"]
+    assert [row["Order ID"] for row in ordered_rows] == ["C", "D", "E", "B", "A", "G", "F"]
+    assert [row["Label Value"] for row in ordered_rows] == ["LC 2", "LC 3", "LC 5", "LC 1", "LC 4", "LC 7", "LC 6"]
+
+
+def test_visible_vfi_numbers_are_assigned_after_country_first_print_order_and_drive_scan_values():
+    label_rows = [
+        {
+            "Pledge Configuration": 2,
+            "Country": "Hong Kong",
+            "Order ID": "HK-C2",
+            "Box Number": 1,
+            "Box Qty": 1,
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+        {
+            "Pledge Configuration": 1,
+            "Country": "China",
+            "Order ID": "CN-C1",
+            "Box Number": 1,
+            "Box Qty": 1,
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+        {
+            "Pledge Configuration": 3,
+            "Country": "China",
+            "Order ID": "CN-C3",
+            "Box Number": 1,
+            "Box Qty": 3,
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+        {
+            "Pledge Configuration": 3,
+            "Country": "China",
+            "Order ID": "CN-C3",
+            "Box Number": 2,
+            "Box Qty": 3,
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+        {
+            "Pledge Configuration": 3,
+            "Country": "China",
+            "Order ID": "CN-C3",
+            "Box Number": 3,
+            "Box Qty": 3,
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+        {
+            "Pledge Configuration": 3,
+            "Country": "China",
+            "Order ID": "CN-C3",
+            "Box Number": 3,
+            "Box Qty": 3,
+            "Label Continuation": True,
+            "Original Label Number": "old continued",
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+        {
+            "Pledge Configuration": 2,
+            "Country": "China",
+            "Order ID": "CN-C2",
+            "Box Number": 1,
+            "Box Qty": 1,
+            "Label Value": "old",
+            "Barcode/QR Value": "old",
+        },
+    ]
+
+    ordered_rows = workflow_module._labels_rows_in_print_order(label_rows)
+    numbered_rows, display_vfi_by_order, _display_label_by_package = workflow_module._assign_visible_vfi_numbers(
+        ordered_rows,
+        "emerald",
+    )
+
+    main_rows = [row for row in numbered_rows if not row.get("Label Continuation")]
+    assert [row["Country"] for row in main_rows] == ["China", "China", "China", "China", "China", "Hong Kong"]
+    assert [row["Pledge Configuration"] for row in main_rows] == [1, 2, 3, 3, 3, 2]
+    assert [row["Barcode/QR Value"] for row in main_rows] == [
+        "1 emerald",
+        "2 emerald",
+        "3 1 of 3 emerald",
+        "3 2 of 3 emerald",
+        "3 3 of 3 emerald",
+        "4 emerald",
+    ]
+    continuation = next(row for row in numbered_rows if row.get("Label Continuation"))
+    assert continuation["Original Label Number"] == "3 3 of 3 emerald"
+    assert continuation["Barcode/QR Value"] == "3 3 of 3 emerald"
+    assert display_vfi_by_order["CN-C3"] == "3 emerald"
+
+    scan_sheets = workflow_module._country_scan_sheets(numbered_rows)
+    assert [row["VFI #"] for row in scan_sheets["China"]] == [
+        "1 emerald",
+        "2 emerald",
+        "3 1 of 3 emerald",
+        "3 2 of 3 emerald",
+        "3 3 of 3 emerald",
+    ]
+    assert scan_sheets["Hong Kong"][0]["VFI #"] == "4 emerald"
+    assert scan_sheets["China"][0]["Items in this box / SKU contents"] == ""
 
 
 def test_labels_rows_respect_campaign_item_line_controls_and_report_overflow():
@@ -3443,7 +3692,7 @@ def test_label_sku_breakdown_follows_sku_master_order(tmp_path):
     assert optimized_row["Box 1"].endswith("CORE x1, ADDON x2, COIN x3")
 
 
-def test_workbook_country_numbering_summary_counts_and_scan_tabs_use_same_sequence(tmp_path):
+def test_workbook_cost_summary_removes_country_number_and_scan_tabs_use_label_vfi_values(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
     output_path = tmp_path / "optimized.xlsx"
@@ -3473,11 +3722,9 @@ def test_workbook_country_numbering_summary_counts_and_scan_tabs_use_same_sequen
     assert sheet_names[labels_index + 1 : labels_index + 3] == ["Hong Kong", "Singapore"]
 
     cost_rows = _sheet_rows(output_path, "Cost Summary")
-    assert [row["Country Number"] for row in cost_rows] == [
-        "Hong Kong 1",
-        "Singapore 1",
-        "Hong Kong 2",
-    ]
+    assert "Country Number" not in cost_rows[0]
+    assert [row["Country"] for row in cost_rows] == ["Hong Kong", "Hong Kong", "Singapore"]
+    assert [row["VFI #"] for row in cost_rows] == ["1 TEST", "2 TEST", "3 TEST"]
 
     summary_rows = _sheet_rows(output_path, "Summary")
     country_counts = {
@@ -3489,10 +3736,22 @@ def test_workbook_country_numbering_summary_counts_and_scan_tabs_use_same_sequen
 
     hong_kong_scan = _sheet_rows(output_path, "Hong Kong")
     singapore_scan = _sheet_rows(output_path, "Singapore")
-    assert [row["Country Number"] for row in hong_kong_scan] == ["Hong Kong 1", "Hong Kong 2"]
-    assert [row["Barcode Value"] for row in hong_kong_scan] == ["TEST 1", "TEST 3"]
-    assert singapore_scan[0]["Country Number"] == "Singapore 1"
-    assert singapore_scan[0]["Barcode Value"] == "TEST 2"
+    assert "Country Number" not in hong_kong_scan[0]
+    assert [row["VFI #"] for row in hong_kong_scan] == ["1 TEST", "2 TEST"]
+    assert "Barcode Value" not in hong_kong_scan[0]
+    hong_kong_xml = _sheet_xml(output_path, "Hong Kong")
+    assert _inline_cell_text(hong_kong_xml, "A1") == "Country"
+    assert _inline_cell_text(hong_kong_xml, "B1") == "VFI #"
+    assert _inline_cell_text(hong_kong_xml, "C1") == ""
+    assert _inline_cell_text(hong_kong_xml, "C2") == ""
+    assert singapore_scan[0]["VFI #"] == "3 TEST"
+    assert "Backer ID" not in hong_kong_scan[0]
+    assert "Order ID" not in hong_kong_scan[0]
+    assert hong_kong_scan[0]["Items in this box / SKU contents"] == "(1)  CORE x1"
+    assert "Package / carton identifier" not in hong_kong_scan[0]
+    assert "Carton index" not in hong_kong_scan[0]
+    assert "Total cartons" not in hong_kong_scan[0]
+    assert "Pledge Configuration" not in hong_kong_scan[0]
 
 
 def test_label_generator_carries_first_valid_backer_notes_and_ignores_sku_notes():
@@ -3517,6 +3776,150 @@ def test_label_generator_carries_first_valid_backer_notes_and_ignores_sku_notes(
     assert workflow_module._valid_order_notes_header("Delivernotes")
     assert not workflow_module._valid_order_notes_header("SKU Notes")
     assert labels[0]["Notes"] == "Leave package at front desk"
+
+
+def test_country_scan_sheets_use_active_hub_pricing_and_preserve_intake_metadata(tmp_path):
+    rate_sheet = workflow_module.CustomerRateSheet(
+        hub=workflow_module.CustomerRateLane(
+            rates_by_zone={
+                "Zone JP": {1.0: 10.0},
+                "Zone SG": {1.0: 12.0},
+            },
+            zone_by_country={
+                "japan": "Zone JP",
+                "jp": "Zone JP",
+                "singapore": "Zone SG",
+                "sg": "Zone SG",
+            },
+            method_by_country={},
+        ),
+        express=workflow_module.CustomerRateLane(
+            rates_by_zone={},
+            zone_by_country={},
+            method_by_country={},
+        ),
+    )
+    label_rows = [
+        {
+            "Country": "Japan",
+            "Barcode/QR Value": "1 VFI",
+            "Order ID": "JP-1",
+            "Items to Pack Column 1": "CORE x1",
+            "_Country Scan Metadata": {
+                "Backer ID": "B-JP",
+                "Name": "Japan Backer",
+                "Email": "jp@example.com",
+                "Address 1": "1 Tokyo Rd",
+                "Address 2": "Suite 7",
+                "City": "Tokyo",
+                "Postal/Zip": "100",
+                "Add to": "Apartment call box 7",
+                "Tax ID number": "JP-TAX",
+                "Tax ID": "JP-TAX-ALT",
+                "Original Optimized Box Type": "VB 4",
+            },
+        },
+        {
+            "Country": "Singapore",
+            "Barcode/QR Value": "2 VFI",
+            "Backer ID": "B-SG",
+            "To Name": "Singapore Backer",
+            "Email": "sg@example.com",
+            "Address Line 1": "2 Marina Way",
+            "Address Line 2": "#02-01",
+            "City": "Singapore",
+            "Postal/Zip": "018956",
+            "Order ID": "SG-1",
+            "Items to Pack Column 1": "CORE x1",
+            "VAT": "SG-VAT",
+        },
+        {
+            "Country": "Germany",
+            "Barcode/QR Value": "3 VFI",
+            "Backer ID": "B-DE",
+            "To Name": "Germany Backer",
+            "Order ID": "DE-1",
+            "Items to Pack Column 1": "CORE x1",
+            "Company": "DE Company",
+            "Original Optimized Box Type": "VB 8",
+        },
+        {
+            "Country": "France",
+            "Barcode/QR Value": "4 VFI",
+            "Backer ID": "B-FR",
+            "To Name": "France Backer",
+            "Order ID": "FR-1",
+            "Items to Pack Column 1": "CORE x1",
+        },
+    ]
+
+    sheets = workflow_module._country_scan_sheets(label_rows, rate_sheet)
+
+    assert list(sheets) == ["Japan", "Singapore", "Non-Hub Countries"]
+    assert [row["Country"] for row in sheets["Non-Hub Countries"]] == ["France", "Germany"]
+    assert sheets["Japan"][0]["Add to"] == "Apartment call box 7"
+    assert sheets["Japan"][0]["Tax ID number"] == "JP-TAX"
+    assert sheets["Japan"][0]["Tax ID"] == "JP-TAX-ALT"
+    assert sheets["Japan"][0]["Address 2"] == "Suite 7"
+    assert "add 2" not in sheets["Japan"][0]
+    assert sheets["Singapore"][0]["Address Line 2"] == "#02-01"
+    assert sheets["Singapore"][0]["VAT"] == "SG-VAT"
+    assert sheets["Non-Hub Countries"][1]["Company"] == "DE Company"
+    for sheet_rows in sheets.values():
+        assert "Barcode Value" not in sheet_rows[0]
+        assert "Barcode/QR Value" not in sheet_rows[0]
+        assert "Package Carton Identifier" not in sheet_rows[0]
+        assert "Carton Index" not in sheet_rows[0]
+        assert "Total Cartons" not in sheet_rows[0]
+        assert "Pledge Configuration" not in sheet_rows[0]
+        assert "Original Optimized Box Type" not in sheet_rows[0]
+
+    output_path = tmp_path / "country_scan.xlsx"
+    excel_writer_module.write_workbook(str(output_path), country_scan_sheets=sheets)
+    japan_xml = _sheet_xml(output_path, "Japan")
+    assert _inline_cell_text(japan_xml, "A1") == "Country"
+    assert _inline_cell_text(japan_xml, "B1") == "VFI #"
+    assert _inline_cell_text(japan_xml, "C1") == ""
+    assert _inline_cell_text(japan_xml, "C2") == ""
+    assert [
+        _inline_cell_text(japan_xml, reference)
+        for reference in [
+            "A1",
+            "B1",
+            "C1",
+            "D1",
+            "E1",
+            "F1",
+            "G1",
+            "H1",
+            "I1",
+            "J1",
+            "K1",
+            "L1",
+            "M1",
+            "N1",
+            "O1",
+        ]
+    ] == [
+        "Country",
+        "VFI #",
+        "",
+        "Backer ID",
+        "Name",
+        "Email",
+        "Address 1",
+        "Address 2",
+        "City",
+        "Postal/Zip",
+        "Add to",
+        "Tax ID number",
+        "Tax ID",
+        "",
+        "Items in this box / SKU contents",
+    ]
+    assert _inline_cell_text(japan_xml, "H2") == "Suite 7"
+    assert _inline_cell_text(japan_xml, "N2") == ""
+    assert _inline_cell_text(japan_xml, "O2") == "CORE x1"
 
 
 def test_label_generator_does_not_duplicate_order_notes_for_multi_carton_orders():
@@ -3693,7 +4096,7 @@ def test_identical_sku_combinations_reuse_packing_plan_and_preserve_metadata(tmp
     order_rows = {row["Order ID"]: row for row in _sheet_rows(output_path, "Order Volume Weights")}
     assert order_rows["1001"]["Name"] == "Alice"
     assert order_rows["1002"]["Name"] == "Bob"
-    assert [row["VFI #"] for row in sorted(order_rows.values(), key=lambda row: row["Order ID"])] == ["VFI-1", "VFI-2"]
+    assert [row["VFI #"] for row in sorted(order_rows.values(), key=lambda row: row["Order ID"])] == ["1 VFI", "2 VFI"]
     detail_rows = sorted(_sheet_rows(output_path, "Multi Box Detail"), key=lambda row: row["Order ID"])
     assert [row["Order Box ID"] for row in detail_rows] == ["1001-1", "1002-1"]
     assert {row["Length cm"] for row in detail_rows} == {"23"}
@@ -3701,7 +4104,7 @@ def test_identical_sku_combinations_reuse_packing_plan_and_preserve_metadata(tmp
     assert [row["Order ID"] for row in label_rows] == ["1001", "1002"]
     cost_rows = sorted(_sheet_rows(output_path, "Cost Summary"), key=lambda row: row["Backer ID"])
     assert len(cost_rows) == 2
-    assert [row["VFI #"] for row in cost_rows] == ["VFI-1", "VFI-2"]
+    assert [row["VFI #"] for row in cost_rows] == ["1 VFI", "2 VFI"]
     debug_rows = {
         row["Metric"]: row["Value"]
         for row in _sheet_rows(output_path, "Debug Summary")
@@ -5322,7 +5725,7 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     label_generator_rows = _sheet_rows(output_path, "Label generator")
     assert label_generator_rows[0]["Order ID"] == "1"
     assert label_generator_rows[0]["Pledge Configuration"] == "1"
-    assert label_generator_rows[0]["Label numbers"] == "LC 1"
+    assert label_generator_rows[0]["Label numbers"] == "1 LC"
     assert "Box Qty" not in label_generator_rows[0]
     assert label_generator_rows[0]["Total Units"] == "1"
     assert label_generator_rows[0]["SKU Breakdown"] == "CORE x1"
@@ -5516,9 +5919,9 @@ def test_fast_production_workbook_keeps_operational_sheets_and_internal_calculat
         "Multi Box Detail",
         "Debug Summary",
         "Input Column Mapping",
-        "Errors and Warnings",
     ]:
         assert skipped_sheet not in sheet_names
+    assert "Errors and Warnings" in sheet_names
 
     assert summary["workbook_output_mode"] == "fast_production"
     assert summary["country_sheet_count"] == 2
@@ -5536,7 +5939,7 @@ def test_fast_production_workbook_keeps_operational_sheets_and_internal_calculat
 
     cost_rows = _sheet_rows(output_path, "Cost Summary")
     assert len(cost_rows) == 2
-    assert {row["VFI #"] for row in cost_rows} == {"VFI-1", "VFI-2"}
+    assert {row["VFI #"] for row in cost_rows} == {"1 VFI", "2 VFI"}
     labels_xml = _sheet_xml(output_path, "Labels")
     assert "B-1" in labels_xml
     assert "B-2" in labels_xml
@@ -6273,7 +6676,7 @@ def test_phase_a_cost_summary_falls_back_when_campaign_name_missing(tmp_path):
 
 
 
-def test_phase_b_vfi_numbers_follow_optimized_to_pack_sequence_while_cost_summary_keeps_input_order(tmp_path):
+def test_phase_b_vfi_numbers_and_cost_summary_follow_final_label_order(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
     output_path = tmp_path / "optimized.xlsx"
@@ -6310,15 +6713,15 @@ def test_phase_b_vfi_numbers_follow_optimized_to_pack_sequence_while_cost_summar
 
     order_rows = _sheet_rows(output_path, "Order Volume Weights")
     assert [row["Order ID"] for row in order_rows] == ["2", "3", "1"]
-    assert [row["VFI #"] for row in order_rows] == ["LC-1", "LC-2", "LC-3"]
+    assert [row["VFI #"] for row in order_rows] == ["1 LC", "2 LC", "3 LC"]
 
     cost_rows = _sheet_rows(output_path, "Cost Summary - Launch Campaign")
-    assert [row["Backer ID"] for row in cost_rows] == ["B-1", "B-2", "B-3"]
-    assert [row["VFI #"] for row in cost_rows] == ["LC-3", "LC-1", "LC-2"]
+    assert [row["Backer ID"] for row in cost_rows] == ["B-2", "B-3", "B-1"]
+    assert [row["VFI #"] for row in cost_rows] == ["1 LC", "2 LC", "3 LC"]
 
     label_rows = _sheet_rows(output_path, "Label generator")
     assert [row["Order ID"] for row in label_rows] == ["2", "3", "1"]
     assert "VFI #" not in label_rows[0]
     assert [row["Pledge Configuration"] for row in label_rows] == ["1", "1", "2"]
-    assert [row["Label numbers"] for row in label_rows] == ["LC 1", "LC 2", "LC 3"]
+    assert [row["Label numbers"] for row in label_rows] == ["1 LC", "2 LC", "3 LC"]
     assert "Box Qty" not in label_rows[0]

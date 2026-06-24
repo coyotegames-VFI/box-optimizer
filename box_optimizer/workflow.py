@@ -117,6 +117,9 @@ class WorkflowWarning:
     sku_breakdown: str = ""
     sku: str = ""
     rule_applied: str = ""
+    country: str = ""
+    backer_id: str = ""
+    context: str = ""
 
 
 @dataclass(frozen=True)
@@ -1288,6 +1291,46 @@ def _normalize_country(country: str | None) -> str:
         if _normalize_lookup_key(name) == key:
             return name
     return raw
+
+
+_OPERATIONAL_HUB_COUNTRY_NAMES = {
+    "Canada",
+    "China",
+    "Hong Kong",
+    "Indonesia",
+    "Mexico",
+    "Taiwan",
+    "United States",
+}
+
+
+def _hub_country_name(country: object) -> str:
+    return _normalize_country(str(country or ""))
+
+
+def _has_hub_pricing_for_country(
+    country: object,
+    rate_sheet: "CustomerRateSheet | None" = None,
+    state_province: object = "",
+) -> bool:
+    if not rate_sheet or not rate_sheet.hub:
+        return False
+    zone = _zone_for_cost_summary_row(
+        {
+            "Country": _hub_country_name(country),
+            "State/Province": state_province,
+        },
+        rate_sheet,
+    )
+    return bool(zone and rate_sheet.hub.rates_by_zone.get(zone))
+
+
+def _is_vfi_hub_country(
+    country: object,
+    rate_sheet: "CustomerRateSheet | None" = None,
+    state_province: object = "",
+) -> bool:
+    return _has_hub_pricing_for_country(country, rate_sheet, state_province) or _hub_country_name(country) in _OPERATIONAL_HUB_COUNTRY_NAMES
 
 
 def _state_abbreviation(country: str | None, state_province: str | None) -> str:
@@ -2791,15 +2834,86 @@ def _retail_bulk_review_warning(
 
 
 def _warning_row(warning: WorkflowWarning) -> dict:
+    severity = "Error" if warning.error_type in {"OversizedItem"} or "failed" in warning.message.casefold() else "Warning"
     return {
+        "Severity": severity,
         "Order ID": warning.order_id,
+        "Backer ID": warning.backer_id,
+        "Country": warning.country,
         "SKU": warning.sku,
         "Stage": warning.stage,
         "Error Type": warning.error_type,
         "Message": warning.message,
+        "Box/Fit Context": warning.context,
         "Rule Applied": warning.rule_applied,
         "SKU Breakdown": warning.sku_breakdown,
     }
+
+
+def _order_warning_metadata(lines: list[OrderLine]) -> dict[str, str]:
+    if not lines:
+        return {"country": "", "backer_id": ""}
+    first_line = lines[0]
+    metadata = _metadata_for_order(lines)
+    return {
+        "country": _normalize_country(first_line.country),
+        "backer_id": str(metadata.get("Backer ID", "") or ""),
+    }
+
+
+def _workflow_warning_rows(
+    warnings: list[str],
+    warning_rows: list[WorkflowWarning],
+) -> list[dict]:
+    return [
+        {
+            "Severity": "Warning",
+            "Order ID": "",
+            "Backer ID": "",
+            "Country": "",
+            "SKU": "",
+            "Stage": "workflow",
+            "Error Type": "Warning",
+            "Message": warning,
+            "Box/Fit Context": "",
+            "Rule Applied": "",
+            "SKU Breakdown": "",
+        }
+        for warning in warnings
+    ] + [_warning_row(warning) for warning in warning_rows]
+
+
+def _is_summary_error_row(row: dict) -> bool:
+    severity = str(row.get("Severity", "") or "").casefold()
+    error_type = str(row.get("Error Type", "") or "")
+    message = str(row.get("Message", "") or "")
+    if severity == "error":
+        return True
+    return error_type in {"OversizedItem"} or "could not be packed" in message.casefold()
+
+
+def _summary_error_rows(errors_and_warnings_rows: list[dict]) -> list[dict]:
+    rows = []
+    for warning in errors_and_warnings_rows:
+        if not _is_summary_error_row(warning):
+            continue
+        message = str(warning.get("Message", "") or "")
+        rows.append(
+            {
+                "Section": "Packing Errors",
+                "Metric": warning.get("Severity", "") or "Error",
+                "Value": warning.get("SKU", ""),
+                "Detail": message,
+                "Severity": warning.get("Severity", "") or "Error",
+                "SKU": warning.get("SKU", ""),
+                "Reason / Message": message,
+                "Order ID": warning.get("Order ID", ""),
+                "Backer ID": warning.get("Backer ID", ""),
+                "Country": warning.get("Country", ""),
+                "Box/Fit Context": warning.get("Box/Fit Context", ""),
+            }
+        )
+    return rows
 
 
 def _rule_allows_vendor_box_fit_tolerance(rule: SKUCampaignRule | None) -> bool:
@@ -3390,6 +3504,7 @@ def _clean_summary_rows(
     intake_summary_metadata: dict[str, str] | None = None,
     country_package_count_rows: list[dict] | None = None,
     sku_intake_summary_rows: list[dict] | None = None,
+    errors_and_warnings_rows: list[dict] | None = None,
 ) -> list[dict]:
     intake_summary_metadata = intake_summary_metadata or {}
     rows = [
@@ -3403,6 +3518,7 @@ def _clean_summary_rows(
         {"Section": "Run Summary", "Metric": "Box Types", "Value": result["box_types"], "Detail": ""},
         {"Section": "Run Summary", "Metric": "Unmatched SKUs", "Value": result["unmatched_skus"], "Detail": ""},
     ]
+    rows.extend(_summary_error_rows(errors_and_warnings_rows or []))
     for label in INTAKE_SUMMARY_METADATA_ORDER:
         value = str(intake_summary_metadata.get(label, "") or "").strip()
         if value:
@@ -4481,7 +4597,6 @@ def _cost_summary_rows(
             {
                 "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id"]),
                 "VFI #": row.get("VFI #", ""),
-                "Country Number": row.get("Country Number", ""),
                 "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Name"]),
                 "phone": _first_present(row, ["phone", "Phone", "Address Phone Number"]),
                 "email": _first_present(row, ["email", "Email"]),
@@ -4610,39 +4725,245 @@ def _country_scan_sheet_name(country: object, used: set[str]) -> str:
     return name
 
 
-def _country_number_sort_key(country_number: object, original_index: int) -> tuple[str, int, int, int]:
-    text = str(country_number or "").strip()
-    match = re.match(r"^(?P<country>.*?)(?P<sequence>\d+)(?:-(?P<suffix>\d+))?\s*$", text)
-    if not match:
-        return (text.casefold(), 10**9, 10**9, original_index)
-    country = match.group("country").strip().casefold()
-    sequence = int(match.group("sequence"))
-    suffix_text = match.group("suffix")
-    suffix = int(suffix_text) if suffix_text is not None else 0
-    return (country, sequence, suffix, original_index)
+COUNTRY_SCAN_COLUMN_C_PLACEHOLDER = "_Country Scan Blank Column C"
+COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER = "_Country Scan Future Cost Blank"
+COUNTRY_SCAN_METADATA_PLACEHOLDER_PREFIX = "_Country Scan Metadata Blank "
+COUNTRY_SCAN_RAW_METADATA_KEY = "_Country Scan Metadata"
+
+COUNTRY_SCAN_CORE_COLUMNS = {
+    "Country",
+    "VFI #",
+    COUNTRY_SCAN_COLUMN_C_PLACEHOLDER,
+    COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER,
+    "Items in this box / SKU contents",
+}
+
+COUNTRY_SCAN_EXCLUDED_METADATA = {
+    "",
+    "Barcode Value",
+    "Barcode/QR Value",
+    "Label Value",
+    "Label Number",
+    "Label numbers",
+    "Original Label Number",
+    "Package Carton Identifier",
+    "Carton Index",
+    "Total Cartons",
+    "Pledge Configuration",
+    "Campaign Name",
+    "Factory Name",
+    "Country Name Chinese",
+    "Origin",
+    "Total Value USD",
+    "From",
+    "Country Code",
+    "Country Number",
+    "Country Sequence",
+    "Country Package Code",
+    "Order ID",
+    "Box Number",
+    "Box Qty",
+    "Carton Box Designation",
+    "Box Plan",
+    "Total Units",
+    "SKU Breakdown",
+    "Items to Pack Column 1",
+    "Items to Pack Column 2",
+    "Label Item Lines Per Column",
+    "Label Item Column Count",
+    "Label Overflow Items Per Label",
+    "Overflow Item Count",
+    "Overflow Items",
+    "Overflow Note",
+    "Per-Box Chargeable Weight",
+    "On Arrival Note",
+    "Label Continuation",
+    "Continuation Page",
+    "Continuation Page Count",
+    "Region",
+    "Order Box ID",
+    "State",
+    "State/Province",
+    "US State Abbreviation",
+    "Actual Weight kg",
+    "Packed Actual Weight kg",
+    "Dimensional Weight kg (/5000)",
+    "Chargeable Weight kg",
+    "Chargeable Weight g",
+    "Unit Count",
+    "Label Unit Count",
+    "Box Type",
+    "Original Optimized Box Type",
+    "Label Box Type",
+    "Vendor Box ID",
+    "Backup Vendor Box",
+    "Box Selection Decision",
+    "Prepacked No Touch",
+    "Length cm",
+    "Width cm",
+    "Height cm",
+    "Optimized Length cm",
+    "Optimized Width cm",
+    "Optimized Height cm",
+    "Assigned Box Length cm",
+    "Assigned Box Width cm",
+    "Assigned Box Height cm",
+    "Box Standardization Note",
+    "Actual Item Weight lb",
+    "Packed Actual Weight lb (+15%)",
+    "Bundled/Padded Volume cmÂ³",
+    "Dimensional Weight lb",
+    "Chargeable Weight lb",
+    "Distinct SKUs",
+    "SKUs in Box",
+    "Label SKUs in Box",
+    "Placement Summary",
+    "Rule Applied",
+    "Warning",
+}
 
 
-def _country_scan_sheets(label_rows: list[dict]) -> dict[str, list[dict]]:
-    sheets: dict[str, list[dict]] = {}
+def _is_country_scan_metadata_key(key: object) -> bool:
+    return (
+        key not in COUNTRY_SCAN_CORE_COLUMNS
+        and key not in COUNTRY_SCAN_EXCLUDED_METADATA
+        and not str(key).startswith("_")
+    )
+
+
+def _country_scan_raw_intake_metadata(row: dict) -> dict:
+    metadata = {}
+    items = list(row.items())
+    if "Warning" in row:
+        first_metadata_index = next(index for index, (key, _value) in enumerate(items) if key == "Warning") + 1
+        items = items[first_metadata_index:]
+    for key, value in items:
+        if not _is_country_scan_metadata_key(key):
+            continue
+        metadata.setdefault(key, value)
+    return metadata
+
+
+def _country_scan_metadata(row: dict) -> dict:
+    raw_metadata = row.get(COUNTRY_SCAN_RAW_METADATA_KEY)
+    if isinstance(raw_metadata, dict):
+        return {
+            key: value
+            for key, value in raw_metadata.items()
+            if _is_country_scan_metadata_key(key)
+        }
+    return _country_scan_raw_intake_metadata(row)
+
+
+def _country_scan_sheets(
+    label_rows: list[dict],
+    rate_sheet: "CustomerRateSheet | None" = None,
+) -> dict[str, list[dict]]:
+    entries_by_sheet: dict[str, list[dict]] = {}
+    metadata_keys_by_sheet: dict[str, list[str]] = {}
     name_by_country: dict[str, str] = {}
     used_names = set()
-    original_indexes: dict[int, int] = {}
-    for original_index, row in enumerate(label_rows):
+    main_rows = [row for row in label_rows if not row.get("Label Continuation")]
+    non_hub_rows = [
+        row
+        for index, row in enumerate(main_rows)
+        if not _is_vfi_hub_country(
+            _first_present(row, ["Country", "Country Name"]),
+            rate_sheet,
+            row.get("State/Province", ""),
+        )
+    ]
+    non_hub_rank = {id(row): index for index, row in enumerate(non_hub_rows)}
+    ordered_rows = sorted(
+        main_rows,
+        key=lambda row: (
+            0
+            if _is_vfi_hub_country(
+                _first_present(row, ["Country", "Country Name"]),
+                rate_sheet,
+                row.get("State/Province", ""),
+            )
+            else 1,
+            ""
+            if _is_vfi_hub_country(
+                _first_present(row, ["Country", "Country Name"]),
+                rate_sheet,
+                row.get("State/Province", ""),
+            )
+            else _country_sequence_display(_first_present(row, ["Country", "Country Name"])).casefold(),
+            non_hub_rank.get(id(row), 0),
+        ),
+    )
+    for row in ordered_rows:
+        if row.get("Label Continuation"):
+            continue
         country = _country_sequence_display(_first_present(row, ["Country", "Country Name"]))
-        key = country.casefold()
-        if key not in name_by_country:
-            name_by_country[key] = _country_scan_sheet_name(country, used_names)
-            sheets[name_by_country[key]] = []
-        scan_row = {
-            "Country Number": row.get("Country Number", ""),
-            "VFI #": row.get("Label Number", ""),
-            "Barcode Value": row.get("Label numbers", ""),
-        }
-        original_indexes[id(scan_row)] = original_index
-        sheets[name_by_country[key]].append(scan_row)
-    for rows in sheets.values():
-        rows.sort(key=lambda row: _country_number_sort_key(row.get("Country Number", ""), original_indexes[id(row)]))
+        if _is_vfi_hub_country(country, rate_sheet, row.get("State/Province", "")):
+            sheet_country = _hub_country_name(country)
+            key = sheet_country.casefold()
+            if key not in name_by_country:
+                name_by_country[key] = _country_scan_sheet_name(sheet_country, used_names)
+                entries_by_sheet[name_by_country[key]] = []
+            sheet_name = name_by_country[key]
+        else:
+            sheet_name = "Non-Hub Countries"
+            entries_by_sheet.setdefault(sheet_name, [])
+        scan_value = str(
+            row.get("Barcode/QR Value")
+            or row.get("Label Value")
+            or row.get("Label numbers")
+            or row.get("Label Number")
+            or ""
+        ).strip()
+        metadata = _country_scan_metadata(row)
+        sheet_metadata_keys = metadata_keys_by_sheet.setdefault(sheet_name, [])
+        for key in metadata:
+            if key not in sheet_metadata_keys:
+                sheet_metadata_keys.append(key)
+        entries_by_sheet[sheet_name].append(
+            {
+                "country": country,
+                "vfi": scan_value,
+                "metadata": metadata,
+                "items": _label_row_items_text(row),
+            }
+        )
+    sheets: dict[str, list[dict]] = {}
+    for sheet_name, entries in entries_by_sheet.items():
+        metadata_keys = metadata_keys_by_sheet.get(sheet_name, [])
+        sheets[sheet_name] = []
+        for entry in entries:
+            scan_row = {
+                "Country": entry["country"],
+                "VFI #": entry["vfi"],
+                COUNTRY_SCAN_COLUMN_C_PLACEHOLDER: "",
+            }
+            for key in metadata_keys:
+                scan_row[key] = entry["metadata"].get(key, "")
+            padding_index = 1
+            while len(scan_row) < 13:
+                scan_row[f"{COUNTRY_SCAN_METADATA_PLACEHOLDER_PREFIX}{padding_index}"] = ""
+                padding_index += 1
+            scan_row[COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER] = ""
+            scan_row["Items in this box / SKU contents"] = entry["items"]
+            sheets[sheet_name].append(scan_row)
     return sheets
+
+
+def _label_row_items_text(row: dict) -> str:
+    items = []
+    for key in ["Items to Pack Column 1", "Items to Pack Column 2"]:
+        for line in str(row.get(key, "") or "").splitlines():
+            text = line.strip()
+            if text and text not in items:
+                items.append(text)
+    if items:
+        return " | ".join(items)
+    for line in str(row.get("SKU Breakdown", "") or "").split("|"):
+        text = line.strip()
+        if text and text not in items:
+            items.append(text)
+    return " | ".join(items)
 
 
 def _label_number_for_box(row: dict, campaign_label_prefix: str = "") -> str:
@@ -4685,34 +5006,36 @@ def _label_generator_rows(
             box_qty = int(float(row.get("Box Qty") or 0))
         except (TypeError, ValueError):
             box_qty = 0
-        rows.append(
-            {
-                "Pledge Configuration": pledge_config_by_combo.get(str(row.get("SKU Breakdown", "")), ""),
-                "Order ID": row.get("Order ID", ""),
-                "Total Units": row.get("Label Unit Count", row.get("Unit Count", "")),
-                "Label numbers": _label_number_for_box(row, campaign_label_prefix),
-                "Box Plan": row.get("Label Box Type") or row.get("Box Type", ""),
-                "Per-Box Chargeable Weight": row.get("Chargeable Weight kg", ""),
-                "Country Number": row.get("Country Number", ""),
-                "Country Package Code": row.get("Country Package Code", ""),
-                "Country Sequence": row.get("Country Sequence", ""),
-                "SKU Breakdown": row.get("Label SKUs in Box") or row.get("SKUs in Box", ""),
-                "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id", "Name Order ID", "Order #", "Order Number", "Order ID"]),
-                "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Backer Name", "Customer Name", "Name"]),
-                "phone": _first_present(row, ["phone", "Phone", "Address Phone Number"]),
-                "email": _first_present(row, ["email", "Email", "CustomerEmail", "Customer Email"]),
-                "Notes": _order_notes_value(row) if box_qty <= 1 else "",
-                "add 1": _first_present(row, ["add 1", "Address 1", "Address Line 1", "Shipping Address 1", "Shipping Address Line 1", "Address1"]),
-                "add 2": _first_present(row, ["add 2", "Address 2", "Address Line 2", "Shipping Address 2", "Shipping Address Line 2", "Address2"]),
-                "Shipping City": _first_present(row, ["Shipping City", "Address City", "City"]),
-                "Shipping Postal Code": _first_present(row, ["Shipping Postal Code", "Address Postal Code", "PostalCode", "Postal Code", "Zip"]),
-                "Country Name": _first_present(row, ["Country Name", "Full Country", "Country"]),
-                "Country Name Chinese": _first_present(row, ["Country Name Chinese", "Country in Chinese", "Country Chinese", "Country Name in Chinese"]) or _country_name_zh_hans(country_code),
-                "Ship to Country Code": country_code,
-                "Name in Chinese": row.get("Name in Chinese", ""),
-                "Shipping State": _first_present(row, ["Shipping State", "Address State", "State/Province"]),
-            }
-        )
+        output = {
+            "Pledge Configuration": pledge_config_by_combo.get(str(row.get("SKU Breakdown", "")), ""),
+            "Order ID": row.get("Order ID", ""),
+            "_Box Number": row.get("Box Number", ""),
+            "_Box Qty": row.get("Box Qty", ""),
+            "Total Units": row.get("Label Unit Count", row.get("Unit Count", "")),
+            "Label numbers": _label_number_for_box(row, campaign_label_prefix),
+            "Box Plan": row.get("Label Box Type") or row.get("Box Type", ""),
+            "Per-Box Chargeable Weight": row.get("Chargeable Weight kg", ""),
+            "Country Number": row.get("Country Number", ""),
+            "Country Package Code": row.get("Country Package Code", ""),
+            "Country Sequence": row.get("Country Sequence", ""),
+            "SKU Breakdown": row.get("Label SKUs in Box") or row.get("SKUs in Box", ""),
+            "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id", "Name Order ID", "Order #", "Order Number", "Order ID"]),
+            "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Backer Name", "Customer Name", "Name"]),
+            "phone": _first_present(row, ["phone", "Phone", "Address Phone Number"]),
+            "email": _first_present(row, ["email", "Email", "CustomerEmail", "Customer Email"]),
+            "Notes": _order_notes_value(row) if box_qty <= 1 else "",
+            "add 1": _first_present(row, ["add 1", "Address 1", "Address Line 1", "Shipping Address 1", "Shipping Address Line 1", "Address1"]),
+            "add 2": _first_present(row, ["add 2", "Address 2", "Address Line 2", "Shipping Address 2", "Shipping Address Line 2", "Address2"]),
+            "Shipping City": _first_present(row, ["Shipping City", "Address City", "City"]),
+            "Shipping Postal Code": _first_present(row, ["Shipping Postal Code", "Address Postal Code", "PostalCode", "Postal Code", "Zip"]),
+            "Country Name": _first_present(row, ["Country Name", "Full Country", "Country"]),
+            "Country Name Chinese": _first_present(row, ["Country Name Chinese", "Country in Chinese", "Country Chinese", "Country Name in Chinese"]) or _country_name_zh_hans(country_code),
+            "Ship to Country Code": country_code,
+            "Name in Chinese": row.get("Name in Chinese", ""),
+            "Shipping State": _first_present(row, ["Shipping State", "Address State", "State/Province"]),
+        }
+        output[COUNTRY_SCAN_RAW_METADATA_KEY] = _country_scan_raw_intake_metadata(row)
+        rows.append(output)
     return rows
 
 
@@ -4842,6 +5165,8 @@ def _labels_rows(
             "Email": label.get("email", ""),
             "Notes": label.get("Notes", ""),
             "Order ID": label.get("Order ID", ""),
+            "Box Number": label.get("_Box Number", ""),
+            "Box Qty": label.get("_Box Qty", ""),
             "Pledge Configuration": label.get("Pledge Configuration", ""),
             "Carton Box Designation": label.get("Box Plan", ""),
             "Box Plan": label.get("Box Plan", ""),
@@ -4858,6 +5183,10 @@ def _labels_rows(
             "Per-Box Chargeable Weight": label.get("Per-Box Chargeable Weight", ""),
             "On Arrival Note": LABEL_ON_ARRIVAL_NOTE,
         }
+        base_row[COUNTRY_SCAN_RAW_METADATA_KEY] = dict(label.get(COUNTRY_SCAN_RAW_METADATA_KEY) or {})
+        for key, value in (label.get(COUNTRY_SCAN_RAW_METADATA_KEY) or {}).items():
+            if key not in base_row and not str(key).startswith("_"):
+                base_row[key] = value
         rows.append(base_row)
         overflow_pages = _label_overflow_item_pages(overflow_items, overflow_items_per_label)
         for page_index, overflow_page in enumerate(overflow_pages, start=1):
@@ -4885,29 +5214,187 @@ def _labels_rows(
     return rows or [{"Note": "No package labels generated."}]
 
 
-def _label_print_pledge_sort_key(value: object) -> tuple[int, float | str]:
+def _numeric_aware_text_key(value: object) -> tuple[object, ...]:
+    text = str(value or "").strip()
+    parts = re.split(r"(\d+(?:\.\d+)?)", text.casefold())
+    key: list[object] = []
+    for part in parts:
+        if not part:
+            continue
+        try:
+            key.append((0, float(part)))
+        except ValueError:
+            key.append((1, part))
+    return tuple(key)
+
+
+def _label_print_pledge_sort_key(value: object) -> tuple[int, tuple[object, ...]]:
     text = str(value or "").strip()
     if not text:
-        return (1, "")
-    try:
-        return (0, float(text))
-    except ValueError:
-        return (1, text.casefold())
+        return (1, ())
+    return (0, _numeric_aware_text_key(text))
 
 
-def _labels_rows_in_print_order(rows: list[dict]) -> list[dict]:
+def _label_print_sort_key(
+    row: dict,
+    original_index: int,
+    rate_sheet: "CustomerRateSheet | None" = None,
+) -> tuple[object, ...]:
+    country = _country_sequence_display(row.get("Country") or row.get("Country Code") or "")
+    is_hub = _is_vfi_hub_country(country, rate_sheet, row.get("State/Province", ""))
+    return (
+        0 if is_hub else 1,
+        _hub_country_name(country).casefold() if is_hub else country.casefold(),
+        _label_print_pledge_sort_key(row.get("Pledge Configuration", "")),
+        original_index,
+    )
+
+
+def _labels_rows_in_print_order(
+    rows: list[dict],
+    rate_sheet: "CustomerRateSheet | None" = None,
+) -> list[dict]:
     indexed_rows = list(enumerate(rows))
     return [
         row
         for _, row in sorted(
             indexed_rows,
-            key=lambda item: (
-                str(item[1].get("Country") or item[1].get("Country Code") or "").strip().casefold(),
-                _label_print_pledge_sort_key(item[1].get("Pledge Configuration", "")),
-                item[0],
-            ),
+            key=lambda item: _label_print_sort_key(item[1], item[0], rate_sheet),
         )
     ]
+
+
+def _positive_int_value(value: object) -> int:
+    try:
+        parsed = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _display_vfi_base(base_number: int, campaign_label_prefix: str) -> str:
+    prefix = str(campaign_label_prefix or "").strip()
+    return f"{base_number} {prefix}".strip()
+
+
+def _display_vfi_label_value(row: dict, base_number: int, campaign_label_prefix: str) -> str:
+    box_qty = _positive_int_value(row.get("Box Qty"))
+    box_number = _positive_int_value(row.get("Box Number"))
+    prefix = str(campaign_label_prefix or "").strip()
+    if box_qty > 1 and box_number:
+        return f"{base_number} {box_number} of {box_qty} {prefix}".strip()
+    return _display_vfi_base(base_number, prefix)
+
+
+def _label_package_key(row: dict) -> tuple[str, str]:
+    return (
+        str(row.get("Order ID", "") or ""),
+        str(row.get("Box Number", row.get("_Box Number", "")) or ""),
+    )
+
+
+def _assign_visible_vfi_numbers(
+    labels_rows: list[dict],
+    campaign_label_prefix: str,
+) -> tuple[list[dict], dict[str, str], dict[tuple[str, str], str]]:
+    rows = [dict(row) for row in labels_rows]
+    next_base_number = 1
+    base_by_order: dict[str, int] = {}
+    label_value_by_package: dict[tuple[str, str], str] = {}
+    order_display_by_order: dict[str, str] = {}
+    last_main_package_key: tuple[str, str] | None = None
+
+    for row in rows:
+        if row.get("Label Continuation"):
+            package_key = last_main_package_key
+            if package_key is None:
+                continue
+            original_label = label_value_by_package.get(package_key, "")
+            if original_label:
+                row["Original Label Number"] = original_label
+                row["Label Value"] = original_label
+                row["Barcode/QR Value"] = original_label
+            continue
+
+        order_id = str(row.get("Order ID", "") or "")
+        if order_id not in base_by_order:
+            base_by_order[order_id] = next_base_number
+            order_display_by_order[order_id] = _display_vfi_base(next_base_number, campaign_label_prefix)
+            next_base_number += 1
+
+        base_number = base_by_order[order_id]
+        label_value = _display_vfi_label_value(row, base_number, campaign_label_prefix)
+        row["Label Number"] = label_value
+        row["Label Value"] = label_value
+        row["Barcode/QR Value"] = label_value
+        row["VFI #"] = order_display_by_order.get(order_id, "")
+        package_key = _label_package_key(row)
+        label_value_by_package[package_key] = label_value
+        last_main_package_key = package_key
+
+    return rows, order_display_by_order, label_value_by_package
+
+
+def _with_display_vfi_numbers(rows: list[dict], display_vfi_by_order: dict[str, str]) -> list[dict]:
+    output_rows = []
+    for row in rows:
+        output = dict(row)
+        order_id = str(output.get("Order ID", "") or "")
+        if order_id in display_vfi_by_order:
+            output["VFI #"] = display_vfi_by_order[order_id]
+        output_rows.append(output)
+    return output_rows
+
+
+def _with_display_label_numbers(
+    label_generator_rows: list[dict],
+    display_label_by_package: dict[tuple[str, str], str],
+) -> list[dict]:
+    output_rows = []
+    for row in label_generator_rows:
+        output = dict(row)
+        label_value = display_label_by_package.get(_label_package_key(output))
+        if label_value:
+            output["Label numbers"] = label_value
+        output.pop("_Box Number", None)
+        output.pop("_Box Qty", None)
+        output.pop("_Country Scan Metadata", None)
+        output_rows.append(output)
+    return output_rows
+
+
+def _label_package_rank(labels_rows: list[dict]) -> dict[tuple[str, str], int]:
+    ranks = {}
+    for index, row in enumerate(labels_rows):
+        if row.get("Label Continuation"):
+            continue
+        ranks.setdefault(_label_package_key(row), index)
+    return ranks
+
+
+def _order_rank_from_label_package_rank(package_rank: dict[tuple[str, str], int]) -> dict[str, int]:
+    order_rank: dict[str, int] = {}
+    for (order_id, _box_number), rank in package_rank.items():
+        if order_id and (order_id not in order_rank or rank < order_rank[order_id]):
+            order_rank[order_id] = rank
+    return order_rank
+
+
+def _rows_in_final_label_order(rows: list[dict], labels_rows: list[dict]) -> list[dict]:
+    package_rank = _label_package_rank(labels_rows)
+    order_rank = _order_rank_from_label_package_rank(package_rank)
+
+    def sort_key(item: tuple[int, dict]) -> tuple[int, int, str]:
+        original_index, row = item
+        package_key = _label_package_key(row)
+        order_id = str(row.get("Order ID", "") or "")
+        return (
+            package_rank.get(package_key, order_rank.get(order_id, 10**9)),
+            original_index,
+            order_id,
+        )
+
+    return [row for _index, row in sorted(enumerate(rows), key=sort_key)]
 
 
 def _vfi_intake_source_rows(sku_master_path: str):
@@ -5964,6 +6451,7 @@ def optimize_workbook(
         except Exception as exc:
             failed_orders.append(order_id)
             message = f"Order packing setup failed and was skipped: {exc}"
+            warning_metadata = _order_warning_metadata(lines)
             warning_rows.append(
                 WorkflowWarning(
                     order_id=order_id,
@@ -5971,6 +6459,8 @@ def optimize_workbook(
                     error_type=type(exc).__name__,
                     message=message,
                     sku_breakdown=combo,
+                    country=warning_metadata["country"],
+                    backer_id=warning_metadata["backer_id"],
                 )
             )
             _log_event(
@@ -6107,6 +6597,7 @@ def optimize_workbook(
         cache_key = context.cache_key
         combo_rank = cache_key_rank.get(cache_key, context.first_index + 1)
         effective_packing_mode = effective_mode_by_cache_key.get(cache_key, "cached")
+        warning_metadata = _order_warning_metadata(lines)
         try:
             if cache_key in cache_solve_failures:
                 exc = cache_solve_failures[cache_key]
@@ -6119,6 +6610,8 @@ def optimize_workbook(
                         error_type=type(exc).__name__,
                         message=message,
                         sku_breakdown=combo,
+                        country=warning_metadata["country"],
+                        backer_id=warning_metadata["backer_id"],
                     )
                 )
                 _log_event(
@@ -6132,7 +6625,12 @@ def optimize_workbook(
             cached_plan = packing_cache[cache_key]
             split_result = _clone_split_result(cached_plan.split_result)
             warning_rows.extend(
-                _materialize_cached_warnings(cached_plan.group_warnings, order_id, combo)
+                replace(
+                    warning,
+                    country=warning.country or warning_metadata["country"],
+                    backer_id=warning.backer_id or warning_metadata["backer_id"],
+                )
+                for warning in _materialize_cached_warnings(cached_plan.group_warnings, order_id, combo)
             )
             rule_split_message = _rule_split_message(groups)
             if rule_split_message:
@@ -6144,6 +6642,8 @@ def optimize_workbook(
                         message=rule_split_message,
                         rule_applied=_rule_split_keys(groups),
                         sku_breakdown=combo,
+                        country=warning_metadata["country"],
+                        backer_id=warning_metadata["backer_id"],
                     )
                 )
             _log_event(
@@ -6177,6 +6677,9 @@ def optimize_workbook(
                         error_type="OversizedItem",
                         message=message,
                         sku_breakdown=combo,
+                        country=warning_metadata["country"],
+                        backer_id=warning_metadata["backer_id"],
+                        context="Carton cap: 74 x 37 x 44 cm; item did not fit in any rotation.",
                     )
                 )
         except Exception as exc:
@@ -6189,6 +6692,8 @@ def optimize_workbook(
                     error_type=type(exc).__name__,
                     message=message,
                     sku_breakdown=combo,
+                    country=warning_metadata["country"],
+                    backer_id=warning_metadata["backer_id"],
                 )
             )
             _log_event(
@@ -6442,7 +6947,53 @@ def optimize_workbook(
     optimized_to_pack_rows = _optimized_to_pack_rows(box_rows)
     pledge_config_by_combo = _pledge_config_by_combo(box_rows)
 
+    workbook_output_mode = str(cfg.get("workbook_output_mode") or "full").strip().lower()
+    if workbook_output_mode not in {"full", "fast_production", "admin", "worker"}:
+        workbook_output_mode = "full"
+    result["workbook_output_mode"] = (
+        "fast_production" if workbook_output_mode in {"fast_production", "worker"} else "full"
+    )
+    summary_box_types = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
+    label_generator_rows = _label_generator_rows(
+        _box_rows_in_vfi_sequence(operational_box_rows, vfi_by_order),
+        pledge_config_by_combo,
+        _campaign_vfi_prefix(cfg),
+    )
+    vfi_intake_sources = _vfi_intake_source_rows(sku_master_path)
+    vfi_intake_form_rows = _vfi_intake_form_rows_from_sources(vfi_intake_sources)
+    sku_intake_summary_rows = _sku_intake_summary_rows(
+        intake.sku_items,
+        intake.order_lines,
+        vfi_intake_form_rows,
+    )
+    factory_name = _factory_name_from_vfi_intake_sources(vfi_intake_sources)
+    intake_summary_metadata = _intake_summary_metadata_from_vfi_intake_sources(vfi_intake_sources)
+    labels_rows = _labels_rows(
+        label_generator_rows,
+        cfg,
+        factory_name=factory_name,
+        sku_pick_order=sku_display_order,
+    )
     rate_selection = _resolve_customer_rate_sheet(cfg)
+    labels_rows = _labels_rows_in_print_order(labels_rows, rate_selection.sheet)
+    labels_rows, display_vfi_by_order, display_label_by_package = _assign_visible_vfi_numbers(
+        labels_rows,
+        _campaign_vfi_prefix(cfg),
+    )
+    label_generator_rows = _with_display_label_numbers(label_generator_rows, display_label_by_package)
+    order_rows = _with_display_vfi_numbers(order_rows, display_vfi_by_order)
+    cost_order_summary_rows = _with_display_vfi_numbers(cost_order_summary_rows, display_vfi_by_order)
+    label_generator_rows = _rows_in_final_label_order(label_generator_rows, labels_rows)
+    order_rows = _rows_in_final_label_order(order_rows, labels_rows)
+    cost_order_summary_rows = _rows_in_final_label_order(cost_order_summary_rows, labels_rows)
+    country_scan_sheets = _country_scan_sheets(labels_rows, rate_selection.sheet)
+    if cfg["preserve_region_sheets"]:
+        rows_by_region = defaultdict(list)
+        for row in order_rows:
+            if row.get("Region"):
+                rows_by_region[f"Region - {row['Region']}"].append(row)
+        region_sheets = dict(rows_by_region)
+
     cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg, rate_selection, sku_rules)
     total_cost = _cost_summary_total_cost(cost_summary_rows)
     result["total_shipping_cost"] = total_cost
@@ -6462,35 +7013,7 @@ def optimize_workbook(
     if rate_selection.warning:
         warnings.append(rate_selection.warning)
         result["warning_count"] = len(warnings) + len(warning_rows)
-    workbook_output_mode = str(cfg.get("workbook_output_mode") or "full").strip().lower()
-    if workbook_output_mode not in {"full", "fast_production", "admin", "worker"}:
-        workbook_output_mode = "full"
-    result["workbook_output_mode"] = (
-        "fast_production" if workbook_output_mode in {"fast_production", "worker"} else "full"
-    )
-    summary_box_types = len({_base_box_type(row["Box Type"]) for row in operational_box_rows if row.get("Box Type")})
-    label_generator_rows = _label_generator_rows(
-        _box_rows_in_vfi_sequence(operational_box_rows, vfi_by_order),
-        pledge_config_by_combo,
-        _campaign_vfi_prefix(cfg),
-    )
-    country_scan_sheets = _country_scan_sheets(label_generator_rows)
-    vfi_intake_sources = _vfi_intake_source_rows(sku_master_path)
-    vfi_intake_form_rows = _vfi_intake_form_rows_from_sources(vfi_intake_sources)
-    sku_intake_summary_rows = _sku_intake_summary_rows(
-        intake.sku_items,
-        intake.order_lines,
-        vfi_intake_form_rows,
-    )
-    factory_name = _factory_name_from_vfi_intake_sources(vfi_intake_sources)
-    intake_summary_metadata = _intake_summary_metadata_from_vfi_intake_sources(vfi_intake_sources)
-    labels_rows = _labels_rows(
-        label_generator_rows,
-        cfg,
-        factory_name=factory_name,
-        sku_pick_order=sku_display_order,
-    )
-    labels_rows = _labels_rows_in_print_order(labels_rows)
+    errors_and_warnings_rows = _workflow_warning_rows(warnings, warning_rows)
     workbook_sheets = dict(region_sheets)
     workbook_sheets["Box Consolidation What-If"] = box_consolidation_rows
     cost_sheet_name = _cost_summary_sheet_name(cfg)
@@ -6515,19 +7038,7 @@ def optimize_workbook(
         pledge_combination_summary_rows=_pledge_combination_summary_rows_from_boxes(box_rows),
         debug_summary_rows=debug_summary_rows,
         input_column_mapping_rows=intake.column_mappings,
-        errors_and_warnings_rows=[
-            {
-                "Order ID": "",
-                "SKU": "",
-                "Stage": "workflow",
-                "Error Type": "Warning",
-                "Message": warning,
-                "Rule Applied": "",
-                "SKU Breakdown": "",
-            }
-            for warning in warnings
-        ]
-        + [_warning_row(warning) for warning in warning_rows],
+        errors_and_warnings_rows=errors_and_warnings_rows,
         sheets=workbook_sheets,
     )
     result.update(
@@ -6557,6 +7068,7 @@ def optimize_workbook(
             intake_summary_metadata=intake_summary_metadata,
             country_package_count_rows=_country_package_count_rows(operational_box_rows),
             sku_intake_summary_rows=sku_intake_summary_rows,
+            errors_and_warnings_rows=errors_and_warnings_rows,
         ),
         cost_summary_rows=cost_summary_rows,
         vfi_intake_form_rows=vfi_intake_form_rows,
@@ -6573,19 +7085,7 @@ def optimize_workbook(
         pledge_combination_summary_rows=_pledge_combination_summary_rows_from_boxes(box_rows),
         debug_summary_rows=debug_summary_rows,
         input_column_mapping_rows=intake.column_mappings,
-        errors_and_warnings_rows=[
-            {
-                "Order ID": "",
-                "SKU": "",
-                "Stage": "workflow",
-                "Error Type": "Warning",
-                "Message": warning,
-                "Rule Applied": "",
-                "SKU Breakdown": "",
-            }
-            for warning in warnings
-        ]
-        + [_warning_row(warning) for warning in warning_rows],
+        errors_and_warnings_rows=errors_and_warnings_rows,
         sheets=workbook_sheets,
     )
     workbook_writing_seconds = time.perf_counter() - workbook_write_started
