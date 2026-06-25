@@ -435,6 +435,15 @@ def _sheet_rows(path: Path, sheet_name: str) -> list[dict]:
     return next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == sheet_name)
 
 
+def _workbook_sheet_names(path: Path) -> list[str]:
+    with zipfile.ZipFile(path) as archive:
+        workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    return [
+        sheet.attrib["name"]
+        for sheet in workbook_root.findall("main:sheets/main:sheet", _NS)
+    ]
+
+
 def _sheet_xml(path: Path, sheet_name: str) -> str:
     with zipfile.ZipFile(path) as archive:
         workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
@@ -524,8 +533,8 @@ def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path
     assert output_path.exists()
 
     workbook_rows = read_workbook(str(output_path))
-    sheet_names = [sheet.sheet_name for sheet in workbook_rows]
-    assert sheet_names[:3] == ["Summary", "Cost Summary", "Labels"]
+    sheet_names = _workbook_sheet_names(output_path)
+    assert sheet_names[:4] == ["Summary", "Cost Summary", "Actual Dimensions", "Labels"]
     for required_sheet in [
         "VFI Intake Form",
         "Optimized to Pack",
@@ -539,6 +548,281 @@ def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path
     assert order_volume_rows[0]["US State Abbreviation"] == "CA"
     assert order_volume_rows[0]["Pledge Level"] == "Deluxe"
     assert order_volume_rows[0]["SKU Breakdown"] == "CORE GAME x1"
+
+
+def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcode_formulas(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOX_OPTIMIZER_RATE_SHEET_DIR", str(tmp_path / "managed_rates"))
+    monkeypatch.delenv("BOX_OPTIMIZER_RATE_SYNC_URL", raising=False)
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized_shipping_plan.xlsx"
+    rate_path = tmp_path / "rates.xlsx"
+    _write_xlsx_table(
+        rate_path,
+        "Zone Key",
+        [
+            ["HUB", "", "", ""],
+            ["KG", 0.5, 1, 1.5],
+            ["Zone USA", 11.15, 12.25, 13.35],
+            ["", "", "", ""],
+            ["Zone 0", "Zone USA"],
+            ["United States", "USA"],
+        ],
+    )
+    _write_csv(
+        sku_master_path,
+        [
+            {
+                "SKU": "Core Game",
+                "Product Name": "Core Game",
+                "Length": "5",
+                "Width": "5",
+                "Height": "5",
+                "Weight kg": "1",
+            }
+        ],
+    )
+    _write_csv(
+        orders_path,
+        [
+            {
+                "Order ID": "1001",
+                "SKU": "Core Game",
+                "Quantity": "1",
+                "Country": "US",
+                "State": "California",
+            }
+        ],
+    )
+
+    optimize_workbook(
+        sku_master_path=str(sku_master_path),
+        orders_path=str(orders_path),
+        output_path=str(output_path),
+        config={**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(rate_path)},
+    )
+
+    sheet_names = _workbook_sheet_names(output_path)
+    assert sheet_names[1:3] == ["Cost Summary", "Actual Dimensions"]
+    assert "_ActualLookupTable" in sheet_names
+    assert "_ActualRateTable" in sheet_names
+
+    actual_xml = _sheet_xml(output_path, "Actual Dimensions")
+    actual_root = ElementTree.fromstring(actual_xml)
+    actual_headers = [
+        cell.find(".//main:t", _NS).text
+        for cell in actual_root.findall("main:sheetData/main:row[@r='1']/main:c", _NS)
+    ]
+    assert actual_headers[:9] == [
+        "Barcode",
+        "Order number",
+        "weight",
+        "CBM weight",
+        "L",
+        "W",
+        "H",
+        "CBM",
+        "Time",
+    ]
+    assert actual_headers[9:27] == [
+        "Cost Summary VFI #",
+        "Group VFI key",
+        "Is charge row",
+        "Country",
+        "Pick count / Total units",
+        "Add-on adjusters",
+        "Actual weight kg",
+        "CBM weight kg",
+        "Carton chargeable weight kg",
+        "Order/group chargeable weight kg",
+        "Hub zone / rate zone",
+        "Matched rate weight band",
+        "Actual hub shipping fee",
+        "Pick / add-on fee",
+        "Actual total shipping cost",
+        "Quoted shipping cost",
+        "Actual vs quoted difference",
+        "Lookup status",
+    ]
+
+    assert "XLOOKUP" not in actual_xml
+    assert "LET(" not in actual_xml
+    assert 'ISNUMBER(SEARCH(" of ",$A2))' in actual_xml
+    assert 'LEFT($A2,FIND(" ",$A2)-1)&amp;" "&amp;MID($A2,FIND("@",SUBSTITUTE($A2," ","@",4))+1,999)' in actual_xml
+    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$K2),$K2,""))' in actual_xml
+    assert 'VALUE(RIGHT($A2,LEN($A2)-FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))))&gt;1' in actual_xml
+    assert "MATCH($K2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
+    assert 'SUMIF($K:$K,$K2,$R:$R)' in actual_xml
+    assert "INDEX('_ActualRateTable'!$D:$D,MATCH($T2&amp;\"|\"&amp;" in actual_xml
+    assert "$C2/1000" in actual_xml
+    assert "$D2/1000" in actual_xml
+    assert "MAX($P2,$Q2)" in actual_xml
+    assert "CEILING($S2-0.000000001,0.5)" in actual_xml
+    assert '$L2&lt;&gt;"Yes"' in actual_xml
+    assert "$B2" not in actual_xml
+    assert "No barcode match" in actual_xml
+    assert "No hub rate" in actual_xml
+    assert "Dimension only" in actual_xml
+
+    lookup_rows = _sheet_rows(output_path, "_ActualLookupTable")
+    rate_rows = _sheet_rows(output_path, "_ActualRateTable")
+    assert lookup_rows[0]["Country"] == "United States"
+    assert lookup_rows[0]["Total Units"] == "1"
+    assert lookup_rows[0]["Pick / add-on fee"] == "2.0"
+    assert lookup_rows[0]["Quoted shipping cost"] == "15.35"
+    assert rate_rows[0]["Zone"] == "Zone USA"
+    assert rate_rows[0]["Weight Band kg"] == "0.5"
+    with zipfile.ZipFile(output_path) as archive:
+        workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+    assert 'name="_ActualLookupTable"' in workbook_xml
+    assert 'name="_ActualRateTable"' in workbook_xml
+    assert 'state="hidden"' in workbook_xml
+
+
+def test_actual_dimensions_multi_carton_formulas_group_by_base_barcode_and_gate_costs():
+    row = workflow_module._actual_dimensions_rows(1)[0]
+
+    lookup_formula = row["Cost Summary VFI #"].formula
+    group_key_formula = row["Group VFI key"].formula
+    charge_flag_formula = row["Is charge row"].formula
+    group_weight_formula = row["Order/group chargeable weight kg"].formula
+    matched_band_formula = row["Matched rate weight band"].formula
+    hub_fee_formula = row["Actual hub shipping fee"].formula
+    pick_fee_formula = row["Pick / add-on fee"].formula
+    total_formula = row["Actual total shipping cost"].formula
+    quoted_formula = row["Quoted shipping cost"].formula
+    diff_formula = row["Actual vs quoted difference"].formula
+    status_formula = row["Lookup status"].formula
+
+    assert "$B2" not in "".join(value.formula for value in row.values() if hasattr(value, "formula"))
+    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$K2),$K2,""))' == lookup_formula
+    assert 'LEFT($A2,FIND(" ",$A2)-1)&" "&MID($A2,FIND("@",SUBSTITUTE($A2," ","@",4))+1,999)' in group_key_formula
+    assert 'VALUE(RIGHT($A2,LEN($A2)-FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))))>1' in group_key_formula
+    assert 'LEFT($A2,FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))-1)' in group_key_formula
+    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$K2),"Yes","No"))' == charge_flag_formula
+    assert "MATCH($K2,'_ActualLookupTable'!$A:$A,0)" in row["Country"].formula
+    assert "SUMIF($K:$K,$K2,$R:$R)" in group_weight_formula
+    assert "CEILING($S2-0.000000001,0.5)" in matched_band_formula
+
+    for cost_formula in [
+        matched_band_formula,
+        hub_fee_formula,
+        pick_fee_formula,
+        total_formula,
+        quoted_formula,
+        diff_formula,
+    ]:
+        assert '$L2<>"Yes"' in cost_formula
+
+    assert "Dimension only" in status_formula
+    assert "XLOOKUP" not in "".join(value.formula for value in row.values() if hasattr(value, "formula"))
+    assert "LET(" not in "".join(value.formula for value in row.values() if hasattr(value, "formula"))
+
+
+def test_actual_rate_table_keys_match_excel_numeric_band_text_for_whole_and_repeat_weights():
+    rates = {step / 2: step for step in range(1, 99)}
+    rate_sheet = workflow_module.CustomerRateSheet(
+        hub=workflow_module.CustomerRateLane(
+            rates_by_zone={"Zone 0": rates},
+            zone_by_country={"united states": "Zone 0"},
+            max_weight_kg=49.0,
+        ),
+        express=workflow_module.CustomerRateLane(rates_by_zone={}, zone_by_country={}),
+    )
+
+    rate_rows = workflow_module._actual_rate_rows(rate_sheet)
+    rates_by_key = {row["Rate Key"]: row["Hub Rate"] for row in rate_rows}
+
+    for expected_key in ["Zone 0|0.5", "Zone 0|1", "Zone 0|6", "Zone 0|9", "Zone 0|10.5", "Zone 0|40", "Zone 0|49"]:
+        assert expected_key in rates_by_key
+    for old_key in ["Zone 0|1.0", "Zone 0|6.0", "Zone 0|9.0", "Zone 0|11.0", "Zone 0|40.0", "Zone 0|49.0"]:
+        assert old_key not in rates_by_key
+
+    assert next(row for row in rate_rows if row["Rate Key"] == "Zone 0|6")["Weight Band kg"] == 6.0
+    assert next(row for row in rate_rows if row["Rate Key"] == "Zone 0|9")["Weight Band kg"] == 9.0
+    assert next(row for row in rate_rows if row["Rate Key"] == "Zone 0|10.5")["Weight Band kg"] == 10.5
+
+    def excel_numeric_text(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+    def excel_ceiling_half(value: float) -> float:
+        return int((value * 2) + 0.999999999) / 2
+
+    max_weight = rate_rows[0]["Max Weight kg"]
+    max_rate = rate_rows[0]["Max Weight Rate"]
+
+    def simulated_actual_hub_fee(matched_band: float) -> float:
+        repeated_max_weights = int((matched_band - 0.000000001) / max_weight)
+        remainder = excel_ceiling_half((matched_band - 0.000000001) % max_weight)
+        lookup_band = max_weight if remainder == 0 else remainder
+        return repeated_max_weights * max_rate + rates_by_key[f"Zone 0|{excel_numeric_text(lookup_band)}"]
+
+    assert simulated_actual_hub_fee(6) == rates_by_key["Zone 0|6"]
+    assert simulated_actual_hub_fee(9) == rates_by_key["Zone 0|9"]
+    assert simulated_actual_hub_fee(10.5) == rates_by_key["Zone 0|10.5"]
+    assert simulated_actual_hub_fee(60) == rates_by_key["Zone 0|49"] + rates_by_key["Zone 0|11"]
+    assert simulated_actual_hub_fee(66.5) == rates_by_key["Zone 0|49"] + rates_by_key["Zone 0|17.5"]
+
+    formula_text = "".join(value.formula for value in workflow_module._actual_dimensions_rows(1)[0].values() if hasattr(value, "formula"))
+    assert "XLOOKUP" not in formula_text
+    assert "LET(" not in formula_text
+
+
+def test_actual_dimensions_barcode_parts_separate_scanner_barcode_lookup_and_group_key():
+    assert workflow_module._actual_dimensions_barcode_parts("2 Game") == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="2 Game",
+        group_vfi_key="2 Game",
+        is_charge_row=True,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "2 1 of 2 Game"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="2 Game",
+        group_vfi_key="2 Game",
+        is_charge_row=True,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "2 2 of 2 Game"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="",
+        group_vfi_key="2 Game",
+        is_charge_row=False,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "15 1 of 4 ITFFKS1"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="15 ITFFKS1",
+        group_vfi_key="15 ITFFKS1",
+        is_charge_row=True,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "15 2 of 4 ITFFKS1"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="",
+        group_vfi_key="15 ITFFKS1",
+        is_charge_row=False,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "15 4 of 4 ITFFKS1"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="",
+        group_vfi_key="15 ITFFKS1",
+        is_charge_row=False,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "One Page Rules-1"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="One Page Rules-1",
+        group_vfi_key="One Page Rules-1",
+        is_charge_row=True,
+    )
+    assert workflow_module._actual_dimensions_barcode_parts(
+        "One Page Rules-1-2"
+    ) == workflow_module.ActualDimensionsBarcodeParts(
+        cost_summary_vfi="",
+        group_vfi_key="One Page Rules-1",
+        is_charge_row=False,
+    )
 
 
 def test_output_workbook_includes_received_intake_column_and_sku_intake_summary(tmp_path):
@@ -1418,8 +1702,8 @@ def test_workbook_presentation_tabs_and_compact_columns(tmp_path):
     )
 
     workbook = read_workbook(str(output_path))
-    sheet_names = [sheet.sheet_name for sheet in workbook]
-    assert sheet_names[:3] == ["Summary", "Cost Summary", "Labels"]
+    sheet_names = _workbook_sheet_names(output_path)
+    assert sheet_names[:4] == ["Summary", "Cost Summary", "Actual Dimensions", "Labels"]
     for required_sheet in [
         "VFI Intake Form",
         "Optimized to Pack",
@@ -3717,7 +4001,7 @@ def test_workbook_cost_summary_removes_country_number_and_scan_tabs_use_label_vf
     )
 
     workbook = read_workbook(str(output_path))
-    sheet_names = [sheet.sheet_name for sheet in workbook]
+    sheet_names = _workbook_sheet_names(output_path)
     labels_index = sheet_names.index("Labels")
     assert sheet_names[labels_index + 1 : labels_index + 3] == ["Hong Kong", "Singapore"]
 
@@ -5682,8 +5966,8 @@ def test_phase_a_workbook_presentation_skeleton_and_campaign_cost_summary(tmp_pa
     )
 
     workbook = read_workbook(str(output_path))
-    sheet_names = [sheet.sheet_name for sheet in workbook]
-    assert sheet_names[:3] == ["Summary", "Cost Summary - Launch Campaign", "Labels"]
+    sheet_names = _workbook_sheet_names(output_path)
+    assert sheet_names[:4] == ["Summary", "Cost Summary - Launch Campaign", "Actual Dimensions", "Labels"]
     for required_sheet in [
         "VFI Intake Form",
         "Optimized to Pack",
@@ -5907,8 +6191,8 @@ def test_fast_production_workbook_keeps_operational_sheets_and_internal_calculat
         },
     )
 
-    sheet_names = [sheet.sheet_name for sheet in read_workbook(str(output_path))]
-    assert sheet_names[:3] == ["Summary", "Cost Summary", "Labels"]
+    sheet_names = _workbook_sheet_names(output_path)
+    assert sheet_names[:4] == ["Summary", "Cost Summary", "Actual Dimensions", "Labels"]
     for required_sheet in ["United States", "Canada", "VFI Intake Form", "Optimized to Pack", "Box Size Summary"]:
         assert required_sheet in sheet_names
     for skipped_sheet in [

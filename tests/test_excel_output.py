@@ -4,6 +4,7 @@ from xml.etree import ElementTree
 
 from box_optimizer.io.excel_reader import read_workbook
 from box_optimizer.io.excel_writer import (
+    ExcelFormula,
     MAX_LABELS_PER_SHEET,
     MAX_MANUAL_ROW_BREAKS_PER_SHEET,
     _column_letter,
@@ -83,9 +84,10 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[:8] == [
+    assert sheet_names[:9] == [
         "Summary",
         "Cost Summary",
+        "Actual Dimensions",
         "Labels",
         "VFI Intake Form",
         "Optimized to Pack",
@@ -93,7 +95,7 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
         "Order Volume Weights",
         "Box Size Summary",
     ]
-    assert sheet_names[8:] == ["Unmatched SKUs"]
+    assert sheet_names[9:] == ["Unmatched SKUs"]
 
 
 def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
@@ -123,6 +125,7 @@ def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
     assert sheet_names == [
         "Summary",
         "Cost Summary",
+        "Actual Dimensions",
         "Labels",
         "US",
         "VFI Intake Form",
@@ -431,6 +434,88 @@ def test_write_workbook_formats_shipping_money_columns_as_usd(tmp_path):
     assert cost_summary.find(".//main:c[@r='C2']/main:v", NS).text == "0"
 
 
+def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_and_hidden_helpers(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"VFI #": "VFI-1", "Country": "Canada", "Total Units": 2, "Hub Shipping Fee": 12}],
+        actual_dimensions_rows=[
+            {
+                "Barcode": "",
+                "Order number": "",
+                "weight": "",
+                "CBM weight": "",
+                "L": "",
+                "W": "",
+                "H": "",
+                "CBM": "",
+                "Time": "",
+                "Cost Summary VFI #": ExcelFormula('IF($A2="",$A2,"base")'),
+                "Group VFI key": ExcelFormula('IF($A2="",$A2,"base")'),
+                "Is charge row": ExcelFormula('IF($A2="","","Yes")'),
+                "Country": ExcelFormula('IF($A2="","",IFERROR(INDEX(\'_ActualLookupTable\'!$B:$B,MATCH($K2,\'_ActualLookupTable\'!$A:$A,0)),""))'),
+            }
+        ],
+        actual_lookup_rows=[{"Barcode": "VFI-1", "Country": "Canada"}],
+        actual_rate_rows=[{"Rate Key": "Zone 2|1", "Zone": "Zone 2", "Weight Band kg": 1, "Hub Rate": 10}],
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    assert sheet_names[1:3] == ["Cost Summary", "Actual Dimensions"]
+    assert "_ActualLookupTable" in sheet_names
+    assert "_ActualRateTable" in sheet_names
+
+    actual_xml = _worksheet_xml(path, "Actual Dimensions")
+    actual_root = ElementTree.fromstring(actual_xml)
+    headers = [
+        cell.find(".//main:t", NS).text
+        for cell in actual_root.findall("main:sheetData/main:row[@r='1']/main:c", NS)
+    ]
+    assert headers[:9] == [
+        "Barcode",
+        "Order number",
+        "weight",
+        "CBM weight",
+        "L",
+        "W",
+        "H",
+        "CBM",
+        "Time",
+    ]
+    assert headers[9:27] == [
+        "Cost Summary VFI #",
+        "Group VFI key",
+        "Is charge row",
+        "Country",
+        "Pick count / Total units",
+        "Add-on adjusters",
+        "Actual weight kg",
+        "CBM weight kg",
+        "Carton chargeable weight kg",
+        "Order/group chargeable weight kg",
+        "Hub zone / rate zone",
+        "Matched rate weight band",
+        "Actual hub shipping fee",
+        "Pick / add-on fee",
+        "Actual total shipping cost",
+        "Quoted shipping cost",
+        "Actual vs quoted difference",
+        "Lookup status",
+    ]
+    assert '<f>IF($A2=' in actual_xml
+    assert "$B2" not in actual_xml
+    assert "XLOOKUP" not in actual_xml
+    assert "LET(" not in actual_xml
+    assert "MATCH($K2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
+
+    with zipfile.ZipFile(path) as archive:
+        workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+    assert 'name="_ActualLookupTable"' in workbook_xml
+    assert 'name="_ActualRateTable"' in workbook_xml
+    assert 'state="hidden"' in workbook_xml
+
+
 def test_vfi_intake_form_hides_database_upload_columns_without_deleting_data(tmp_path):
     path = tmp_path / "report.xlsx"
     row = {f"Column {_column_letter(index)}": f"value-{index + 1}" for index in range(28)}
@@ -495,7 +580,7 @@ def test_labels_sheet_follows_campaign_suffixed_cost_summary(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[1:3] == ["Cost Summary - Sordane", "Labels"]
+    assert sheet_names[1:4] == ["Cost Summary - Sordane", "Actual Dimensions", "Labels"]
     assert sheet_names.count("Labels") == 1
     assert sheet_names.count("Cost Summary - Sordane") == 1
 
@@ -515,7 +600,7 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[1:5] == ["Cost Summary - Sordane", "Labels", "Hong Kong", "Singapore"]
+    assert sheet_names[1:6] == ["Cost Summary - Sordane", "Actual Dimensions", "Labels", "Hong Kong", "Singapore"]
     hong_kong_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Hong Kong")
     assert hong_kong_rows == [{"Country": "Hong Kong", "VFI #": "OPR 39"}]
 
@@ -534,6 +619,7 @@ def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
     assert _workbook_sheet_names(path) == [
         "Summary",
         "Cost Summary",
+        "Actual Dimensions",
         "Labels",
         "VFI Intake Form",
         "Optimized to Pack",

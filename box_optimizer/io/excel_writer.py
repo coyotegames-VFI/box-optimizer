@@ -1,6 +1,7 @@
 """Excel output helpers."""
 
 from pathlib import Path
+from dataclasses import dataclass
 import re
 from xml.sax.saxutils import escape
 import zipfile
@@ -11,6 +12,7 @@ from box_optimizer.io.qr import qr_png
 REQUIRED_SHEETS = [
     "Summary",
     "Cost Summary",
+    "Actual Dimensions",
     "Labels",
     "VFI Intake Form",
     "Optimized to Pack",
@@ -20,6 +22,8 @@ REQUIRED_SHEETS = [
 ]
 
 OPTIONAL_SHEETS = [
+    "_ActualLookupTable",
+    "_ActualRateTable",
     "Unmatched SKUs",
     "Multi Box Detail",
     "Pledge Combination Summary",
@@ -63,6 +67,41 @@ ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "SKU Breakdown",
 ]
 
+ACTUAL_DIMENSIONS_COLUMNS = [
+    "Barcode",
+    "Order number",
+    "weight",
+    "CBM weight",
+    "L",
+    "W",
+    "H",
+    "CBM",
+    "Time",
+    "Cost Summary VFI #",
+    "Group VFI key",
+    "Is charge row",
+    "Country",
+    "Pick count / Total units",
+    "Add-on adjusters",
+    "Actual weight kg",
+    "CBM weight kg",
+    "Carton chargeable weight kg",
+    "Order/group chargeable weight kg",
+    "Hub zone / rate zone",
+    "Matched rate weight band",
+    "Actual hub shipping fee",
+    "Pick / add-on fee",
+    "Actual total shipping cost",
+    "Quoted shipping cost",
+    "Actual vs quoted difference",
+    "Lookup status",
+]
+
+
+@dataclass(frozen=True)
+class ExcelFormula:
+    formula: str
+
 _UNIT_HINTS = {
     "length": "cm",
     "width": "cm",
@@ -105,6 +144,8 @@ def _header_with_units(header: str) -> str:
 
 
 def _display_header_for_sheet(sheet_name: str, header: str) -> str:
+    if sheet_name == "Actual Dimensions":
+        return header
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee", "Express"}:
         return f"{header} (USD)"
     if header == "Country Detail":
@@ -131,8 +172,15 @@ def _number_cell(reference: str, value: int | float, style: int | None = None) -
     return f'<c r="{reference}"{style_attr}><v>{value}</v></c>'
 
 
+def _formula_cell(reference: str, formula: str, style: int | None = None) -> str:
+    style_attr = f' s="{style}"' if style is not None else ""
+    return f'<c r="{reference}"{style_attr}><f>{escape(formula)}</f></c>'
+
+
 def _cell_xml(row_index: int, column_index: int, value: object, style: int | None = None) -> str:
     reference = f"{_column_letter(column_index)}{row_index}"
+    if isinstance(value, ExcelFormula):
+        return _formula_cell(reference, value.formula, style)
     if isinstance(value, bool):
         return f'<c r="{reference}" t="b"><v>{1 if value else 0}</v></c>'
     if isinstance(value, int | float) and not isinstance(value, bool):
@@ -165,6 +213,14 @@ def _cell_style_for_sheet_value(
             except (TypeError, ValueError):
                 pass
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee (USD)", "Express (USD)"}:
+        return 19
+    if sheet_name == "Actual Dimensions" and header in {
+        "Actual hub shipping fee",
+        "Pick / add-on fee",
+        "Actual total shipping cost",
+        "Quoted shipping cost",
+        "Actual vs quoted difference",
+    }:
         return 19
     return None
 
@@ -724,6 +780,10 @@ def _headers_for_sheet(sheet_name: str, rows: list[dict]) -> list[str]:
     headers = []
     seen = set()
 
+    if sheet_name == "Actual Dimensions":
+        headers.extend(ACTUAL_DIMENSIONS_COLUMNS)
+        seen.update(ACTUAL_DIMENSIONS_COLUMNS)
+
     if sheet_name == "Order Volume Weights":
         headers.extend(ORDER_VOLUME_WEIGHTS_COLUMNS)
         seen.update(ORDER_VOLUME_WEIGHTS_COLUMNS)
@@ -762,6 +822,8 @@ def _is_one_decimal_measure_column(header: str) -> bool:
 
 
 def _format_measure_value(header: str, value: object) -> object:
+    if isinstance(value, ExcelFormula):
+        return value
     if not _is_one_decimal_measure_column(header):
         return value
     if isinstance(value, bool):
@@ -781,6 +843,8 @@ def _format_measure_value(header: str, value: object) -> object:
 
 def _rows_to_table(sheet_name: str, rows: list[dict]) -> tuple[list[str], list[list[object]]]:
     if not rows:
+        if sheet_name == "Actual Dimensions":
+            return ACTUAL_DIMENSIONS_COLUMNS, []
         if sheet_name == "Order Volume Weights":
             return ORDER_VOLUME_WEIGHTS_COLUMNS, []
         return ["Note"], [["No records"]]
@@ -814,6 +878,8 @@ def _worksheet_column_xml(sheet_name: str, widths: list[float]) -> str:
             if sheet_name == "VFI Intake Form" and 12 <= column_number <= 27
             else ""
         )
+        if sheet_name in {"_ActualLookupTable", "_ActualRateTable"}:
+            hidden = ' hidden="1" collapsed="1"'
         column_xml.append(
             f'<col min="{column_number}" max="{column_number}" width="{width}" customWidth="1"{hidden}/>'
         )
@@ -859,7 +925,8 @@ def _worksheet_xml(sheet_name: str, rows: list[dict]) -> str:
 
 def _workbook_xml(sheet_names: list[str]) -> str:
     sheets = "".join(
-        f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+        f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"'
+        f'{" state=" + chr(34) + "hidden" + chr(34) if name in {"_ActualLookupTable", "_ActualRateTable"} else ""}/>'
         for index, name in enumerate(sheet_names, start=1)
     )
     return (
@@ -1010,6 +1077,9 @@ def _build_sheet_payloads(
     aliases = {
         "summary_rows": "Summary",
         "cost_summary_rows": "Cost Summary",
+        "actual_dimensions_rows": "Actual Dimensions",
+        "actual_lookup_rows": "_ActualLookupTable",
+        "actual_rate_rows": "_ActualRateTable",
         "vfi_intake_form_rows": "VFI Intake Form",
         "optimized_to_pack_rows": "Optimized to Pack",
         "label_generator_rows": "Label generator",
@@ -1060,6 +1130,9 @@ def _build_sheet_payloads(
         operational_sheet_names = {
             "Summary",
             "Cost Summary",
+            "Actual Dimensions",
+            "_ActualLookupTable",
+            "_ActualRateTable",
             "VFI Intake Form",
             "Optimized to Pack",
             "Box Size Summary",

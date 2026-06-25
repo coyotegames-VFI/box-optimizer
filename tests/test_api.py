@@ -1392,7 +1392,7 @@ def test_employee_upload_token_gets_worker_workbook_when_admin_upload_token_is_s
     sheet_names = _sheet_names_from_xlsx_bytes(download.content)
 
     assert download.status_code == 200
-    assert sheet_names[:3] == ["Summary", "Cost Summary", "Labels"]
+    assert sheet_names[:4] == ["Summary", "Cost Summary", "Actual Dimensions", "Labels"]
     assert "United States" in sheet_names
     assert "VFI Intake Form" in sheet_names
     assert "Optimized to Pack" in sheet_names
