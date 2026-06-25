@@ -16,7 +16,13 @@ from pathlib import Path
 
 from box_optimizer.bundling import sku_combination_key
 from box_optimizer.io.excel_reader import IntakeResult, read_intake, read_workbook
-from box_optimizer.io.excel_writer import ExcelFormula, workbook_sheet_stats, write_workbook
+from box_optimizer.io.excel_writer import (
+    ACTUAL_DIMENSIONS_COLUMNS,
+    ExcelFormula,
+    _column_letter,
+    workbook_sheet_stats,
+    write_workbook,
+)
 from box_optimizer.models import Dimensions, OrderLine, PackedItem, SKUItem
 from box_optimizer.normalize import normalize_sku
 from box_optimizer.packing.geometry import volume
@@ -4578,6 +4584,12 @@ def _order_notes_value(row: dict) -> str:
     return ""
 
 
+def _actual_dimensions_column_range(header: str) -> str:
+    column_index = ACTUAL_DIMENSIONS_COLUMNS.index(header)
+    column = _column_letter(column_index)
+    return f"${column}:${column}"
+
+
 def _cost_summary_rows(
     order_rows: list[dict],
     cfg: dict,
@@ -4588,11 +4600,16 @@ def _cost_summary_rows(
     rate_selection = rate_selection or _resolve_customer_rate_sheet(cfg)
     rate_sheet = rate_selection.sheet
     sku_rules = sku_rules if sku_rules is not None else _parse_sku_rules(cfg)
-    for row in order_rows:
+    actual_dimensions = _excel_quote_sheet_name("Actual Dimensions")
+    actual_scan_status_column = _actual_dimensions_column_range("Scan status")
+    actual_expected_scan_group_column = _actual_dimensions_column_range("Expected scan group VFI key")
+    for index, row in enumerate(order_rows, start=2):
         zone = _zone_for_cost_summary_row(row, rate_sheet)
         hub_fee, express_fee, shipping_note = _shipping_fee_choice(row, rate_sheet, zone, sku_rules)
         shipping_method, method_note = _shipping_method_for_cost_summary_row(row, rate_sheet, hub_fee, express_fee)
         combined_note = " ".join(note for note in [shipping_note, method_note] if note)
+        actual_match = f'MATCH($B{index},{actual_dimensions}!$O:$O,0)'
+        actual_scan_row = f'INDEX({actual_dimensions}!$A:$A,{actual_match})'
         rows.append(
             {
                 "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id"]),
@@ -4614,6 +4631,17 @@ def _cost_summary_rows(
                 "Express": express_fee,
                 "Shipping Rate Note": combined_note,
                 "Box Qty": row.get("Box Qty", ""),
+                "Final weight kg": ExcelFormula(
+                    f'IFERROR(IF({actual_scan_row}="","",INDEX({actual_dimensions}!$Y:$Y,{actual_match})),"")'
+                ),
+                "Final cost": ExcelFormula(
+                    f'IFERROR(IF({actual_scan_row}="","",INDEX({actual_dimensions}!$I:$I,{actual_match})),"")'
+                ),
+                "Scan note": ExcelFormula(
+                    f'IF(COUNTA({actual_dimensions}!$A:$A)<=1,"",'
+                    f'IF(COUNTIFS({actual_dimensions}!{actual_expected_scan_group_column},$B{index},'
+                    f'{actual_dimensions}!{actual_scan_status_column},"Not Scanned")>0,"Item not scanned",""))'
+                ),
             }
         )
     return rows
@@ -4655,6 +4683,12 @@ def _actual_lookup_rows(
     rate_sheet: CustomerRateSheet | None,
     sku_rules: dict[str, SKUCampaignRule],
 ) -> list[dict]:
+    def estimated_weight_grams(cost_row: dict) -> int | str:
+        try:
+            return int(round(float(cost_row.get("Packed Actual Weight kg") or "") * 1000))
+        except (TypeError, ValueError):
+            return ""
+
     cost_by_vfi = {str(row.get("VFI #", "") or "").strip(): row for row in cost_summary_rows}
     rows = []
     for row in source_rows:
@@ -4685,6 +4719,7 @@ def _actual_lookup_rows(
                 "Pick / add-on fee": add_on_fee,
                 "Hub zone / rate zone": _zone_for_cost_summary_row(row, rate_sheet),
                 "Quoted shipping cost": quoted,
+                "Estimated weight g": estimated_weight_grams(cost_row),
             }
         )
     return rows or [
@@ -4696,6 +4731,7 @@ def _actual_lookup_rows(
             "Pick / add-on fee": "",
             "Hub zone / rate zone": "",
             "Quoted shipping cost": "",
+            "Estimated weight g": "",
         }
     ]
 
@@ -4739,22 +4775,58 @@ def _actual_rate_rows(rate_sheet: CustomerRateSheet | None) -> list[dict]:
     return rows or empty
 
 
-def _actual_dimensions_rows(row_count: int = ACTUAL_DIMENSIONS_FORMULA_ROWS) -> list[dict]:
+def _expected_scan_barcodes(labels_rows: list[dict]) -> list[str]:
+    barcodes = []
+    seen = set()
+    for row in labels_rows:
+        if row.get("Label Continuation"):
+            continue
+        barcode = str(
+            row.get("Barcode/QR Value")
+            or row.get("Label Value")
+            or row.get("Label numbers")
+            or row.get("Label Number")
+            or ""
+        ).strip()
+        if barcode and barcode not in seen:
+            seen.add(barcode)
+            barcodes.append(barcode)
+    return barcodes
+
+
+def _actual_dimensions_rows(
+    row_count: int = ACTUAL_DIMENSIONS_FORMULA_ROWS,
+    expected_scan_barcodes: list[str] | None = None,
+) -> list[dict]:
     lookup = _excel_quote_sheet_name("_ActualLookupTable")
     rates = _excel_quote_sheet_name("_ActualRateTable")
+    expected_scan_barcodes = expected_scan_barcodes or []
+    row_count = max(row_count, len(expected_scan_barcodes))
     rows = []
     for index in range(2, row_count + 2):
-        required = f'OR($A{index}="",$C{index}="",$D{index}="")'
+        expected_barcode = expected_scan_barcodes[index - 2] if index - 2 < len(expected_scan_barcodes) else ""
+        required = f'OR($A{index}="",$B{index}="",$C{index}="",$D{index}="",$E{index}="")'
         last_dash = f'FIND("@",SUBSTITUTE($A{index},"-","@",LEN($A{index})-LEN(SUBSTITUTE($A{index},"-",""))))'
         trailing_suffix = f'RIGHT($A{index},LEN($A{index})-{last_dash})'
         dash_group_key = f'IFERROR(IF(VALUE({trailing_suffix})>1,LEFT($A{index},{last_dash}-1),$A{index}),$A{index})'
         fourth_space = f'FIND("@",SUBSTITUTE($A{index}," ","@",4))'
         one_of_group_key = f'LEFT($A{index},FIND(" ",$A{index})-1)&" "&MID($A{index},{fourth_space}+1,999)'
         group_key = f'IFERROR(IF(ISNUMBER(SEARCH(" of ",$A{index})),{one_of_group_key},{dash_group_key}),{dash_group_key})'
+        expected_last_dash = f'FIND("@",SUBSTITUTE($L{index},"-","@",LEN($L{index})-LEN(SUBSTITUTE($L{index},"-",""))))'
+        expected_trailing_suffix = f'RIGHT($L{index},LEN($L{index})-{expected_last_dash})'
+        expected_dash_group_key = (
+            f'IFERROR(IF(VALUE({expected_trailing_suffix})>1,LEFT($L{index},{expected_last_dash}-1),$L{index}),$L{index})'
+        )
+        expected_fourth_space = f'FIND("@",SUBSTITUTE($L{index}," ","@",4))'
+        expected_one_of_group_key = f'LEFT($L{index},FIND(" ",$L{index})-1)&" "&MID($L{index},{expected_fourth_space}+1,999)'
+        expected_group_key = (
+            f'IFERROR(IF(ISNUMBER(SEARCH(" of ",$L{index})),{expected_one_of_group_key},{expected_dash_group_key}),'
+            f'{expected_dash_group_key})'
+        )
         one_of_charge_row = f'IFERROR(VALUE(MID($A{index},FIND(" ",$A{index})+1,FIND(" of ",$A{index})-FIND(" ",$A{index})-1))=1,FALSE)'
-        dash_charge_row = f'$A{index}=$K{index}'
+        dash_charge_row = f'$A{index}=$P{index}'
         is_charge_row = f'IF(ISNUMBER(SEARCH(" of ",$A{index})),{one_of_charge_row},{dash_charge_row})'
-        lookup_match = f'MATCH($K{index},{lookup}!$A:$A,0)'
+        lookup_match = f'MATCH($P{index},{lookup}!$A:$A,0)'
         lookup_value = f'INDEX({lookup}!$A:$A,{lookup_match})'
         country_value = f'INDEX({lookup}!$B:$B,{lookup_match})'
         pick_count_value = f'INDEX({lookup}!$C:$C,{lookup_match})'
@@ -4762,49 +4834,61 @@ def _actual_dimensions_rows(row_count: int = ACTUAL_DIMENSIONS_FORMULA_ROWS) -> 
         pick_addon_value = f'INDEX({lookup}!$E:$E,{lookup_match})'
         zone_value = f'INDEX({lookup}!$F:$F,{lookup_match})'
         quoted_value = f'INDEX({lookup}!$G:$G,{lookup_match})'
-        zone_match = f'MATCH($T{index},{rates}!$B:$B,0)'
+        estimated_weight_value = f'INDEX({lookup}!$H:$H,{lookup_match})'
+        zone_match = f'MATCH($Z{index},{rates}!$B:$B,0)'
         max_weight = f'INDEX({rates}!$E:$E,{zone_match})'
         max_rate = f'INDEX({rates}!$F:$F,{zone_match})'
-        matched_weight = f'CEILING($S{index}-0.000000001,0.5)'
+        matched_weight = f'CEILING($Y{index}-0.000000001,0.5)'
         remainder = f'CEILING(MOD({matched_weight}-0.000000001,{max_weight}),0.5)'
         rate_weight = f'IF({remainder}=0,{max_weight},{remainder})'
-        hub_rate = f'INDEX({rates}!$D:$D,MATCH($T{index}&"|"&{rate_weight},{rates}!$A:$A,0))'
-        charge_gate = f'OR({required},$L{index}<>"Yes")'
+        hub_rate = f'INDEX({rates}!$D:$D,MATCH($Z{index}&"|"&{rate_weight},{rates}!$A:$A,0))'
+        charge_gate = f'OR({required},$Q{index}<>"Yes")'
         rows.append(
             {
-                "Barcode": "",
-                "Order number": "",
-                "weight": "",
-                "CBM weight": "",
-                "L": "",
-                "W": "",
-                "H": "",
-                "CBM": "",
-                "Time": "",
-                "Cost Summary VFI #": ExcelFormula(f'IF($A{index}="","",IF({is_charge_row},$K{index},""))'),
+                "Scan barcode": "",
+                "Weight in grams": "",
+                "Length": "",
+                "Width": "",
+                "Height": "",
+                "Actual DIM weight kg": ExcelFormula(
+                    f'IF(OR($C{index}="",$D{index}="",$E{index}=""),"",'
+                    f'CEILING($C{index},0.5)*CEILING($D{index},0.5)*CEILING($E{index},0.5)/5000)'
+                ),
+                "Estimated weight in grams": ExcelFormula(f'IF($A{index}="","",IFERROR({estimated_weight_value},""))'),
+                "Weight warning": ExcelFormula(
+                    f'IF(OR($B{index}="",$G{index}=""),"",'
+                    f'IF($B{index}>$G{index}*1.2,"Greater than expected",'
+                    f'IF($B{index}<$G{index}*0.95,"Less than expected","")))'
+                ),
+                "Actual total shipping cost": ExcelFormula(f'IF(OR({charge_gate},$AB{index}=""),"",$AB{index}+$AC{index})'),
+                "Quoted shipping cost": ExcelFormula(f'IF({charge_gate},"",IFERROR({quoted_value},""))'),
+                "Actual vs quoted difference": ExcelFormula(f'IF(OR({charge_gate},$I{index}="",$J{index}=""),"",$I{index}-$J{index})'),
+                "Expected scan barcode": expected_barcode,
+                "Scan status": ExcelFormula(f'IF($L{index}="","",IF(COUNTIF($A:$A,$L{index})>0,"","Not Scanned"))'),
+                "Helper/debug separator": "",
+                "Cost Summary VFI #": ExcelFormula(f'IF($A{index}="","",IF({is_charge_row},$P{index},""))'),
                 "Group VFI key": ExcelFormula(f'IF($A{index}="","",{group_key})'),
                 "Is charge row": ExcelFormula(f'IF($A{index}="","",IF({is_charge_row},"Yes","No"))'),
                 "Country": ExcelFormula(f'IF($A{index}="","",IFERROR({country_value},""))'),
                 "Pick count / Total units": ExcelFormula(f'IF($A{index}="","",IFERROR({pick_count_value},""))'),
                 "Add-on adjusters": ExcelFormula(f'IF($A{index}="","",IFERROR({adders_value},""))'),
-                "Actual weight kg": ExcelFormula(f'IF({required},"",$C{index}/1000)'),
-                "CBM weight kg": ExcelFormula(f'IF({required},"",$D{index}/1000)'),
-                "Carton chargeable weight kg": ExcelFormula(f'IF(OR($P{index}="",$Q{index}=""),"",MAX($P{index},$Q{index}))'),
-                "Order/group chargeable weight kg": ExcelFormula(f'IF(OR({required},$K{index}=""),"",SUMIF($K:$K,$K{index},$R:$R))'),
+                "Actual weight kg": ExcelFormula(f'IF($B{index}="","",$B{index}/1000)'),
+                "Actual DIM weight kg helper": ExcelFormula(f'IF($F{index}="","",$F{index})'),
+                "Actual chargeable weight kg": ExcelFormula(f'IF(OR($B{index}="",$F{index}=""),"",MAX($B{index}/1000,$F{index}))'),
+                "Carton chargeable weight kg": ExcelFormula(f'IF($W{index}="","",$W{index})'),
+                "Order/group chargeable weight kg": ExcelFormula(f'IF(OR({required},$P{index}=""),"",SUMIF($P:$P,$P{index},$X:$X))'),
                 "Hub zone / rate zone": ExcelFormula(f'IF($A{index}="","",IFERROR({zone_value},""))'),
-                "Matched rate weight band": ExcelFormula(f'IF(OR({charge_gate},$T{index}="",$S{index}=""),"",{matched_weight})'),
+                "Matched rate weight band": ExcelFormula(f'IF(OR({charge_gate},$Z{index}="",$Y{index}=""),"",{matched_weight})'),
                 "Actual hub shipping fee": ExcelFormula(
-                    f'IF(OR({charge_gate},$T{index}="",$S{index}=""),"",IFERROR('
+                    f'IF(OR({charge_gate},$Z{index}="",$Y{index}=""),"",IFERROR('
                     f'INT(({matched_weight}-0.000000001)/{max_weight})*{max_rate}+{hub_rate},""))'
                 ),
                 "Pick / add-on fee": ExcelFormula(f'IF({charge_gate},"",IFERROR({pick_addon_value},""))'),
-                "Actual total shipping cost": ExcelFormula(f'IF(OR({charge_gate},$V{index}=""),"",$V{index}+$W{index})'),
-                "Quoted shipping cost": ExcelFormula(f'IF({charge_gate},"",IFERROR({quoted_value},""))'),
-                "Actual vs quoted difference": ExcelFormula(f'IF(OR({charge_gate},$X{index}="",$Y{index}=""),"",$X{index}-$Y{index})'),
                 "Lookup status": ExcelFormula(
                     f'IF($A{index}="","",IFERROR(IF({lookup_value}="","No barcode match",'
-                    f'IF($L{index}<>"Yes","Dimension only",IF(OR($T{index}="",$V{index}=""),"No hub rate","OK"))),"No barcode match"))'
+                    f'IF($Q{index}<>"Yes","Dimension only",IF(OR($Y{index}="",$AA{index}=""),"No hub rate","OK"))),"No barcode match"))'
                 ),
+                "Expected scan group VFI key": ExcelFormula(f'IF($L{index}="","",{expected_group_key})'),
             }
         )
     return rows
@@ -4916,17 +5000,37 @@ def _country_scan_sheet_name(country: object, used: set[str]) -> str:
     return name
 
 
-COUNTRY_SCAN_COLUMN_C_PLACEHOLDER = "_Country Scan Blank Column C"
+COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS = "Actual weight g"
+COUNTRY_SCAN_VOLUMETRIC_WEIGHT_KG = "Volumetric weight kg"
 COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER = "_Country Scan Future Cost Blank"
 COUNTRY_SCAN_METADATA_PLACEHOLDER_PREFIX = "_Country Scan Metadata Blank "
 COUNTRY_SCAN_RAW_METADATA_KEY = "_Country Scan Metadata"
+COUNTRY_SCAN_ITEMS_IN_BOX = "Items in box"
 
 COUNTRY_SCAN_CORE_COLUMNS = {
-    "Country",
+    "Campaign",
     "VFI #",
-    COUNTRY_SCAN_COLUMN_C_PLACEHOLDER,
+    COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS,
+    COUNTRY_SCAN_VOLUMETRIC_WEIGHT_KG,
     COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER,
+    COUNTRY_SCAN_ITEMS_IN_BOX,
     "Items in this box / SKU contents",
+}
+
+COUNTRY_SCAN_GROUPED_HUB_TABS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Australia-NZ", ("Australia", "New Zealand")),
+    ("China-HK", ("China", "Hong Kong")),
+    ("Middle East Hub", ("Bahrain", "Kuwait", "Oman", "Saudi Arabia", "United Arab Emirates")),
+)
+COUNTRY_SCAN_GROUPED_HUB_COUNTRY_TO_TAB = {
+    country.casefold(): tab_name
+    for tab_name, countries in COUNTRY_SCAN_GROUPED_HUB_TABS
+    for country in countries
+}
+COUNTRY_SCAN_GROUPED_HUB_RANK = {
+    country.casefold(): rank
+    for _tab_name, countries in COUNTRY_SCAN_GROUPED_HUB_TABS
+    for rank, country in enumerate(countries)
 }
 
 COUNTRY_SCAN_EXCLUDED_METADATA = {
@@ -4943,6 +5047,7 @@ COUNTRY_SCAN_EXCLUDED_METADATA = {
     "Pledge Configuration",
     "Campaign Name",
     "Factory Name",
+    "Country",
     "Country Name Chinese",
     "Origin",
     "Total Value USD",
@@ -5049,38 +5154,33 @@ def _country_scan_metadata(row: dict) -> dict:
 def _country_scan_sheets(
     label_rows: list[dict],
     rate_sheet: "CustomerRateSheet | None" = None,
+    campaign_name: str = "",
 ) -> dict[str, list[dict]]:
     entries_by_sheet: dict[str, list[dict]] = {}
     metadata_keys_by_sheet: dict[str, list[str]] = {}
     name_by_country: dict[str, str] = {}
     used_names = set()
     main_rows = [row for row in label_rows if not row.get("Label Continuation")]
-    non_hub_rows = [
-        row
-        for index, row in enumerate(main_rows)
-        if not _is_vfi_hub_country(
-            _first_present(row, ["Country", "Country Name"]),
+    main_row_rank = {id(row): index for index, row in enumerate(main_rows)}
+    def grouped_hub_tab_name(country: object) -> str:
+        return COUNTRY_SCAN_GROUPED_HUB_COUNTRY_TO_TAB.get(_hub_country_name(country).casefold(), "")
+
+    def is_hub_row(row: dict) -> bool:
+        country = _first_present(row, ["Country", "Country Name"])
+        return bool(grouped_hub_tab_name(country)) or _is_vfi_hub_country(
+            country,
             rate_sheet,
             row.get("State/Province", ""),
         )
-    ]
+
+    non_hub_rows = [row for row in main_rows if not is_hub_row(row)]
     non_hub_rank = {id(row): index for index, row in enumerate(non_hub_rows)}
     ordered_rows = sorted(
         main_rows,
         key=lambda row: (
-            0
-            if _is_vfi_hub_country(
-                _first_present(row, ["Country", "Country Name"]),
-                rate_sheet,
-                row.get("State/Province", ""),
-            )
-            else 1,
+            0 if is_hub_row(row) else 1,
             ""
-            if _is_vfi_hub_country(
-                _first_present(row, ["Country", "Country Name"]),
-                rate_sheet,
-                row.get("State/Province", ""),
-            )
+            if is_hub_row(row)
             else _country_sequence_display(_first_present(row, ["Country", "Country Name"])).casefold(),
             non_hub_rank.get(id(row), 0),
         ),
@@ -5089,7 +5189,11 @@ def _country_scan_sheets(
         if row.get("Label Continuation"):
             continue
         country = _country_sequence_display(_first_present(row, ["Country", "Country Name"]))
-        if _is_vfi_hub_country(country, rate_sheet, row.get("State/Province", "")):
+        grouped_tab_name = grouped_hub_tab_name(country)
+        if grouped_tab_name:
+            sheet_name = grouped_tab_name
+            entries_by_sheet.setdefault(sheet_name, [])
+        elif _is_vfi_hub_country(country, rate_sheet, row.get("State/Province", "")):
             sheet_country = _hub_country_name(country)
             key = sheet_country.casefold()
             if key not in name_by_country:
@@ -5116,18 +5220,31 @@ def _country_scan_sheets(
                 "country": country,
                 "vfi": scan_value,
                 "metadata": metadata,
+                "items_in_box": row.get("Total Units", ""),
                 "items": _label_row_items_text(row),
+                "country_rank": COUNTRY_SCAN_GROUPED_HUB_RANK.get(_hub_country_name(country).casefold(), 0),
+                "row_rank": main_row_rank.get(id(row), 0),
             }
         )
     sheets: dict[str, list[dict]] = {}
+    actual_dimensions = _excel_quote_sheet_name("Actual Dimensions")
     for sheet_name, entries in entries_by_sheet.items():
+        if sheet_name in {tab_name for tab_name, _countries in COUNTRY_SCAN_GROUPED_HUB_TABS}:
+            entries = sorted(entries, key=lambda entry: (entry["country_rank"], entry["row_rank"]))
         metadata_keys = metadata_keys_by_sheet.get(sheet_name, [])
         sheets[sheet_name] = []
-        for entry in entries:
+        for row_index, entry in enumerate(entries, start=2):
+            scan_match = f'MATCH($B{row_index},{actual_dimensions}!$A:$A,0)'
+            actual_scan_value = f'INDEX({actual_dimensions}!$A:$A,{scan_match})'
             scan_row = {
-                "Country": entry["country"],
+                "Campaign": campaign_name,
                 "VFI #": entry["vfi"],
-                COUNTRY_SCAN_COLUMN_C_PLACEHOLDER: "",
+                COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS: ExcelFormula(
+                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$B:$B,{scan_match})),"")'
+                ),
+                COUNTRY_SCAN_VOLUMETRIC_WEIGHT_KG: ExcelFormula(
+                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$F:$F,{scan_match})),"")'
+                ),
             }
             for key in metadata_keys:
                 scan_row[key] = entry["metadata"].get(key, "")
@@ -5136,6 +5253,7 @@ def _country_scan_sheets(
                 scan_row[f"{COUNTRY_SCAN_METADATA_PLACEHOLDER_PREFIX}{padding_index}"] = ""
                 padding_index += 1
             scan_row[COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER] = ""
+            scan_row[COUNTRY_SCAN_ITEMS_IN_BOX] = entry["items_in_box"]
             scan_row["Items in this box / SKU contents"] = entry["items"]
             sheets[sheet_name].append(scan_row)
     return sheets
@@ -7177,7 +7295,7 @@ def optimize_workbook(
     label_generator_rows = _rows_in_final_label_order(label_generator_rows, labels_rows)
     order_rows = _rows_in_final_label_order(order_rows, labels_rows)
     cost_order_summary_rows = _rows_in_final_label_order(cost_order_summary_rows, labels_rows)
-    country_scan_sheets = _country_scan_sheets(labels_rows, rate_selection.sheet)
+    country_scan_sheets = _country_scan_sheets(labels_rows, rate_selection.sheet, _campaign_name(cfg))
     if cfg["preserve_region_sheets"]:
         rows_by_region = defaultdict(list)
         for row in order_rows:
@@ -7188,7 +7306,7 @@ def optimize_workbook(
     cost_summary_rows = _cost_summary_rows(cost_order_summary_rows, cfg, rate_selection, sku_rules)
     actual_lookup_rows = _actual_lookup_rows(cost_order_summary_rows, cost_summary_rows, rate_selection.sheet, sku_rules)
     actual_rate_rows = _actual_rate_rows(rate_selection.sheet)
-    actual_dimensions_rows = _actual_dimensions_rows()
+    actual_dimensions_rows = _actual_dimensions_rows(expected_scan_barcodes=_expected_scan_barcodes(labels_rows))
     total_cost = _cost_summary_total_cost(cost_summary_rows)
     result["total_shipping_cost"] = total_cost
     result["total_shipping_cost_detail"] = "Hub Shipping Fee + Express"

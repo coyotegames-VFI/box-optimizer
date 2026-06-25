@@ -68,15 +68,20 @@ ORDER_VOLUME_WEIGHTS_COLUMNS = [
 ]
 
 ACTUAL_DIMENSIONS_COLUMNS = [
-    "Barcode",
-    "Order number",
-    "weight",
-    "CBM weight",
-    "L",
-    "W",
-    "H",
-    "CBM",
-    "Time",
+    "Scan barcode",
+    "Weight in grams",
+    "Length",
+    "Width",
+    "Height",
+    "Actual DIM weight kg",
+    "Estimated weight in grams",
+    "Weight warning",
+    "Actual total shipping cost",
+    "Quoted shipping cost",
+    "Actual vs quoted difference",
+    "Expected scan barcode",
+    "Scan status",
+    "Helper/debug separator",
     "Cost Summary VFI #",
     "Group VFI key",
     "Is charge row",
@@ -84,18 +89,55 @@ ACTUAL_DIMENSIONS_COLUMNS = [
     "Pick count / Total units",
     "Add-on adjusters",
     "Actual weight kg",
-    "CBM weight kg",
+    "Actual DIM weight kg helper",
+    "Actual chargeable weight kg",
     "Carton chargeable weight kg",
     "Order/group chargeable weight kg",
     "Hub zone / rate zone",
     "Matched rate weight band",
     "Actual hub shipping fee",
     "Pick / add-on fee",
-    "Actual total shipping cost",
-    "Quoted shipping cost",
-    "Actual vs quoted difference",
     "Lookup status",
+    "Expected scan group VFI key",
 ]
+
+ACTUAL_DIMENSIONS_MAIN_COLUMNS = set(ACTUAL_DIMENSIONS_COLUMNS[:14])
+ACTUAL_DIMENSIONS_FIRST_HELPER_COLUMN = "Cost Summary VFI #"
+ACTUAL_DIMENSIONS_HELPER_COLUMNS = set(ACTUAL_DIMENSIONS_COLUMNS[14:])
+
+ACTUAL_DIMENSIONS_COLUMN_WIDTHS = {
+    "Scan barcode": 24,
+    "Weight in grams": 13,
+    "Length": 12,
+    "Width": 12,
+    "Height": 12,
+    "Actual DIM weight kg": 16,
+    "Estimated weight in grams": 20,
+    "Weight warning": 20,
+    "Actual total shipping cost": 18,
+    "Quoted shipping cost": 17,
+    "Actual vs quoted difference": 18,
+    "Expected scan barcode": 26,
+    "Scan status": 18,
+    "Helper/debug separator": 4,
+    "Cost Summary VFI #": 18,
+    "Group VFI key": 18,
+    "Is charge row": 14,
+    "Country": 16,
+    "Pick count / Total units": 18,
+    "Add-on adjusters": 16,
+    "Actual weight kg": 16,
+    "Actual DIM weight kg helper": 16,
+    "Actual chargeable weight kg": 18,
+    "Carton chargeable weight kg": 18,
+    "Order/group chargeable weight kg": 18,
+    "Hub zone / rate zone": 18,
+    "Matched rate weight band": 18,
+    "Actual hub shipping fee": 16,
+    "Pick / add-on fee": 16,
+    "Lookup status": 20,
+    "Expected scan group VFI key": 26,
+}
 
 
 @dataclass(frozen=True)
@@ -145,12 +187,14 @@ def _header_with_units(header: str) -> str:
 
 def _display_header_for_sheet(sheet_name: str, header: str) -> str:
     if sheet_name == "Actual Dimensions":
+        if header == "Helper/debug separator":
+            return ""
         return header
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee", "Express"}:
         return f"{header} (USD)"
     if header == "Country Detail":
         return "Country"
-    if header in {"_Country Scan Blank Column C", "_Country Scan Future Cost Blank"}:
+    if header in {"_Country Scan Future Cost Blank"}:
         return ""
     if header.startswith("_Country Scan Metadata Blank "):
         return ""
@@ -195,9 +239,15 @@ def _cell_style_for_sheet_value(
     headers: list[str],
     row: list[object],
 ) -> int | None:
+    header = headers[column_index] if column_index < len(headers) else ""
+    if row_index == 1 and sheet_name == "Actual Dimensions":
+        if header == ACTUAL_DIMENSIONS_FIRST_HELPER_COLUMN:
+            return 29
+        if header in ACTUAL_DIMENSIONS_HELPER_COLUMNS:
+            return 28
+        return 27
     if row_index == 1:
         return 1
-    header = headers[column_index] if column_index < len(headers) else ""
     if sheet_name == "Summary" and header == "Value":
         metric = str(row[1] if len(row) > 1 else "")
         if metric == "Total Chargeable Cost":
@@ -214,6 +264,12 @@ def _cell_style_for_sheet_value(
                 pass
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee (USD)", "Express (USD)"}:
         return 19
+    if sheet_name.startswith("Cost Summary") and header == "Final cost":
+        return 19
+    if sheet_name.startswith("Cost Summary") and header == "Final weight kg":
+        return 31
+    if header == "Volumetric weight kg":
+        return 31
     if sheet_name == "Actual Dimensions" and header in {
         "Actual hub shipping fee",
         "Pick / add-on fee",
@@ -222,6 +278,10 @@ def _cell_style_for_sheet_value(
         "Actual vs quoted difference",
     }:
         return 19
+    if sheet_name == "Actual Dimensions" and header == "Scan status":
+        return 26
+    if sheet_name == "Actual Dimensions" and header == ACTUAL_DIMENSIONS_FIRST_HELPER_COLUMN:
+        return 30
     return None
 
 
@@ -858,9 +918,32 @@ def _rows_to_table(sheet_name: str, rows: list[dict]) -> tuple[list[str], list[l
     return display_headers, values
 
 
-def _column_widths(headers: list[str], rows: list[list[object]]) -> list[float]:
+def _column_widths(sheet_name: str, headers: list[str], rows: list[list[object]]) -> list[float]:
+    if sheet_name == "Actual Dimensions":
+        return [
+            4
+            if index == 13
+            else ACTUAL_DIMENSIONS_COLUMN_WIDTHS.get(header, min(max(len(str(header)) + 2, 14), 18))
+            for index, header in enumerate(headers)
+        ]
+
     widths = []
     for index, header in enumerate(headers):
+        if sheet_name.startswith("Cost Summary") and header == "Final weight kg":
+            widths.append(15)
+            continue
+        if sheet_name.startswith("Cost Summary") and header == "Final cost":
+            widths.append(12)
+            continue
+        if sheet_name.startswith("Cost Summary") and header == "Scan note":
+            widths.append(16)
+            continue
+        if headers[2:4] == ["Actual weight g", "Volumetric weight kg"] and index == 2:
+            widths.append(13)
+            continue
+        if headers[2:4] == ["Actual weight g", "Volumetric weight kg"] and index == 3:
+            widths.append(16)
+            continue
         longest = len(str(header))
         for row in rows:
             if index < len(row):
@@ -902,7 +985,7 @@ def _worksheet_xml(sheet_name: str, rows: list[dict]) -> str:
         ]
         row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
 
-    widths = _column_widths(headers, values)
+    widths = _column_widths(sheet_name, headers, values)
     cols_xml = _worksheet_column_xml(sheet_name, widths)
     last_column = _column_letter(len(headers) - 1)
     last_row = max(len(table), 1)
@@ -1000,11 +1083,12 @@ def _styles_xml() -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        '<numFmts count="2">'
+        '<numFmts count="3">'
         '<numFmt numFmtId="164" formatCode="$#,##0.00&quot; (USD)&quot;"/>'
         '<numFmt numFmtId="165" formatCode="$#,##0.00"/>'
+        '<numFmt numFmtId="166" formatCode="0.0"/>'
         '</numFmts>'
-        '<fonts count="11">'
+        '<fonts count="12">'
         '<font><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><sz val="12"/><name val="Calibri"/></font>'
@@ -1016,11 +1100,13 @@ def _styles_xml() -> str:
         '<font><color rgb="FFFF0000"/><sz val="11"/><name val="Calibri"/></font>'
         '<font><sz val="15"/><name val="Calibri"/></font>'
         '<font><b/><sz val="31"/><name val="Calibri"/></font>'
+        '<font><b/><color rgb="FFFF0000"/><sz val="11"/><name val="Calibri"/></font>'
         "</fonts>"
-        '<fills count="3">'
+        '<fills count="4">'
         '<fill><patternFill patternType="none"/></fill>'
         '<fill><patternFill patternType="gray125"/></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFD9E2F3"/><bgColor indexed="64"/></patternFill></fill>'
         "</fills>"
         '<borders count="3">'
         '<border><left/><right/><top/><bottom/><diagonal/></border>'
@@ -1028,7 +1114,7 @@ def _styles_xml() -> str:
         '<border><left style="thick"><color auto="1"/></left><right style="thick"><color auto="1"/></right><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
         '</borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="26">'
+        '<cellXfs count="32">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
@@ -1055,6 +1141,12 @@ def _styles_xml() -> str:
         '<xf numFmtId="0" fontId="9" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
         '<xf numFmtId="0" fontId="10" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
         '<xf numFmtId="0" fontId="10" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="right"/></xf>'
+        '<xf numFmtId="0" fontId="11" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="3" borderId="2" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="2" xfId="0" applyBorder="1"/>'
+        '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"

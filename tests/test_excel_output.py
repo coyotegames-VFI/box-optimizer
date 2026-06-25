@@ -420,11 +420,18 @@ def test_write_workbook_formats_shipping_money_columns_as_usd(tmp_path):
         and fmt.attrib["formatCode"] == "$#,##0.00"
         for fmt in number_formats
     )
+    assert any(
+        fmt.attrib["numFmtId"] == "166"
+        and fmt.attrib["formatCode"] == "0.0"
+        for fmt in number_formats
+    )
     cell_formats = styles.findall("main:cellXfs/main:xf", NS)
     assert cell_formats[9].attrib["numFmtId"] == "164"
     assert cell_formats[9].attrib["applyNumberFormat"] == "1"
     assert cell_formats[19].attrib["numFmtId"] == "165"
     assert cell_formats[19].attrib["applyNumberFormat"] == "1"
+    assert cell_formats[31].attrib["numFmtId"] == "166"
+    assert cell_formats[31].attrib["applyNumberFormat"] == "1"
     assert summary.find(".//main:c[@r='C2']", NS).attrib["s"] == "9"
     assert "Hub Shipping Fee (USD)" in ElementTree.tostring(cost_summary, encoding="unicode")
     assert "Express (USD)" in ElementTree.tostring(cost_summary, encoding="unicode")
@@ -442,22 +449,28 @@ def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_
         cost_summary_rows=[{"VFI #": "VFI-1", "Country": "Canada", "Total Units": 2, "Hub Shipping Fee": 12}],
         actual_dimensions_rows=[
             {
-                "Barcode": "",
-                "Order number": "",
-                "weight": "",
-                "CBM weight": "",
-                "L": "",
-                "W": "",
-                "H": "",
-                "CBM": "",
-                "Time": "",
+                "Scan barcode": "",
+                "Weight in grams": "",
+                "Length": "",
+                "Width": "",
+                "Height": "",
+                "Actual DIM weight kg": ExcelFormula('IF(OR($C2="",$D2="",$E2=""),"",CEILING($C2,0.5)*CEILING($D2,0.5)*CEILING($E2,0.5)/5000)'),
+                "Estimated weight in grams": ExcelFormula('IF($A2="","",IFERROR(INDEX(\'_ActualLookupTable\'!$H:$H,MATCH($P2,\'_ActualLookupTable\'!$A:$A,0)),""))'),
+                "Weight warning": ExcelFormula('IF(OR($B2="",$G2=""),"",IF($B2>$G2*1.2,"Greater than expected",IF($B2<$G2*0.95,"Less than expected","")))'),
+                "Actual total shipping cost": ExcelFormula('IF($Q2<>"Yes","",10)'),
+                "Quoted shipping cost": ExcelFormula('IF($Q2<>"Yes","",8)'),
+                "Actual vs quoted difference": ExcelFormula('IF(OR($I2="",$J2=""),"",$I2-$J2)'),
+                "Expected scan barcode": "VFI-1",
+                "Scan status": ExcelFormula('IF($L2="","",IF(COUNTIF($A:$A,$L2)>0,"","Not Scanned"))'),
+                "Helper/debug separator": "",
                 "Cost Summary VFI #": ExcelFormula('IF($A2="",$A2,"base")'),
                 "Group VFI key": ExcelFormula('IF($A2="",$A2,"base")'),
                 "Is charge row": ExcelFormula('IF($A2="","","Yes")'),
-                "Country": ExcelFormula('IF($A2="","",IFERROR(INDEX(\'_ActualLookupTable\'!$B:$B,MATCH($K2,\'_ActualLookupTable\'!$A:$A,0)),""))'),
+                "Country": ExcelFormula('IF($A2="","",IFERROR(INDEX(\'_ActualLookupTable\'!$B:$B,MATCH($P2,\'_ActualLookupTable\'!$A:$A,0)),""))'),
+                "Actual chargeable weight kg": ExcelFormula('IF(OR($B2="",$F2=""),"",MAX($B2/1000,$F2))'),
             }
         ],
-        actual_lookup_rows=[{"Barcode": "VFI-1", "Country": "Canada"}],
+        actual_lookup_rows=[{"Barcode": "VFI-1", "Country": "Canada", "Estimated weight g": 1500}],
         actual_rate_rows=[{"Rate Key": "Zone 2|1", "Zone": "Zone 2", "Weight Band kg": 1, "Hub Rate": 10}],
     )
 
@@ -469,21 +482,26 @@ def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_
     actual_xml = _worksheet_xml(path, "Actual Dimensions")
     actual_root = ElementTree.fromstring(actual_xml)
     headers = [
-        cell.find(".//main:t", NS).text
+        cell.find(".//main:t", NS).text or ""
         for cell in actual_root.findall("main:sheetData/main:row[@r='1']/main:c", NS)
     ]
-    assert headers[:9] == [
-        "Barcode",
-        "Order number",
-        "weight",
-        "CBM weight",
-        "L",
-        "W",
-        "H",
-        "CBM",
-        "Time",
+    assert headers[:14] == [
+        "Scan barcode",
+        "Weight in grams",
+        "Length",
+        "Width",
+        "Height",
+        "Actual DIM weight kg",
+        "Estimated weight in grams",
+        "Weight warning",
+        "Actual total shipping cost",
+        "Quoted shipping cost",
+        "Actual vs quoted difference",
+        "Expected scan barcode",
+        "Scan status",
+        "",
     ]
-    assert headers[9:27] == [
+    assert headers[14:30] == [
         "Cost Summary VFI #",
         "Group VFI key",
         "Is charge row",
@@ -491,23 +509,57 @@ def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_
         "Pick count / Total units",
         "Add-on adjusters",
         "Actual weight kg",
-        "CBM weight kg",
+        "Actual DIM weight kg helper",
+        "Actual chargeable weight kg",
         "Carton chargeable weight kg",
         "Order/group chargeable weight kg",
         "Hub zone / rate zone",
         "Matched rate weight band",
         "Actual hub shipping fee",
         "Pick / add-on fee",
-        "Actual total shipping cost",
-        "Quoted shipping cost",
-        "Actual vs quoted difference",
         "Lookup status",
     ]
+    assert headers[30] == "Expected scan group VFI key"
+    assert headers[12] == "Scan status"
+    assert headers[13] == ""
+    assert headers[14] == "Cost Summary VFI #"
+
+    header_cells = {
+        cell.attrib["r"]: cell
+        for cell in actual_root.findall("main:sheetData/main:row[@r='1']/main:c", NS)
+    }
+    row_2_cells = {
+        cell.attrib["r"]: cell
+        for cell in actual_root.findall("main:sheetData/main:row[@r='2']/main:c", NS)
+    }
+    assert header_cells["N1"].attrib["s"] == "27"
+    assert header_cells["O1"].attrib["s"] == "29"
+    assert header_cells["P1"].attrib["s"] == "28"
+    assert row_2_cells["O2"].attrib["s"] == "30"
+
+    columns = actual_root.findall("main:cols/main:col", NS)
+    widths_by_column = {int(column.attrib["min"]): float(column.attrib["width"]) for column in columns}
+    assert widths_by_column[1] == 24
+    assert widths_by_column[2] == 13
+    assert widths_by_column[12] == 26
+    assert widths_by_column[13] == 18
+    assert widths_by_column[14] == 4
+    assert widths_by_column[15] == 18
+    assert max(widths_by_column.values()) <= 26
+
     assert '<f>IF($A2=' in actual_xml
-    assert "$B2" not in actual_xml
+    assert "Order number" not in headers
+    assert "CBM weight" not in headers
+    assert "CBM" not in headers
+    assert "Time" not in headers
     assert "XLOOKUP" not in actual_xml
     assert "LET(" not in actual_xml
-    assert "MATCH($K2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
+    assert "MATCH($P2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
+    assert "COUNTIF($A:$A,$L2)" in actual_xml
+    assert "MAX($B2/1000,$F2)" in actual_xml
+    assert 'IF($B2&gt;$G2*1.2,"Greater than expected",IF($B2&lt;$G2*0.95,"Less than expected",""))' in actual_xml
+    assert "Estimated DIM weight kg" not in headers
+    assert "DIM warning" not in headers
 
     with zipfile.ZipFile(path) as archive:
         workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
@@ -593,8 +645,8 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
         sheets={"Cost Summary - Sordane": [{"Order ID": "1", "Hub Shipping Fee": 12}]},
         labels_rows=[{"Label Number": "39", "Barcode/QR Value": "OPR 39"}],
         country_scan_sheets={
-            "Hong Kong": [{"Country": "Hong Kong", "VFI #": "OPR 39", "": ""}],
-            "Singapore": [{"Country": "Singapore", "VFI #": "OPR 40", "": ""}],
+            "Hong Kong": [{"Campaign": "Sordane", "VFI #": "OPR 39", "": ""}],
+            "Singapore": [{"Campaign": "Sordane", "VFI #": "OPR 40", "": ""}],
         },
     )
 
@@ -602,7 +654,7 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
 
     assert sheet_names[1:6] == ["Cost Summary - Sordane", "Actual Dimensions", "Labels", "Hong Kong", "Singapore"]
     hong_kong_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Hong Kong")
-    assert hong_kong_rows == [{"Country": "Hong Kong", "VFI #": "OPR 39"}]
+    assert hong_kong_rows == [{"Campaign": "Sordane", "VFI #": "OPR 39"}]
 
 
 def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):

@@ -607,24 +607,71 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
     assert "_ActualLookupTable" in sheet_names
     assert "_ActualRateTable" in sheet_names
 
+    cost_xml = _sheet_xml(output_path, "Cost Summary")
+    cost_root = ElementTree.fromstring(cost_xml)
+    cost_headers = [
+        cell.find(".//main:t", _NS).text
+        for cell in cost_root.findall("main:sheetData/main:row[@r='1']/main:c", _NS)
+    ]
+    assert cost_headers[-3:] == ["Final weight kg", "Final cost", "Scan note"]
+    cost_formulas = [
+        formula.text or ""
+        for formula in cost_root.findall("main:sheetData/main:row[@r='2']/main:c/main:f", _NS)
+    ]
+    cost_formula_text = "\n".join(cost_formulas)
+    assert "XLOOKUP" not in cost_xml
+    assert "LET(" not in cost_xml
+    assert "INDEX('Actual Dimensions'!$Y:$Y,MATCH($B2,'Actual Dimensions'!$O:$O,0))" in cost_formula_text
+    assert "INDEX('Actual Dimensions'!$I:$I,MATCH($B2,'Actual Dimensions'!$O:$O,0))" in cost_formula_text
+    assert "COUNTA('Actual Dimensions'!$A:$A)<=1" in cost_formula_text
+    assert 'COUNTIFS(\'Actual Dimensions\'!$AE:$AE,$B2,\'Actual Dimensions\'!$M:$M,"Not Scanned")>0' in cost_formula_text
+    assert 'COUNTIFS(\'Actual Dimensions\'!$P:$P,$B2,\'Actual Dimensions\'!$M:$M,"Not Scanned")>0' not in cost_formula_text
+    assert "MATCH($B2,'Actual Dimensions'!$L:$L,0)" not in cost_formula_text
+    assert "Item not scanned" in cost_formula_text
+    cost_widths = {
+        int(column.attrib["min"]): float(column.attrib["width"])
+        for column in cost_root.findall("main:cols/main:col", _NS)
+    }
+    final_weight_column = len(cost_headers) - 2
+    final_cost_column = len(cost_headers) - 1
+    scan_note_column = len(cost_headers)
+    assert cost_widths[final_weight_column] == 15
+    assert cost_widths[final_cost_column] == 12
+    assert cost_widths[scan_note_column] == 16
+    final_weight_ref = f"{excel_writer_module._column_letter(final_weight_column - 1)}2"
+    final_cost_ref = f"{excel_writer_module._column_letter(final_cost_column - 1)}2"
+    assert cost_root.find(f".//main:c[@r='{final_weight_ref}']", _NS).attrib["s"] == "31"
+    assert cost_root.find(f".//main:c[@r='{final_cost_ref}']", _NS).attrib["s"] == "19"
+    assert cost_root.find(".//main:c[@r='P2']", _NS).attrib["s"] == "19"
+    with zipfile.ZipFile(output_path) as archive:
+        styles_root = ElementTree.fromstring(archive.read("xl/styles.xml"))
+    cell_formats = styles_root.findall("main:cellXfs/main:xf", _NS)
+    assert cell_formats[19].attrib["numFmtId"] == "165"
+    assert cell_formats[31].attrib["numFmtId"] == "166"
+
     actual_xml = _sheet_xml(output_path, "Actual Dimensions")
     actual_root = ElementTree.fromstring(actual_xml)
     actual_headers = [
-        cell.find(".//main:t", _NS).text
+        cell.find(".//main:t", _NS).text or ""
         for cell in actual_root.findall("main:sheetData/main:row[@r='1']/main:c", _NS)
     ]
-    assert actual_headers[:9] == [
-        "Barcode",
-        "Order number",
-        "weight",
-        "CBM weight",
-        "L",
-        "W",
-        "H",
-        "CBM",
-        "Time",
+    assert actual_headers[:14] == [
+        "Scan barcode",
+        "Weight in grams",
+        "Length",
+        "Width",
+        "Height",
+        "Actual DIM weight kg",
+        "Estimated weight in grams",
+        "Weight warning",
+        "Actual total shipping cost",
+        "Quoted shipping cost",
+        "Actual vs quoted difference",
+        "Expected scan barcode",
+        "Scan status",
+        "",
     ]
-    assert actual_headers[9:27] == [
+    assert actual_headers[14:30] == [
         "Cost Summary VFI #",
         "Group VFI key",
         "Is charge row",
@@ -632,34 +679,39 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
         "Pick count / Total units",
         "Add-on adjusters",
         "Actual weight kg",
-        "CBM weight kg",
+        "Actual DIM weight kg helper",
+        "Actual chargeable weight kg",
         "Carton chargeable weight kg",
         "Order/group chargeable weight kg",
         "Hub zone / rate zone",
         "Matched rate weight band",
         "Actual hub shipping fee",
         "Pick / add-on fee",
-        "Actual total shipping cost",
-        "Quoted shipping cost",
-        "Actual vs quoted difference",
         "Lookup status",
     ]
+    assert actual_headers[30] == "Expected scan group VFI key"
+    assert _inline_cell_text(actual_xml, "N1") == ""
 
     assert "XLOOKUP" not in actual_xml
     assert "LET(" not in actual_xml
     assert 'ISNUMBER(SEARCH(" of ",$A2))' in actual_xml
     assert 'LEFT($A2,FIND(" ",$A2)-1)&amp;" "&amp;MID($A2,FIND("@",SUBSTITUTE($A2," ","@",4))+1,999)' in actual_xml
-    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$K2),$K2,""))' in actual_xml
+    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$P2),$P2,""))' in actual_xml
     assert 'VALUE(RIGHT($A2,LEN($A2)-FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))))&gt;1' in actual_xml
-    assert "MATCH($K2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
-    assert 'SUMIF($K:$K,$K2,$R:$R)' in actual_xml
-    assert "INDEX('_ActualRateTable'!$D:$D,MATCH($T2&amp;\"|\"&amp;" in actual_xml
-    assert "$C2/1000" in actual_xml
-    assert "$D2/1000" in actual_xml
-    assert "MAX($P2,$Q2)" in actual_xml
-    assert "CEILING($S2-0.000000001,0.5)" in actual_xml
-    assert '$L2&lt;&gt;"Yes"' in actual_xml
-    assert "$B2" not in actual_xml
+    assert "MATCH($P2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
+    assert "INDEX('_ActualLookupTable'!$H:$H" in actual_xml
+    assert 'CEILING($C2,0.5)*CEILING($D2,0.5)*CEILING($E2,0.5)/5000' in actual_xml
+    assert "MAX($B2/1000,$F2)" in actual_xml
+    assert 'IF($B2&gt;$G2*1.2,"Greater than expected",IF($B2&lt;$G2*0.95,"Less than expected",""))' in actual_xml
+    assert 'SUMIF($P:$P,$P2,$X:$X)' in actual_xml
+    assert "INDEX('_ActualRateTable'!$D:$D,MATCH($Z2&amp;\"|\"&amp;" in actual_xml
+    assert "$B2/1000" in actual_xml
+    assert "CEILING($Y2-0.000000001,0.5)" in actual_xml
+    assert '$Q2&lt;&gt;"Yes"' in actual_xml
+    assert "COUNTIF($A:$A,$L2)" in actual_xml
+    assert 'IF($L2="","",IFERROR(IF(ISNUMBER(SEARCH(" of ",$L2)),LEFT($L2,FIND(" ",$L2)-1)&amp;" "&amp;MID($L2,FIND("@",SUBSTITUTE($L2," ","@",4))+1,999)' in actual_xml
+    assert 'VALUE(RIGHT($L2,LEN($L2)-FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))))&gt;1' in actual_xml
+    assert "Not Scanned" in actual_xml
     assert "No barcode match" in actual_xml
     assert "No hub rate" in actual_xml
     assert "Dimension only" in actual_xml
@@ -670,6 +722,7 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
     assert lookup_rows[0]["Total Units"] == "1"
     assert lookup_rows[0]["Pick / add-on fee"] == "2.0"
     assert lookup_rows[0]["Quoted shipping cost"] == "15.35"
+    assert lookup_rows[0]["Estimated weight g"]
     assert rate_rows[0]["Zone"] == "Zone USA"
     assert rate_rows[0]["Weight Band kg"] == "0.5"
     with zipfile.ZipFile(output_path) as archive:
@@ -684,6 +737,7 @@ def test_actual_dimensions_multi_carton_formulas_group_by_base_barcode_and_gate_
 
     lookup_formula = row["Cost Summary VFI #"].formula
     group_key_formula = row["Group VFI key"].formula
+    expected_group_key_formula = row["Expected scan group VFI key"].formula
     charge_flag_formula = row["Is charge row"].formula
     group_weight_formula = row["Order/group chargeable weight kg"].formula
     matched_band_formula = row["Matched rate weight band"].formula
@@ -694,15 +748,27 @@ def test_actual_dimensions_multi_carton_formulas_group_by_base_barcode_and_gate_
     diff_formula = row["Actual vs quoted difference"].formula
     status_formula = row["Lookup status"].formula
 
-    assert "$B2" not in "".join(value.formula for value in row.values() if hasattr(value, "formula"))
-    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$K2),$K2,""))' == lookup_formula
+    assert 'CEILING($C2,0.5)*CEILING($D2,0.5)*CEILING($E2,0.5)/5000' == row["Actual DIM weight kg"].formula.split(',"",', 1)[1][:-1]
+    assert 'MAX($B2/1000,$F2)' in row["Actual chargeable weight kg"].formula
+    assert 'INDEX(\'_ActualLookupTable\'!$H:$H' in row["Estimated weight in grams"].formula
+    assert '$B2>$G2*1.2' in row["Weight warning"].formula
+    assert '$B2<$G2*0.95' in row["Weight warning"].formula
+    assert '"Greater than expected"' in row["Weight warning"].formula
+    assert '"Less than expected"' in row["Weight warning"].formula
+    assert 'COUNTIF($A:$A,$L2)' in row["Scan status"].formula
+    assert '"Not Scanned"' in row["Scan status"].formula
+    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$P2),$P2,""))' == lookup_formula
     assert 'LEFT($A2,FIND(" ",$A2)-1)&" "&MID($A2,FIND("@",SUBSTITUTE($A2," ","@",4))+1,999)' in group_key_formula
     assert 'VALUE(RIGHT($A2,LEN($A2)-FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))))>1' in group_key_formula
     assert 'LEFT($A2,FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))-1)' in group_key_formula
-    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$K2),"Yes","No"))' == charge_flag_formula
-    assert "MATCH($K2,'_ActualLookupTable'!$A:$A,0)" in row["Country"].formula
-    assert "SUMIF($K:$K,$K2,$R:$R)" in group_weight_formula
-    assert "CEILING($S2-0.000000001,0.5)" in matched_band_formula
+    assert 'IF($L2="","",' in expected_group_key_formula
+    assert 'LEFT($L2,FIND(" ",$L2)-1)&" "&MID($L2,FIND("@",SUBSTITUTE($L2," ","@",4))+1,999)' in expected_group_key_formula
+    assert 'VALUE(RIGHT($L2,LEN($L2)-FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))))>1' in expected_group_key_formula
+    assert 'LEFT($L2,FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))-1)' in expected_group_key_formula
+    assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$P2),"Yes","No"))' == charge_flag_formula
+    assert "MATCH($P2,'_ActualLookupTable'!$A:$A,0)" in row["Country"].formula
+    assert "SUMIF($P:$P,$P2,$X:$X)" in group_weight_formula
+    assert "CEILING($Y2-0.000000001,0.5)" in matched_band_formula
 
     for cost_formula in [
         matched_band_formula,
@@ -712,7 +778,7 @@ def test_actual_dimensions_multi_carton_formulas_group_by_base_barcode_and_gate_
         quoted_formula,
         diff_formula,
     ]:
-        assert '$L2<>"Yes"' in cost_formula
+        assert '$Q2<>"Yes"' in cost_formula
 
     assert "Dimension only" in status_formula
     assert "XLOOKUP" not in "".join(value.formula for value in row.values() if hasattr(value, "formula"))
@@ -2171,11 +2237,14 @@ def test_country_tab_uses_raw_order_volume_metadata_and_preserves_nonstandard_he
         str(sku_master_path),
         str(orders_path),
         str(output_path),
-        config={"preserve_region_sheets": False, "campaign_label_prefix": "TEST"},
+        config={
+            "preserve_region_sheets": False,
+            "campaign": {"name": "Long Human Campaign", "code": "BARCODE"},
+        },
     )
 
     order_row = _sheet_rows(output_path, "Order Volume Weights")[0]
-    country_row = _sheet_rows(output_path, "Hong Kong")[0]
+    country_row = _sheet_rows(output_path, "China-HK")[0]
     metadata_headers = [
         "Backer Number",
         "Name",
@@ -2188,6 +2257,9 @@ def test_country_tab_uses_raw_order_volume_metadata_and_preserves_nonstandard_he
     ]
     assert country_row["SKU"] == order_row["SKU"]
     assert country_row["Quantity"] == order_row["Quantity"]
+    assert country_row["Items in box"] == "1"
+    assert country_row["Campaign"] == "Long Human Campaign"
+    assert country_row["Campaign"] != "BARCODE"
     for header in metadata_headers:
         assert country_row[header] == order_row[header]
     assert "Original Optimized Box Type" not in country_row
@@ -2195,19 +2267,21 @@ def test_country_tab_uses_raw_order_volume_metadata_and_preserves_nonstandard_he
     assert "Address Line 1" not in country_row
     assert "Address Line 2" not in country_row
 
-    hong_kong_xml = _sheet_xml(output_path, "Hong Kong")
-    assert [_inline_cell_text(hong_kong_xml, cell) for cell in ["A1", "B1", "C1", "D1", "M1", "N1", "O1"]] == [
-        "Country",
+    hong_kong_xml = _sheet_xml(output_path, "China-HK")
+    assert [_inline_cell_text(hong_kong_xml, cell) for cell in ["A1", "B1", "C1", "D1", "E1", "N1", "O1", "P1", "Q1"]] == [
+        "Campaign",
         "VFI #",
-        "",
+        "Actual weight g",
+        "Volumetric weight kg",
         "SKU",
         "Shipping Method",
         "",
+        "Items in box",
         "Items in this box / SKU contents",
     ]
-    assert _inline_cell_text(hong_kong_xml, "L2") == "HK-TAX"
-    assert _inline_cell_text(hong_kong_xml, "N2") == ""
-    assert _inline_cell_text(hong_kong_xml, "O2") == "(1)  CORE x1"
+    assert _inline_cell_text(hong_kong_xml, "M2") == "HK-TAX"
+    assert _inline_cell_text(hong_kong_xml, "O2") == ""
+    assert _inline_cell_text(hong_kong_xml, "Q2") == "(1)  CORE x1"
 
 
 def test_clean_default_order_volume_weights_hides_audit_columns(tmp_path):
@@ -3308,9 +3382,9 @@ def test_country_scan_sheets_group_barcode_values_by_country_in_label_order():
         ]
     )
 
-    assert [row["VFI #"] for row in sheets["Hong Kong"]] == ["VEST 1", "VEST 3"]
+    assert [row["VFI #"] for row in sheets["China-HK"]] == ["VEST 1", "VEST 3"]
     assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["VEST 4", "VEST 5", "VEST 2"]
-    assert "Barcode Value" not in sheets["Hong Kong"][0]
+    assert "Barcode Value" not in sheets["China-HK"][0]
     assert "Bad_Name" not in sheets
     assert "Bad_Name 2" not in sheets
 
@@ -3328,7 +3402,7 @@ def test_country_scan_sheets_keep_final_label_order_and_use_vfi_barcode_values()
         ]
     )
 
-    hong_kong_rows = sheets["Hong Kong"]
+    hong_kong_rows = sheets["China-HK"]
 
     assert "Country Number" not in hong_kong_rows[0]
     assert [row["VFI #"] for row in hong_kong_rows] == [
@@ -3340,8 +3414,39 @@ def test_country_scan_sheets_keep_final_label_order_and_use_vfi_barcode_values()
         "VEST 22-1",
         "VEST 21-1",
     ]
-    assert list(hong_kong_rows[0])[:2] == ["Country", "VFI #"]
+    assert list(hong_kong_rows[0])[:2] == ["Campaign", "VFI #"]
     assert "Barcode Value" not in hong_kong_rows[0]
+    assert list(hong_kong_rows[0])[2:4] == ["Actual weight g", "Volumetric weight kg"]
+
+
+def test_country_scan_sheets_group_selected_hub_countries_into_shared_tabs():
+    sheets = workflow_module._country_scan_sheets(
+        [
+            {"Country": "New Zealand", "Barcode/QR Value": "NZ-1", "Total Units": 2},
+            {"Country": "Germany", "Barcode/QR Value": "DE-1", "Total Units": 1},
+            {"Country": "Australia", "Barcode/QR Value": "AU-1", "Total Units": 3},
+            {"Country": "Hong Kong", "Barcode/QR Value": "HK-1", "Total Units": 4},
+            {"Country": "China", "Barcode/QR Value": "CN-1", "Total Units": 5},
+            {"Country": "United Arab Emirates", "Barcode/QR Value": "AE-1", "Total Units": 6},
+            {"Country": "Bahrain", "Barcode/QR Value": "BH-1", "Total Units": 7},
+            {"Country": "Oman", "Barcode/QR Value": "OM-1", "Total Units": 8},
+            {"Country": "Kuwait", "Barcode/QR Value": "KW-1", "Total Units": 9},
+            {"Country": "Saudi Arabia", "Barcode/QR Value": "SA-1", "Total Units": 10},
+        ]
+    )
+
+    assert [row["VFI #"] for row in sheets["Australia-NZ"]] == ["AU-1", "NZ-1"]
+    assert [row["VFI #"] for row in sheets["China-HK"]] == ["CN-1", "HK-1"]
+    assert [row["VFI #"] for row in sheets["Middle East Hub"]] == ["BH-1", "KW-1", "OM-1", "SA-1", "AE-1"]
+    assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["DE-1"]
+    assert "Australia" not in sheets
+    assert "New Zealand" not in sheets
+    assert "China" not in sheets
+    assert "Hong Kong" not in sheets
+    assert "Bahrain" not in sheets
+    assert sheets["Australia-NZ"][0]["Items in box"] == 3
+    assert sheets["China-HK"][0]["Items in box"] == 5
+    assert sheets["Middle East Hub"][0]["Items in box"] == 7
 
 
 def test_label_generator_populates_simplified_chinese_country_from_two_letter_code():
@@ -3785,16 +3890,18 @@ def test_visible_vfi_numbers_are_assigned_after_country_first_print_order_and_dr
     assert continuation["Barcode/QR Value"] == "3 3 of 3 emerald"
     assert display_vfi_by_order["CN-C3"] == "3 emerald"
 
-    scan_sheets = workflow_module._country_scan_sheets(numbered_rows)
-    assert [row["VFI #"] for row in scan_sheets["China"]] == [
+    scan_sheets = workflow_module._country_scan_sheets(numbered_rows, campaign_name="Emerald Long Campaign")
+    assert [row["VFI #"] for row in scan_sheets["China-HK"]] == [
         "1 emerald",
         "2 emerald",
         "3 1 of 3 emerald",
         "3 2 of 3 emerald",
         "3 3 of 3 emerald",
+        "4 emerald",
     ]
-    assert scan_sheets["Hong Kong"][0]["VFI #"] == "4 emerald"
-    assert scan_sheets["China"][0]["Items in this box / SKU contents"] == ""
+    assert [row["Campaign"] for row in scan_sheets["China-HK"]] == ["Emerald Long Campaign"] * 6
+    assert "Country" not in scan_sheets["China-HK"][0]
+    assert scan_sheets["China-HK"][0]["Items in this box / SKU contents"] == ""
 
 
 def test_labels_rows_respect_campaign_item_line_controls_and_report_overflow():
@@ -4003,7 +4110,7 @@ def test_workbook_cost_summary_removes_country_number_and_scan_tabs_use_label_vf
     workbook = read_workbook(str(output_path))
     sheet_names = _workbook_sheet_names(output_path)
     labels_index = sheet_names.index("Labels")
-    assert sheet_names[labels_index + 1 : labels_index + 3] == ["Hong Kong", "Singapore"]
+    assert sheet_names[labels_index + 1 : labels_index + 3] == ["China-HK", "Singapore"]
 
     cost_rows = _sheet_rows(output_path, "Cost Summary")
     assert "Country Number" not in cost_rows[0]
@@ -4018,16 +4125,29 @@ def test_workbook_cost_summary_removes_country_number_and_scan_tabs_use_label_vf
     }
     assert country_counts == {"Hong Kong": "2", "Singapore": "1"}
 
-    hong_kong_scan = _sheet_rows(output_path, "Hong Kong")
+    hong_kong_scan = _sheet_rows(output_path, "China-HK")
     singapore_scan = _sheet_rows(output_path, "Singapore")
     assert "Country Number" not in hong_kong_scan[0]
     assert [row["VFI #"] for row in hong_kong_scan] == ["1 TEST", "2 TEST"]
+    assert hong_kong_scan[0]["Items in box"] == "1"
     assert "Barcode Value" not in hong_kong_scan[0]
-    hong_kong_xml = _sheet_xml(output_path, "Hong Kong")
-    assert _inline_cell_text(hong_kong_xml, "A1") == "Country"
+    hong_kong_xml = _sheet_xml(output_path, "China-HK")
+    assert _inline_cell_text(hong_kong_xml, "A1") == "Campaign"
     assert _inline_cell_text(hong_kong_xml, "B1") == "VFI #"
-    assert _inline_cell_text(hong_kong_xml, "C1") == ""
+    assert _inline_cell_text(hong_kong_xml, "C1") == "Actual weight g"
+    assert _inline_cell_text(hong_kong_xml, "D1") == "Volumetric weight kg"
     assert _inline_cell_text(hong_kong_xml, "C2") == ""
+    assert _inline_cell_text(hong_kong_xml, "D2") == ""
+    hong_kong_root = ElementTree.fromstring(hong_kong_xml)
+    hong_kong_widths = {
+        int(column.attrib["min"]): float(column.attrib["width"])
+        for column in hong_kong_root.findall("main:cols/main:col", _NS)
+    }
+    assert hong_kong_widths[3] == 13
+    assert hong_kong_widths[4] == 16
+    assert hong_kong_root.find(".//main:c[@r='D2']", _NS).attrib["s"] == "31"
+    assert _inline_cell_text(hong_kong_xml, "O1") == "Items in box"
+    assert _inline_cell_text(hong_kong_xml, "P1") == "Items in this box / SKU contents"
     assert singapore_scan[0]["VFI #"] == "3 TEST"
     assert "Backer ID" not in hong_kong_scan[0]
     assert "Order ID" not in hong_kong_scan[0]
@@ -4137,10 +4257,11 @@ def test_country_scan_sheets_use_active_hub_pricing_and_preserve_intake_metadata
         },
     ]
 
-    sheets = workflow_module._country_scan_sheets(label_rows, rate_sheet)
+    sheets = workflow_module._country_scan_sheets(label_rows, rate_sheet, "Long Human Campaign")
 
     assert list(sheets) == ["Japan", "Singapore", "Non-Hub Countries"]
-    assert [row["Country"] for row in sheets["Non-Hub Countries"]] == ["France", "Germany"]
+    assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["4 VFI", "3 VFI"]
+    assert sheets["Japan"][0]["Campaign"] == "Long Human Campaign"
     assert sheets["Japan"][0]["Add to"] == "Apartment call box 7"
     assert sheets["Japan"][0]["Tax ID number"] == "JP-TAX"
     assert sheets["Japan"][0]["Tax ID"] == "JP-TAX-ALT"
@@ -4161,10 +4282,12 @@ def test_country_scan_sheets_use_active_hub_pricing_and_preserve_intake_metadata
     output_path = tmp_path / "country_scan.xlsx"
     excel_writer_module.write_workbook(str(output_path), country_scan_sheets=sheets)
     japan_xml = _sheet_xml(output_path, "Japan")
-    assert _inline_cell_text(japan_xml, "A1") == "Country"
+    assert _inline_cell_text(japan_xml, "A1") == "Campaign"
     assert _inline_cell_text(japan_xml, "B1") == "VFI #"
-    assert _inline_cell_text(japan_xml, "C1") == ""
+    assert _inline_cell_text(japan_xml, "C1") == "Actual weight g"
+    assert _inline_cell_text(japan_xml, "D1") == "Volumetric weight kg"
     assert _inline_cell_text(japan_xml, "C2") == ""
+    assert _inline_cell_text(japan_xml, "D2") == ""
     assert [
         _inline_cell_text(japan_xml, reference)
         for reference in [
@@ -4183,11 +4306,14 @@ def test_country_scan_sheets_use_active_hub_pricing_and_preserve_intake_metadata
             "M1",
             "N1",
             "O1",
+            "P1",
+            "Q1",
         ]
     ] == [
-        "Country",
+        "Campaign",
         "VFI #",
-        "",
+        "Actual weight g",
+        "Volumetric weight kg",
         "Backer ID",
         "Name",
         "Email",
@@ -4199,11 +4325,13 @@ def test_country_scan_sheets_use_active_hub_pricing_and_preserve_intake_metadata
         "Tax ID number",
         "Tax ID",
         "",
+        "Items in box",
         "Items in this box / SKU contents",
     ]
-    assert _inline_cell_text(japan_xml, "H2") == "Suite 7"
-    assert _inline_cell_text(japan_xml, "N2") == ""
-    assert _inline_cell_text(japan_xml, "O2") == "CORE x1"
+    assert _inline_cell_text(japan_xml, "I2") == "Suite 7"
+    assert _inline_cell_text(japan_xml, "O2") == ""
+    assert _inline_cell_text(japan_xml, "P2") == ""
+    assert _inline_cell_text(japan_xml, "Q2") == "CORE x1"
 
 
 def test_label_generator_does_not_duplicate_order_notes_for_multi_carton_orders():
