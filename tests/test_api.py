@@ -672,6 +672,17 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     assert 'name="config_json"' in response.text
     assert 'name="campaign_name"' in response.text
     assert 'name="packing_mode_choice"' in response.text
+    assert "<legend>Add invoice</legend>" in response.text
+    assert 'name="invoice_selection" value="none" checked' in response.text
+    assert 'name="invoice_selection" value="invoice_us"' in response.text
+    assert 'name="invoice_selection" value="invoice_cn"' in response.text
+    assert "Yes - US Pay To" in response.text
+    assert "Yes - CN Pay To" in response.text
+    assert "INVOICE_PAY_TO" not in response.text
+    assert "Account number" not in response.text
+    assert "Routing number" not in response.text
+    assert "SWIFT" not in response.text
+    assert "IBAN" not in response.text
     assert 'name="ship_as_is_skus"' in response.text
     assert 'name="separate_playmat_charge_skus"' in response.text
     assert "separate_playmat_charge_amount" not in response.text
@@ -1140,7 +1151,204 @@ def test_upload_workflow_uses_default_friendly_config_when_blank(monkeypatch, tm
     assert captured["config"]["packing_mode"] == "fast"
     assert captured["config"]["output_granularity"] == "order_summary"
     assert captured["config"]["preserve_region_sheets"] is False
+    assert captured["config"]["include_invoice"] is False
 
+
+def _upload_config_for_invoice_selection(monkeypatch, tmp_path, data: dict) -> dict:
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    captured = {}
+
+    def fake_optimize_workbook(*, sku_master_path, orders_path, output_path, config):
+        captured["config"] = config
+        with open(output_path, "wb") as output:
+            output.write(_minimal_xlsx_bytes(["Summary"]))
+        return {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "warnings": [],
+            "warning_count": 0,
+            "multi_box_order_count": 0,
+            "rules_applied_count": 0,
+        }
+
+    monkeypatch.setattr("box_optimizer.api.optimize_workbook", fake_optimize_workbook)
+    client = TestClient(app)
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku.xlsx", b"fake sku", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            "orders_file": ("orders.xlsx", b"fake orders", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        },
+        data=data,
+    )
+
+    assert response.status_code == 200
+    return captured["config"]
+
+
+def test_upload_default_no_invoice_submission_maps_to_include_invoice_false(monkeypatch, tmp_path):
+    config = _upload_config_for_invoice_selection(
+        monkeypatch,
+        tmp_path,
+        {"config_json": "{}", "invoice_selection": "none"},
+    )
+
+    assert config["include_invoice"] is False
+    assert config.get("invoice_variant", "US") == "US"
+
+
+def test_upload_us_invoice_selection_maps_to_invoice_config(monkeypatch, tmp_path):
+    config = _upload_config_for_invoice_selection(
+        monkeypatch,
+        tmp_path,
+        {"config_json": '{"include_invoice":false}', "invoice_selection": "invoice_us"},
+    )
+
+    assert config["include_invoice"] is True
+    assert config["invoice_variant"] == "US"
+
+
+def test_upload_cn_invoice_selection_maps_to_invoice_config(monkeypatch, tmp_path):
+    config = _upload_config_for_invoice_selection(
+        monkeypatch,
+        tmp_path,
+        {"config_json": '{"include_invoice":false,"invoice_variant":"US"}', "invoice_selection": "invoice_cn"},
+    )
+
+    assert config["include_invoice"] is True
+    assert config["invoice_variant"] == "CN"
+
+
+def test_upload_without_invoice_field_preserves_legacy_config_json(monkeypatch, tmp_path):
+    config = _upload_config_for_invoice_selection(
+        monkeypatch,
+        tmp_path,
+        {"config_json": '{"include_invoice":true,"invoice_variant":"CN"}'},
+    )
+
+    assert config["include_invoice"] is True
+    assert config["invoice_variant"] == "CN"
+
+
+def _upload_workflow_sheet_names(monkeypatch, tmp_path, invoice_selection: str | None) -> tuple[list[str], str]:
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    data = {
+        "config_json": (
+            '{"packing_mode":"fast","output_granularity":"order_summary",'
+            '"preserve_region_sheets":false,"campaign":{"code":"Invoice Test"}}'
+        )
+    }
+    if invoice_selection is not None:
+        data["invoice_selection"] = invoice_selection
+    client = TestClient(app)
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku list.csv", _sku_master_file()[1], "text/csv"),
+            "orders_file": ("orders list.csv", _orders_file()[1], "text/csv"),
+        },
+        data=data,
+    )
+
+    assert response.status_code == 200
+    job_id = _extract_job_id(response.text)
+    download = client.get(f"/jobs/{job_id}/download")
+    assert download.status_code == 200
+    return _sheet_names_from_xlsx_bytes(download.content), _xlsx_xml_text(download.content)
+
+
+FAKE_US_PAY_TO_ENV = {
+    "INVOICE_PAY_TO_US_ACCOUNT_HOLDER": "TEST US ACCOUNT HOLDER",
+    "INVOICE_PAY_TO_US_BANK_NAME": "TEST US BANK",
+    "INVOICE_PAY_TO_US_ACCOUNT_NUMBER": "TEST-US-ACCOUNT-0000",
+    "INVOICE_PAY_TO_US_ROUTING_NUMBER": "TEST-US-ROUTING-0000",
+    "INVOICE_PAY_TO_US_SWIFT_CODE": "TESTUSXX",
+    "INVOICE_PAY_TO_US_IBAN": "TEST-US-IBAN-0000",
+    "INVOICE_PAY_TO_US_ADDRESS": "TEST US ADDRESS",
+    "INVOICE_PAY_TO_US_EMAIL": "test-us@example.invalid",
+    "INVOICE_PAY_TO_US_EXTRA_LINES": "TEST US EXTRA LINE 1|TEST US EXTRA LINE 2",
+}
+
+
+FAKE_CN_PAY_TO_ENV = {
+    "INVOICE_PAY_TO_CN_ACCOUNT_HOLDER": "TEST CN ACCOUNT HOLDER",
+    "INVOICE_PAY_TO_CN_BANK_NAME": "TEST CN BANK",
+    "INVOICE_PAY_TO_CN_ACCOUNT_NUMBER": "TEST-CN-ACCOUNT-0000",
+    "INVOICE_PAY_TO_CN_SWIFT_CODE": "TESTCNXX",
+    "INVOICE_PAY_TO_CN_CNAPS": "TEST-CN-CNAPS-0000",
+    "INVOICE_PAY_TO_CN_BENEFICIARY_ADDRESS": "TEST CN BENEFICIARY ADDRESS",
+    "INVOICE_PAY_TO_CN_POSTAL_CODE": "TEST-CN-POSTAL",
+    "INVOICE_PAY_TO_CN_PHONE": "TEST-CN-PHONE",
+    "INVOICE_PAY_TO_CN_EXTRA_LINES": "TEST CN EXTRA LINE 1|TEST CN EXTRA LINE 2",
+}
+
+
+def _set_fake_pay_to_env(monkeypatch):
+    for key, value in {**FAKE_US_PAY_TO_ENV, **FAKE_CN_PAY_TO_ENV}.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_upload_workflow_no_invoice_selection_produces_no_invoice_sheet(monkeypatch, tmp_path):
+    sheet_names, _html = _upload_workflow_sheet_names(monkeypatch, tmp_path, "none")
+
+    assert "Invoice" not in sheet_names
+    assert "Invoice US" not in sheet_names
+    assert "Invoice CN" not in sheet_names
+
+
+def test_upload_workflow_us_invoice_selection_produces_one_invoice_sheet(monkeypatch, tmp_path):
+    sheet_names, workbook_text = _upload_workflow_sheet_names(monkeypatch, tmp_path, "invoice_us")
+
+    assert sheet_names.count("Invoice") == 1
+    assert "Invoice US" not in sheet_names
+    assert "Invoice CN" not in sheet_names
+    assert "Warning: Pay To config is incomplete." in workbook_text
+    assert "Warning: Some packages are missing scans or final costs. Review before sending invoice." in workbook_text
+
+
+def test_upload_workflow_us_invoice_selection_uses_fake_us_pay_to_env_only(monkeypatch, tmp_path):
+    _set_fake_pay_to_env(monkeypatch)
+
+    sheet_names, workbook_text = _upload_workflow_sheet_names(monkeypatch, tmp_path, "invoice_us")
+
+    assert sheet_names.count("Invoice") == 1
+    for value in FAKE_US_PAY_TO_ENV.values():
+        for line in value.split("|"):
+            assert line in workbook_text
+    for value in FAKE_CN_PAY_TO_ENV.values():
+        for line in value.split("|"):
+            assert line not in workbook_text
+    assert "Warning: Pay To config is incomplete." not in workbook_text
+
+
+def test_upload_workflow_cn_invoice_selection_uses_fake_cn_pay_to_env_only(monkeypatch, tmp_path):
+    _set_fake_pay_to_env(monkeypatch)
+
+    sheet_names, workbook_text = _upload_workflow_sheet_names(monkeypatch, tmp_path, "invoice_cn")
+
+    assert sheet_names.count("Invoice") == 1
+    for value in FAKE_CN_PAY_TO_ENV.values():
+        for line in value.split("|"):
+            assert line in workbook_text
+    for value in FAKE_US_PAY_TO_ENV.values():
+        for line in value.split("|"):
+            assert line not in workbook_text
+    assert "Warning: Pay To config is incomplete." not in workbook_text
+
+
+def test_upload_workflow_cn_invoice_selection_produces_one_invoice_sheet(monkeypatch, tmp_path):
+    sheet_names, workbook_text = _upload_workflow_sheet_names(monkeypatch, tmp_path, "invoice_cn")
+
+    assert sheet_names.count("Invoice") == 1
+    assert "Invoice US" not in sheet_names
+    assert "Invoice CN" not in sheet_names
+    assert "Warning: Pay To config is incomplete." in workbook_text
+    assert "Warning: Some packages are missing scans or final costs. Review before sending invoice." in workbook_text
 
 
 

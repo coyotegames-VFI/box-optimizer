@@ -470,6 +470,12 @@ def _inline_cell_text(sheet_xml: str, reference: str) -> str:
     return "" if text is None else text.text or ""
 
 
+def _cell_formula(sheet_xml: str, reference: str) -> str:
+    root = ElementTree.fromstring(sheet_xml)
+    formula = root.find(f".//main:c[@r='{reference}']/main:f", _NS)
+    return "" if formula is None else formula.text or ""
+
+
 def test_optimize_workbook_public_api_writes_output_and_returns_summary(tmp_path):
     sku_master_path = tmp_path / "sku_master.csv"
     orders_path = tmp_path / "orders.csv"
@@ -708,7 +714,7 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
     assert "$B2/1000" in actual_xml
     assert "CEILING($Y2-0.000000001,0.5)" in actual_xml
     assert '$Q2&lt;&gt;"Yes"' in actual_xml
-    assert "COUNTIF($A:$A,$L2)" in actual_xml
+    assert "SUMPRODUCT(--(TRIM($A$2:$A$2)=TRIM($L2)))" in actual_xml
     assert 'IF($L2="","",IFERROR(IF(ISNUMBER(SEARCH(" of ",$L2)),LEFT($L2,FIND(" ",$L2)-1)&amp;" "&amp;MID($L2,FIND("@",SUBSTITUTE($L2," ","@",4))+1,999)' in actual_xml
     assert 'VALUE(RIGHT($L2,LEN($L2)-FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))))&gt;1' in actual_xml
     assert "Not Scanned" in actual_xml
@@ -755,7 +761,7 @@ def test_actual_dimensions_multi_carton_formulas_group_by_base_barcode_and_gate_
     assert '$B2<$G2*0.95' in row["Weight warning"].formula
     assert '"Greater than expected"' in row["Weight warning"].formula
     assert '"Less than expected"' in row["Weight warning"].formula
-    assert 'COUNTIF($A:$A,$L2)' in row["Scan status"].formula
+    assert "SUMPRODUCT(--(TRIM($A$2:$A$2)=TRIM($L2)))" in row["Scan status"].formula
     assert '"Not Scanned"' in row["Scan status"].formula
     assert 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1))=1,FALSE),$A2=$P2),$P2,""))' == lookup_formula
     assert 'LEFT($A2,FIND(" ",$A2)-1)&" "&MID($A2,FIND("@",SUBSTITUTE($A2," ","@",4))+1,999)' in group_key_formula
@@ -889,6 +895,127 @@ def test_actual_dimensions_barcode_parts_separate_scanner_barcode_lookup_and_gro
         group_vfi_key="One Page Rules-1",
         is_charge_row=False,
     )
+
+
+def test_actual_dimensions_rows_match_small_expected_scan_count_without_default_cap():
+    expected = [f"PKG-{index}" for index in range(1, 21)]
+
+    rows = workflow_module._actual_dimensions_rows(expected_scan_barcodes=expected)
+
+    assert not hasattr(workflow_module, "ACTUAL_DIMENSIONS_FORMULA_ROWS")
+    assert workflow_module._actual_dimensions_rows() == []
+    assert len(rows) == 20
+    assert [row["Expected scan barcode"] for row in rows] == expected
+    assert rows[-1]["Expected scan group VFI key"].formula.startswith('IF($L21="","",')
+    assert rows[-1]["Scan status"].formula == (
+        'IF($L21="","",IF(SUMPRODUCT(--(TRIM($A$2:$A$21)=TRIM($L21)))>0,"","Not Scanned"))'
+    )
+
+
+def test_actual_dimensions_rows_fill_beyond_one_thousand_expected_packages():
+    expected = [f"PKG-{index}" for index in range(1, 1006)]
+
+    rows = workflow_module._actual_dimensions_rows(expected_scan_barcodes=expected)
+
+    assert len(rows) == 1005
+    assert rows[-1]["Expected scan barcode"] == "PKG-1005"
+    assert rows[-1]["Expected scan group VFI key"].formula.startswith('IF($L1006="","",')
+    assert "MAX($B1006/1000,$F1006)" in rows[-1]["Actual chargeable weight kg"].formula
+
+
+def test_actual_dimensions_rows_fill_through_ten_thousand_expected_packages():
+    expected = [f"PKG-{index}" for index in range(1, 10001)]
+
+    rows = workflow_module._actual_dimensions_rows(expected_scan_barcodes=expected)
+
+    assert len(rows) == 10000
+    assert rows[-1]["Expected scan barcode"] == "PKG-10000"
+    assert rows[-1]["Expected scan group VFI key"].formula.startswith('IF($L10001="","",')
+    assert "SUMPRODUCT(--(TRIM($A$2:$A$10001)=TRIM($L10001)))" in rows[-1]["Scan status"].formula
+
+
+def test_cost_summary_scan_note_uses_full_actual_dimensions_expected_helper_columns():
+    rate_sheet = workflow_module.CustomerRateSheet(
+        hub=workflow_module._empty_rate_lane(),
+        express=workflow_module._empty_rate_lane(),
+    )
+    rows = workflow_module._cost_summary_rows(
+        [{"VFI #": "PKG-10000", "Country": "US"}],
+        {},
+        workflow_module.CustomerRateSheetSelection(sheet=rate_sheet, path="", filename="", source="test"),
+        {},
+    )
+
+    formula = rows[0]["Scan note"].formula
+
+    assert "COUNTIFS('Actual Dimensions'!$AE:$AE,$B2" in formula
+    assert "'Actual Dimensions'!$M:$M,\"Not Scanned\"" in formula
+    assert "$AE$2:$AE$1001" not in formula
+    assert "$M$2:$M$1001" not in formula
+
+
+def test_cost_summary_scan_note_uses_package_set_status_for_multi_package_group():
+    rate_sheet = workflow_module.CustomerRateSheet(
+        hub=workflow_module._empty_rate_lane(),
+        express=workflow_module._empty_rate_lane(),
+    )
+    rows = workflow_module._cost_summary_rows(
+        [{"VFI #": "15 ITFFKS1", "Country": "US"}],
+        {},
+        workflow_module.CustomerRateSheetSelection(sheet=rate_sheet, path="", filename="", source="test"),
+        {},
+    )
+    actual_rows = workflow_module._actual_dimensions_rows(
+        expected_scan_barcodes=["15 1 of 2 ITFFKS1", "15 2 of 2 ITFFKS1"]
+    )
+
+    formula = rows[0]["Scan note"].formula
+
+    assert 'COUNTIFS(\'Actual Dimensions\'!$AE:$AE,$B2' in formula
+    assert '\'Actual Dimensions\'!$M:$M,"Not Scanned"' in formula
+    assert ',"Item not scanned","")' in formula
+    assert 'ISNUMBER(SEARCH(" of ",$L2))' in actual_rows[0]["Expected scan group VFI key"].formula
+    assert 'ISNUMBER(SEARCH(" of ",$L3))' in actual_rows[1]["Expected scan group VFI key"].formula
+    assert "TRIM($L2)" in actual_rows[0]["Scan status"].formula
+    assert "TRIM($L3)" in actual_rows[1]["Scan status"].formula
+
+
+def test_cost_summary_scan_note_keeps_blank_until_scans_are_present():
+    rate_sheet = workflow_module.CustomerRateSheet(
+        hub=workflow_module._empty_rate_lane(),
+        express=workflow_module._empty_rate_lane(),
+    )
+    rows = workflow_module._cost_summary_rows(
+        [{"VFI #": "15 ITFFKS1", "Country": "US"}],
+        {},
+        workflow_module.CustomerRateSheetSelection(sheet=rate_sheet, path="", filename="", source="test"),
+        {},
+    )
+
+    formula = rows[0]["Scan note"].formula
+
+    assert formula.startswith('IF(COUNTA(\'Actual Dimensions\'!$A:$A)<=1,"",')
+    assert "Item not scanned" in formula
+
+
+def test_workbook_actual_dimensions_writes_expected_rows_beyond_one_thousand(tmp_path):
+    expected = [f"PKG-{index}" for index in range(1, 1006)]
+    output_path = tmp_path / "actual_dimensions_extent.xlsx"
+
+    excel_writer_module.write_workbook(
+        str(output_path),
+        actual_dimensions_rows=workflow_module._actual_dimensions_rows(expected_scan_barcodes=expected),
+    )
+
+    actual_xml = _sheet_xml(output_path, "Actual Dimensions")
+    actual_root = ElementTree.fromstring(actual_xml)
+
+    assert _inline_cell_text(actual_xml, "L1006") == "PKG-1005"
+    assert _cell_formula(actual_xml, "AE1006").startswith('IF($L1006="","",')
+    assert _cell_formula(actual_xml, "M1006") == (
+        'IF($L1006="","",IF(SUMPRODUCT(--(TRIM($A$2:$A$1006)=TRIM($L1006)))>0,"","Not Scanned"))'
+    )
+    assert actual_root.find(".//main:row[@r='1007']", _NS) is None
 
 
 def test_output_workbook_includes_received_intake_column_and_sku_intake_summary(tmp_path):
@@ -4332,6 +4459,54 @@ def test_country_scan_sheets_use_active_hub_pricing_and_preserve_intake_metadata
     assert _inline_cell_text(japan_xml, "O2") == ""
     assert _inline_cell_text(japan_xml, "P2") == ""
     assert _inline_cell_text(japan_xml, "Q2") == "CORE x1"
+
+
+def test_country_scan_multi_package_rows_lookup_actual_dimensions_by_package_barcode(tmp_path):
+    label_rows = [
+        {
+            "Country": "Hong Kong",
+            "Barcode/QR Value": "15 1 of 2 ITFFKS1",
+            "Label Number": "15 1 of 2 ITFFKS1",
+            "Order ID": "ORDER-15",
+            "Box Number": 1,
+            "Box Qty": 2,
+        },
+        {
+            "Country": "Hong Kong",
+            "Barcode/QR Value": "15 2 of 2 ITFFKS1",
+            "Label Number": "15 2 of 2 ITFFKS1",
+            "Order ID": "ORDER-15",
+            "Box Number": 2,
+            "Box Qty": 2,
+        },
+    ]
+    sheets = workflow_module._country_scan_sheets(label_rows, campaign_name="TEST Campaign")
+    output_path = tmp_path / "country_scan_multi_package.xlsx"
+
+    excel_writer_module.write_workbook(
+        str(output_path),
+        actual_dimensions_rows=workflow_module._actual_dimensions_rows(
+            expected_scan_barcodes=["15 1 of 2 ITFFKS1", "15 2 of 2 ITFFKS1"]
+        ),
+        country_scan_sheets=sheets,
+    )
+
+    hong_kong_xml = _sheet_xml(output_path, "China-HK")
+
+    assert _inline_cell_text(hong_kong_xml, "B2") == "15 1 of 2 ITFFKS1"
+    assert _inline_cell_text(hong_kong_xml, "B3") == "15 2 of 2 ITFFKS1"
+    assert _cell_formula(hong_kong_xml, "C2") == (
+        'IFERROR(IF(INDEX(\'Actual Dimensions\'!$A:$A,MATCH($B2,\'Actual Dimensions\'!$A:$A,0))="",'
+        '"",INDEX(\'Actual Dimensions\'!$B:$B,MATCH($B2,\'Actual Dimensions\'!$A:$A,0))),"")'
+    )
+    assert _cell_formula(hong_kong_xml, "D2") == (
+        'IFERROR(IF(INDEX(\'Actual Dimensions\'!$A:$A,MATCH($B2,\'Actual Dimensions\'!$A:$A,0))="",'
+        '"",INDEX(\'Actual Dimensions\'!$F:$F,MATCH($B2,\'Actual Dimensions\'!$A:$A,0))),"")'
+    )
+    assert "MATCH($B3,'Actual Dimensions'!$A:$A,0)" in _cell_formula(hong_kong_xml, "C3")
+    assert "MATCH($B3,'Actual Dimensions'!$A:$A,0)" in _cell_formula(hong_kong_xml, "D3")
+    assert "Expected scan group VFI key" not in _cell_formula(hong_kong_xml, "C2")
+    assert "Expected scan group VFI key" not in _cell_formula(hong_kong_xml, "D2")
 
 
 def test_label_generator_does_not_duplicate_order_notes_for_multi_carton_orders():

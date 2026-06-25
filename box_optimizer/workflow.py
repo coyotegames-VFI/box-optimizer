@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 from xml.etree import ElementTree
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import date
 from itertools import permutations
 from pathlib import Path
 
@@ -20,8 +21,20 @@ from box_optimizer.io.excel_writer import (
     ACTUAL_DIMENSIONS_COLUMNS,
     ExcelFormula,
     _column_letter,
+    _headers_for_sheet,
     workbook_sheet_stats,
     write_workbook,
+)
+from box_optimizer.invoice import (
+    InvoicePayload,
+    cost_summary_invoice_columns,
+    first_present,
+    invoice_enabled,
+    invoice_number,
+    normalize_invoice_variant,
+    parse_money,
+    pay_to_lines,
+    pay_to_uses_display_lines,
 )
 from box_optimizer.models import Dimensions, OrderLine, PackedItem, SKUItem
 from box_optimizer.normalize import normalize_sku
@@ -104,6 +117,8 @@ DEFAULT_CONFIG = {
     "vendor_box_fit_tolerance_max_chargeable_increase_kg": 1.0,
     "output_granularity": "order_summary",
     "separate_playmat_charge_skus": [],
+    "include_invoice": False,
+    "invoice_variant": "US",
 }
 
 SEPARATE_PLAYMAT_CHARGE_AMOUNT = 6.0
@@ -3487,6 +3502,7 @@ INTAKE_SUMMARY_METADATA_ORDER = [
     "Campaign Name",
     "Commodity",
     "Invoices To",
+    "Email",
     "Accounting Email",
     "Email #2",
     "Email #3",
@@ -4647,9 +4663,6 @@ def _cost_summary_rows(
     return rows
 
 
-ACTUAL_DIMENSIONS_FORMULA_ROWS = 1000
-
-
 @dataclass(frozen=True)
 class ActualDimensionsBarcodeParts:
     cost_summary_vfi: str
@@ -4795,13 +4808,14 @@ def _expected_scan_barcodes(labels_rows: list[dict]) -> list[str]:
 
 
 def _actual_dimensions_rows(
-    row_count: int = ACTUAL_DIMENSIONS_FORMULA_ROWS,
+    row_count: int | None = None,
     expected_scan_barcodes: list[str] | None = None,
 ) -> list[dict]:
     lookup = _excel_quote_sheet_name("_ActualLookupTable")
     rates = _excel_quote_sheet_name("_ActualRateTable")
     expected_scan_barcodes = expected_scan_barcodes or []
-    row_count = max(row_count, len(expected_scan_barcodes))
+    row_count = len(expected_scan_barcodes) if row_count is None else max(row_count, len(expected_scan_barcodes))
+    scan_barcode_range = f"$A$2:$A${row_count + 1}"
     rows = []
     for index in range(2, row_count + 2):
         expected_barcode = expected_scan_barcodes[index - 2] if index - 2 < len(expected_scan_barcodes) else ""
@@ -4864,7 +4878,10 @@ def _actual_dimensions_rows(
                 "Quoted shipping cost": ExcelFormula(f'IF({charge_gate},"",IFERROR({quoted_value},""))'),
                 "Actual vs quoted difference": ExcelFormula(f'IF(OR({charge_gate},$I{index}="",$J{index}=""),"",$I{index}-$J{index})'),
                 "Expected scan barcode": expected_barcode,
-                "Scan status": ExcelFormula(f'IF($L{index}="","",IF(COUNTIF($A:$A,$L{index})>0,"","Not Scanned"))'),
+                "Scan status": ExcelFormula(
+                    f'IF($L{index}="","",IF(SUMPRODUCT(--(TRIM({scan_barcode_range})=TRIM($L{index})))>0,'
+                    f'"","Not Scanned"))'
+                ),
                 "Helper/debug separator": "",
                 "Cost Summary VFI #": ExcelFormula(f'IF($A{index}="","",IF({is_charge_row},$P{index},""))'),
                 "Group VFI key": ExcelFormula(f'IF($A{index}="","",{group_key})'),
@@ -5885,6 +5902,73 @@ def _intake_summary_metadata_from_vfi_intake_sources(source_rows) -> dict[str, s
             if value and label not in summary_metadata:
                 summary_metadata[label] = value
     return summary_metadata
+
+
+def _invoice_bill_to_fallback(cfg: dict) -> str:
+    campaign = _campaign_info(cfg)
+    for source in [cfg, campaign]:
+        value = first_present(source, ["company", "client", "publisher", "company_name", "client_name", "publisher_name"])
+        if value:
+            return value
+    return ""
+
+
+def _invoice_payload(
+    cfg: dict,
+    *,
+    intake_summary_metadata: dict[str, str],
+    cost_summary_rows: list[dict],
+    cost_sheet_name: str,
+    ship_order_count: int,
+) -> tuple[InvoicePayload | None, str]:
+    if not invoice_enabled(cfg):
+        return None, ""
+    variant = normalize_invoice_variant(cfg.get("invoice_variant", "US"))
+    if not variant:
+        return None, f"Invalid invoice_variant {cfg.get('invoice_variant')!r}; invoice sheet skipped."
+
+    headers = _headers_for_sheet(cost_sheet_name, cost_summary_rows)
+    columns = cost_summary_invoice_columns(headers)
+    pay_lines, pay_incomplete = pay_to_lines(variant, config=cfg)
+    address_lines = (
+        first_present(intake_summary_metadata, ["Address Line 1"]),
+        first_present(intake_summary_metadata, ["Address Line 2"]),
+        *(
+            value
+            for value in [
+                first_present(intake_summary_metadata, ["Postal Code"]),
+                first_present(intake_summary_metadata, ["Country"]),
+            ]
+            if value
+        ),
+    )
+    generated_date = date.today()
+    return (
+        InvoicePayload(
+            variant=variant,
+            invoice_number=invoice_number(_campaign_vfi_prefix(cfg), generated_date),
+            invoice_date=generated_date,
+            campaign_name=_campaign_name(cfg),
+            bill_to=first_present(intake_summary_metadata, ["Invoices To"]) or _invoice_bill_to_fallback(cfg),
+            email=first_present(
+                intake_summary_metadata,
+                ["email", "Email", "Accounting Email", "Email #2", "Email #3", "Email #4"],
+            ),
+            address_lines=address_lines,
+            inbound_fee=parse_money(first_present(intake_summary_metadata, ["Inbound Fee"])),
+            ship_order_count=ship_order_count,
+            cost_summary_sheet_name=cost_sheet_name,
+            final_cost_column=columns.get("Final cost", ""),
+            final_weight_column=columns.get("Final weight kg", ""),
+            scan_note_column=columns.get("Scan note", ""),
+            cost_summary_data_start_row=2,
+            cost_summary_data_end_row=len(cost_summary_rows) + 1,
+            pay_to_lines=pay_lines,
+            pay_to_display_lines=pay_to_uses_display_lines(variant, config=cfg),
+            pay_to_incomplete=pay_incomplete,
+        ),
+        "",
+    )
 
 
 def _factory_name_from_vfi_intake_rows(rows: list[dict]) -> str:
@@ -7325,12 +7409,22 @@ def optimize_workbook(
     if rate_selection.warning:
         warnings.append(rate_selection.warning)
         result["warning_count"] = len(warnings) + len(warning_rows)
-    errors_and_warnings_rows = _workflow_warning_rows(warnings, warning_rows)
     workbook_sheets = dict(region_sheets)
     workbook_sheets["Box Consolidation What-If"] = box_consolidation_rows
     cost_sheet_name = _cost_summary_sheet_name(cfg)
     if cost_sheet_name != "Cost Summary":
         workbook_sheets[cost_sheet_name] = cost_summary_rows
+    invoice_payload, invoice_warning = _invoice_payload(
+        cfg,
+        intake_summary_metadata=intake_summary_metadata,
+        cost_summary_rows=cost_summary_rows,
+        cost_sheet_name=cost_sheet_name,
+        ship_order_count=len(grouped_orders),
+    )
+    if invoice_warning:
+        warnings.append(invoice_warning)
+        result["warning_count"] = len(warnings) + len(warning_rows)
+    errors_and_warnings_rows = _workflow_warning_rows(warnings, warning_rows)
 
     debug_summary_rows = _debug_summary_rows(result, box_size_rows, unmatched_rows, warning_rows, sku_rules)
     sheet_stats = workbook_sheet_stats(
@@ -7354,6 +7448,7 @@ def optimize_workbook(
         debug_summary_rows=debug_summary_rows,
         input_column_mapping_rows=intake.column_mappings,
         errors_and_warnings_rows=errors_and_warnings_rows,
+        invoice_payload=invoice_payload,
         sheets=workbook_sheets,
     )
     result.update(
@@ -7404,6 +7499,7 @@ def optimize_workbook(
         debug_summary_rows=debug_summary_rows,
         input_column_mapping_rows=intake.column_mappings,
         errors_and_warnings_rows=errors_and_warnings_rows,
+        invoice_payload=invoice_payload,
         sheets=workbook_sheets,
     )
     workbook_writing_seconds = time.perf_counter() - workbook_write_started

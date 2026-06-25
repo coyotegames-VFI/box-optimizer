@@ -1,7 +1,16 @@
 import zipfile
 import struct
+import json
+from datetime import date
 from xml.etree import ElementTree
 
+from box_optimizer.invoice import (
+    INVOICE_WARNING_TEXT,
+    InvoicePayload,
+    invoice_number,
+    pay_to_lines,
+    pay_to_uses_display_lines,
+)
 from box_optimizer.io.excel_reader import read_workbook
 from box_optimizer.io.excel_writer import (
     ExcelFormula,
@@ -45,6 +54,71 @@ def _worksheet_xml(path, sheet_name):
         return archive.read(f"xl/worksheets/sheet{sheet_index}.xml").decode("utf-8")
 
 
+def _inline_cell_text(xml, reference):
+    root = ElementTree.fromstring(xml)
+    cell = root.find(f".//main:c[@r='{reference}']", NS)
+    if cell is None:
+        return ""
+    text_node = cell.find(".//main:t", NS)
+    return "" if text_node is None else text_node.text or ""
+
+
+def _cell_formula(xml, reference):
+    root = ElementTree.fromstring(xml)
+    formula = root.find(f".//main:c[@r='{reference}']/main:f", NS)
+    return "" if formula is None else formula.text or ""
+
+
+def _cell_style(xml, reference):
+    root = ElementTree.fromstring(xml)
+    cell = root.find(f".//main:c[@r='{reference}']", NS)
+    return "" if cell is None else cell.attrib.get("s", "")
+
+
+def _cell_number_format(path, xml, reference):
+    style = _cell_style(xml, reference)
+    assert style
+    cell_formats = _styles_root(path).findall("main:cellXfs/main:xf", NS)
+    num_fmt_id = cell_formats[int(style)].attrib["numFmtId"]
+    number_formats = _styles_root(path).findall("main:numFmts/main:numFmt", NS)
+    for number_format in number_formats:
+        if number_format.attrib["numFmtId"] == num_fmt_id:
+            return number_format.attrib["formatCode"]
+    return num_fmt_id
+
+
+def _cell_has_center_alignment(path, xml, reference):
+    style = _cell_style(xml, reference)
+    assert style
+    cell_formats = _styles_root(path).findall("main:cellXfs/main:xf", NS)
+    alignment = cell_formats[int(style)].find("main:alignment", NS)
+    return alignment is not None and alignment.attrib.get("horizontal") == "center"
+
+
+def _cell_has_left_alignment(path, xml, reference):
+    style = _cell_style(xml, reference)
+    assert style
+    cell_formats = _styles_root(path).findall("main:cellXfs/main:xf", NS)
+    alignment = cell_formats[int(style)].find("main:alignment", NS)
+    return alignment is not None and alignment.attrib.get("horizontal") == "left"
+
+
+def _merge_refs(xml):
+    root = ElementTree.fromstring(xml)
+    return {
+        merge.attrib["ref"]
+        for merge in root.findall("main:mergeCells/main:mergeCell", NS)
+    }
+
+
+def _row_cell_refs(xml, row_number):
+    root = ElementTree.fromstring(xml)
+    row = root.find(f".//main:row[@r='{row_number}']", NS)
+    if row is None:
+        return []
+    return [cell.attrib["r"] for cell in row.findall("main:c", NS)]
+
+
 def _row_break_count(path, sheet_name):
     sheet_names = _workbook_sheet_names(path)
     sheet_index = sheet_names.index(sheet_name) + 1
@@ -64,6 +138,29 @@ def _label_rows(count, *, with_qr=False):
         }
         for index in range(1, count + 1)
     ]
+
+
+def _invoice_payload(variant="US", **overrides):
+    payload = InvoicePayload(
+        variant=variant,
+        invoice_number=invoice_number("DH", date(2026, 6, 25)),
+        invoice_date=date(2026, 6, 25),
+        campaign_name="Dark Horizon Long Campaign",
+        bill_to="Client Finance",
+        email="finance@example.test",
+        address_lines=("1 Example Way", "Suite 2"),
+        inbound_fee="",
+        ship_order_count=2,
+        cost_summary_sheet_name="Cost Summary",
+        final_cost_column="U",
+        final_weight_column="T",
+        scan_note_column="V",
+        cost_summary_data_start_row=2,
+        cost_summary_data_end_row=3,
+        pay_to_lines=(("Account holder", "US_PLACEHOLDER"), ("Bank name", "")),
+        pay_to_incomplete=True,
+    )
+    return InvoicePayload(**{**payload.__dict__, **overrides})
 
 
 def _styles_root(path):
@@ -162,6 +259,484 @@ def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
     assert stats["country_sheet_count"] == 1
     assert stats["qr_images_written"] == 1
     assert {"Label generator", "Order Volume Weights", "Packing Detail"} <= set(stats["sheets_skipped"])
+
+
+def test_write_workbook_without_invoice_payload_creates_no_invoice_sheet(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), cost_summary_rows=[{"Final cost": 12}])
+
+    assert "Invoice" not in _workbook_sheet_names(path)
+
+
+def test_write_workbook_sets_automatic_full_recalculation(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), cost_summary_rows=[{"Final cost": ExcelFormula("1+2")}])
+
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    calc_pr = root.find("main:calcPr", NS)
+
+    assert calc_pr is not None
+    assert calc_pr.attrib["calcMode"] == "auto"
+    assert calc_pr.attrib["fullCalcOnLoad"] == "1"
+    assert calc_pr.attrib["forceFullCalc"] == "1"
+
+
+def test_write_workbook_include_invoice_us_creates_single_invoice_sheet(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), cost_summary_rows=[{"Final cost": 12}], invoice_payload=_invoice_payload("US"))
+
+    sheet_names = _workbook_sheet_names(path)
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert sheet_names.count("Invoice") == 1
+    assert "Invoice US" not in sheet_names
+    assert "Invoice CN" not in sheet_names
+    assert _inline_cell_text(invoice_xml, "A1") == "VFI Asia"
+    assert _cell_has_center_alignment(path, invoice_xml, "A1")
+    assert _inline_cell_text(invoice_xml, "A2") == "3513 Kensett Way, Raleigh, NC 27612 USA"
+    assert _cell_has_center_alignment(path, invoice_xml, "A2")
+    assert _inline_cell_text(invoice_xml, "B4") == "COMMERCIAL INVOICE"
+    assert _inline_cell_text(invoice_xml, "B6") == "DH-06252026"
+    assert _inline_cell_text(invoice_xml, "B11") == "06/25/2026"
+    assert _inline_cell_text(invoice_xml, "B9") == "1 Example Way"
+    assert _inline_cell_text(invoice_xml, "B10") == "Suite 2"
+    assert '<c r="A15" s="8"><v>2</v></c>' in invoice_xml
+    assert _cell_has_left_alignment(path, invoice_xml, "A15")
+    assert _inline_cell_text(invoice_xml, "D14") == "USD"
+    assert _inline_cell_text(invoice_xml, "D15") == "USD"
+    assert _inline_cell_text(invoice_xml, "D16") == "USD"
+    assert "Shipping and fulfillment" not in invoice_xml
+    assert "final weight kg" not in invoice_xml
+    assert "Final Weight kg" not in invoice_xml
+    assert _inline_cell_text(invoice_xml, "B19") == "US_PLACEHOLDER"
+
+    merge_refs = _merge_refs(invoice_xml)
+    assert "A1:D1" in merge_refs
+    assert "A2:D2" in merge_refs
+    assert _row_cell_refs(invoice_xml, 3) == []
+    assert _row_cell_refs(invoice_xml, 5) == []
+
+
+def test_write_workbook_places_invoice_before_labels(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        labels_rows=_label_rows(1),
+        invoice_payload=_invoice_payload("US"),
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    assert sheet_names[:5] == ["Summary", "Cost Summary", "Actual Dimensions", "Invoice", "Labels"]
+
+
+def test_write_workbook_places_invoice_before_first_split_labels_sheet(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        labels_rows=_label_rows(MAX_LABELS_PER_SHEET + 1),
+        invoice_payload=_invoice_payload("US"),
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    assert sheet_names.index("Invoice") == sheet_names.index("Labels") - 1
+    assert sheet_names.index("Labels") < sheet_names.index("Labels 2")
+
+
+def test_write_workbook_invoice_before_labels_preserves_other_sheet_order(tmp_path):
+    without_invoice = tmp_path / "without_invoice.xlsx"
+    with_invoice = tmp_path / "with_invoice.xlsx"
+
+    kwargs = {
+        "cost_summary_rows": [{"Final cost": 12}],
+        "labels_rows": _label_rows(1),
+        "vfi_intake_form_rows": [{"Campaign Name": "Dark Horizon"}],
+        "country_scan_sheets": {"US": [{"Barcode/QR Value": "VFI-1"}]},
+    }
+    write_workbook(str(without_invoice), **kwargs)
+    write_workbook(str(with_invoice), **kwargs, invoice_payload=_invoice_payload("US"))
+
+    with_invoice_names = _workbook_sheet_names(with_invoice)
+    assert [name for name in with_invoice_names if name != "Invoice"] == _workbook_sheet_names(without_invoice)
+    assert with_invoice_names.index("Invoice") == with_invoice_names.index("Labels") - 1
+
+
+def test_write_workbook_worker_output_places_invoice_before_labels(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        labels_rows=_label_rows(1),
+        invoice_payload=_invoice_payload("US"),
+        workbook_output_mode="worker",
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    assert sheet_names.index("Invoice") == sheet_names.index("Labels") - 1
+
+
+def test_write_workbook_include_invoice_cn_creates_single_invoice_sheet(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        invoice_payload=_invoice_payload(
+            "CN",
+            pay_to_lines=(("Account holder", "CN_PLACEHOLDER"),),
+            pay_to_incomplete=False,
+        ),
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert sheet_names.count("Invoice") == 1
+    assert "Invoice US" not in sheet_names
+    assert "Invoice CN" not in sheet_names
+    assert _inline_cell_text(invoice_xml, "B19") == "CN_PLACEHOLDER"
+
+
+def test_write_workbook_invoice_display_lines_split_colon_values_and_preserve_headers(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        invoice_payload=_invoice_payload(
+            "US",
+            pay_to_lines=(
+                ("ACH / Wire Transfer", ""),
+                ("Zelle Quick Pay: TEST ZELLE VALUE", ""),
+                ("", ""),
+                ("https://example.invalid/pay", ""),
+            ),
+            pay_to_display_lines=True,
+            pay_to_incomplete=False,
+        ),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _inline_cell_text(invoice_xml, "A19") == "ACH / Wire Transfer"
+    assert _inline_cell_text(invoice_xml, "B19") == ""
+    assert _inline_cell_text(invoice_xml, "A20") == "Zelle Quick Pay:"
+    assert _inline_cell_text(invoice_xml, "B20") == "TEST ZELLE VALUE"
+    assert _inline_cell_text(invoice_xml, "A21") == ""
+    assert _inline_cell_text(invoice_xml, "B21") == ""
+    assert _inline_cell_text(invoice_xml, "A22") == "https://example.invalid/pay"
+    assert _inline_cell_text(invoice_xml, "B22") == ""
+    merge_refs = _merge_refs(invoice_xml)
+    assert "A19:D19" in merge_refs
+    assert "A22:D22" in merge_refs
+    assert "A20:D20" not in merge_refs
+    for generic_label in ["Account holder", "Bank name", "Account number", "Routing number", "SWIFT code"]:
+        assert generic_label not in invoice_xml
+
+
+def test_write_workbook_env_display_lines_split_colon_values(tmp_path):
+    path = tmp_path / "report.xlsx"
+    environ = {
+        "INVOICE_PAY_TO_US_DISPLAY_LINES": json.dumps(
+            [
+                "TEST Env Header",
+                "TEST Env Label: TEST ENV VALUE",
+            ]
+        )
+    }
+    lines, incomplete = pay_to_lines("US", environ=environ)
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        invoice_payload=_invoice_payload(
+            "US",
+            pay_to_lines=lines,
+            pay_to_display_lines=pay_to_uses_display_lines("US", environ=environ),
+            pay_to_incomplete=incomplete,
+        ),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _inline_cell_text(invoice_xml, "A19") == "TEST Env Header"
+    assert _inline_cell_text(invoice_xml, "B19") == ""
+    assert _inline_cell_text(invoice_xml, "A20") == "TEST Env Label:"
+    assert _inline_cell_text(invoice_xml, "B20") == "TEST ENV VALUE"
+    assert "Account holder" not in invoice_xml
+
+
+def test_write_workbook_invoice_fallback_pay_to_still_writes_key_value_rows(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        invoice_payload=_invoice_payload(
+            "US",
+            pay_to_lines=(("Account holder", "TEST HOLDER"), ("Bank name", "TEST BANK")),
+            pay_to_display_lines=False,
+            pay_to_incomplete=False,
+        ),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _inline_cell_text(invoice_xml, "A19") == "Account holder"
+    assert _inline_cell_text(invoice_xml, "B19") == "TEST HOLDER"
+    assert _inline_cell_text(invoice_xml, "A20") == "Bank name"
+    assert _inline_cell_text(invoice_xml, "B20") == "TEST BANK"
+
+
+def test_write_workbook_invalid_invoice_variant_skips_invoice_sheet(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(str(path), invoice_payload=_invoice_payload("EU"))
+
+    assert "Invoice" not in _workbook_sheet_names(path)
+
+
+def test_write_workbook_fast_production_keeps_selected_invoice_sheet(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        invoice_payload=_invoice_payload(),
+        workbook_output_mode="worker",
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    assert "Invoice" in sheet_names
+    assert "Label generator" not in sheet_names
+
+
+def test_invoice_number_uses_short_slug_not_long_campaign_name():
+    assert invoice_number("DH", date(2026, 6, 25)) == "DH-06252026"
+    assert invoice_number("DH", date(2026, 6, 25)) != "Dark Horizon Long Campaign-06252026"
+
+
+def test_invoice_sheet_uses_final_cost_formula_without_quoted_cost_fallback(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[
+            {"Quoted shipping cost": 99, "Final cost": ExcelFormula("10"), "Final weight kg": 1, "Scan note": ""},
+            {"Quoted shipping cost": 199, "Final cost": ExcelFormula("20"), "Final weight kg": 2, "Scan note": ""},
+        ],
+        invoice_payload=_invoice_payload(),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _cell_formula(invoice_xml, "C14") == "ROUNDDOWN(SUM('Cost Summary'!$U$2:$U$3),2)"
+    assert _cell_formula(invoice_xml, "C16") == "ROUNDDOWN(SUM(C14,C15),2)"
+    assert "Cost Summary" not in _cell_formula(invoice_xml, "C16")
+    assert "Quoted" not in invoice_xml
+    assert "shipping cost" not in invoice_xml
+
+
+def test_invoice_sheet_amount_cells_use_two_decimal_currency_format(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": ExcelFormula("12.345")}],
+        invoice_payload=_invoice_payload(inbound_fee=12.345),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _cell_number_format(path, invoice_xml, "C14") == "$#,##0.00"
+    assert _cell_number_format(path, invoice_xml, "C15") == "$#,##0.00"
+    assert _cell_number_format(path, invoice_xml, "C16") == "$#,##0.00"
+    assert '<c r="C15" s="19"><v>12.34</v></c>' in invoice_xml
+
+
+def test_invoice_sheet_preserves_invoice_and_existing_workbook_formulas(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[
+            {
+                "Final cost": ExcelFormula("10.123"),
+                "Final weight kg": ExcelFormula("1+1"),
+                "Scan note": ExcelFormula('IF(A2="","missing","")'),
+            }
+        ],
+        actual_dimensions_rows=[
+            {
+                "Scan barcode": ExcelFormula('"VFI-1"'),
+                "Actual total shipping cost": ExcelFormula("5+5"),
+            }
+        ],
+        invoice_payload=_invoice_payload(cost_summary_data_end_row=2),
+    )
+
+    cost_xml = _worksheet_xml(path, "Cost Summary")
+    actual_xml = _worksheet_xml(path, "Actual Dimensions")
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _cell_formula(cost_xml, "A2") == "10.123"
+    assert _cell_formula(cost_xml, "B2") == "1+1"
+    assert _cell_formula(cost_xml, "C2") == 'IF(A2="","missing","")'
+    assert _cell_formula(actual_xml, "A2") == '"VFI-1"'
+    assert _cell_formula(actual_xml, "I2") == "5+5"
+    assert _cell_formula(invoice_xml, "C14") == "ROUNDDOWN(SUM('Cost Summary'!$U$2:$U$2),2)"
+
+
+def test_invoice_sheet_warning_formula_checks_scan_notes_and_visibly_missing_final_cost(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[
+            {"Final cost": ExcelFormula('IF(A1="","",10)'), "Final weight kg": 1, "Scan note": "Item not scanned"},
+            {"Final cost": "", "Final weight kg": 2, "Scan note": ""},
+        ],
+        invoice_payload=_invoice_payload(),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+    warning_formula = _cell_formula(invoice_xml, "A17")
+
+    assert INVOICE_WARNING_TEXT in warning_formula
+    assert 'LEN(TRIM(\'Cost Summary\'!$U$2:$U$3&""))=0' in warning_formula
+    assert "COUNTBLANK" not in warning_formula
+    assert 'COUNTIF(\'Cost Summary\'!$V$2:$V$3,"<>")>0' in warning_formula
+
+
+def test_invoice_sheet_warning_formula_is_blank_for_populated_final_cost_formulas_and_blank_scan_notes(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[
+            {"Final cost": ExcelFormula("10"), "Final weight kg": 1, "Scan note": ""},
+            {"Final cost": ExcelFormula("20"), "Final weight kg": 2, "Scan note": ""},
+        ],
+        invoice_payload=_invoice_payload(),
+    )
+
+    warning_formula = _cell_formula(_worksheet_xml(path, "Invoice"), "A17")
+
+    assert warning_formula == (
+        'IF(OR(SUMPRODUCT(--(LEN(TRIM(\'Cost Summary\'!$U$2:$U$3&""))=0))>0,'
+        'COUNTIF(\'Cost Summary\'!$V$2:$V$3,"<>")>0),'
+        f'"{INVOICE_WARNING_TEXT}","")'
+    )
+    assert "COUNTBLANK" not in warning_formula
+
+
+def test_invoice_sheet_warning_formula_appears_for_item_not_scanned_scan_note(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": ExcelFormula("10"), "Final weight kg": 1, "Scan note": "Item not scanned"}],
+        invoice_payload=_invoice_payload(cost_summary_data_end_row=2),
+    )
+
+    warning_formula = _cell_formula(_worksheet_xml(path, "Invoice"), "A17")
+
+    assert INVOICE_WARNING_TEXT in warning_formula
+    assert 'COUNTIF(\'Cost Summary\'!$V$2:$V$2,"<>")>0' in warning_formula
+
+
+def test_invoice_sheet_warning_formula_appears_for_truly_blank_final_cost(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": "", "Final weight kg": 1, "Scan note": ""}],
+        invoice_payload=_invoice_payload(cost_summary_data_end_row=2),
+    )
+
+    warning_formula = _cell_formula(_worksheet_xml(path, "Invoice"), "A17")
+
+    assert INVOICE_WARNING_TEXT in warning_formula
+    assert 'LEN(TRIM(\'Cost Summary\'!$U$2:$U$2&""))=0' in warning_formula
+
+
+def test_invoice_sheet_warning_formula_does_not_inspect_blank_trailing_rows(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[
+            {"Final cost": ExcelFormula("10"), "Final weight kg": 1, "Scan note": ""},
+            {"Final cost": "", "Final weight kg": "", "Scan note": ""},
+        ],
+        invoice_payload=_invoice_payload(cost_summary_data_end_row=2),
+    )
+
+    warning_formula = _cell_formula(_worksheet_xml(path, "Invoice"), "A17")
+
+    assert "$U$2:$U$2" in warning_formula
+    assert "$V$2:$V$2" in warning_formula
+    assert "$U$3" not in warning_formula
+    assert "$V$3" not in warning_formula
+
+
+def test_invoice_sheet_warning_formula_covers_multi_package_scanned_orders(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[
+            {"Final cost": ExcelFormula("10"), "Final weight kg": 1, "Scan note": ""},
+            {"Final cost": ExcelFormula("20"), "Final weight kg": 2, "Scan note": ""},
+            {"Final cost": ExcelFormula("30"), "Final weight kg": 3, "Scan note": ""},
+        ],
+        invoice_payload=_invoice_payload(cost_summary_data_end_row=4),
+    )
+
+    warning_formula = _cell_formula(_worksheet_xml(path, "Invoice"), "A17")
+
+    assert "$U$2:$U$4" in warning_formula
+    assert "$V$2:$V$4" in warning_formula
+
+
+def test_invoice_sheet_generates_with_blank_bill_to_email_address_and_inbound_fee(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        cost_summary_rows=[{"Final cost": 12}],
+        invoice_payload=_invoice_payload(bill_to="", email="", address_lines=(), inbound_fee=""),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _inline_cell_text(invoice_xml, "B8") == ""
+    assert '<c r="B9" t="inlineStr"><is><t></t></is></c>' in invoice_xml
+    assert '<c r="B10" t="inlineStr"><is><t></t></is></c>' in invoice_xml
+    assert _inline_cell_text(invoice_xml, "B12") == ""
+    assert _inline_cell_text(invoice_xml, "C15") == ""
+    assert _inline_cell_text(invoice_xml, "D15") == "USD"
+
+
+def test_invoice_sheet_displays_inbound_fee_only_when_available(tmp_path):
+    with_fee = tmp_path / "with_fee.xlsx"
+    without_fee = tmp_path / "without_fee.xlsx"
+
+    write_workbook(str(with_fee), invoice_payload=_invoice_payload(inbound_fee=12.5))
+    write_workbook(str(without_fee), invoice_payload=_invoice_payload(inbound_fee=""))
+
+    with_fee_xml = _worksheet_xml(with_fee, "Invoice")
+    assert '<c r="C15" s="19"><v>12.5</v></c>' in with_fee_xml
+    assert _cell_number_format(with_fee, with_fee_xml, "C15") == "$#,##0.00"
+    assert _inline_cell_text(_worksheet_xml(without_fee, "Invoice"), "C15") == ""
 
 
 def test_write_workbook_creates_single_labels_sheet_for_1000_or_fewer_labels(tmp_path):
@@ -461,7 +1036,9 @@ def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_
                 "Quoted shipping cost": ExcelFormula('IF($Q2<>"Yes","",8)'),
                 "Actual vs quoted difference": ExcelFormula('IF(OR($I2="",$J2=""),"",$I2-$J2)'),
                 "Expected scan barcode": "VFI-1",
-                "Scan status": ExcelFormula('IF($L2="","",IF(COUNTIF($A:$A,$L2)>0,"","Not Scanned"))'),
+                "Scan status": ExcelFormula(
+                    'IF($L2="","",IF(SUMPRODUCT(--(TRIM($A$2:$A$2)=TRIM($L2)))>0,"","Not Scanned"))'
+                ),
                 "Helper/debug separator": "",
                 "Cost Summary VFI #": ExcelFormula('IF($A2="",$A2,"base")'),
                 "Group VFI key": ExcelFormula('IF($A2="",$A2,"base")'),
@@ -555,7 +1132,7 @@ def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_
     assert "XLOOKUP" not in actual_xml
     assert "LET(" not in actual_xml
     assert "MATCH($P2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
-    assert "COUNTIF($A:$A,$L2)" in actual_xml
+    assert "SUMPRODUCT(--(TRIM($A$2:$A$2)=TRIM($L2)))" in actual_xml
     assert "MAX($B2/1000,$F2)" in actual_xml
     assert 'IF($B2&gt;$G2*1.2,"Greater than expected",IF($B2&lt;$G2*0.95,"Less than expected",""))' in actual_xml
     assert "Estimated DIM weight kg" not in headers

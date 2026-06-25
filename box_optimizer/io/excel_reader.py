@@ -369,6 +369,7 @@ _INTAKE_METADATA_LABELS = {
     "commodity": ("Commodity", "commodity"),
     "factory": ("Factory", "factory_name"),
     "invoicesto": ("Invoices To", "invoices_to"),
+    "email": ("Email", "email"),
     "accountingemail": ("Accounting Email", "accounting_email"),
     "email2": ("Email #2", "email_2"),
     "email3": ("Email #3", "email_3"),

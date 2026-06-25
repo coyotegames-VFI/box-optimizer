@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape
 import zipfile
 
 from box_optimizer.io.qr import qr_png
+from box_optimizer.invoice import InvoicePayload, normalize_invoice_variant
 
 
 REQUIRED_SHEETS = [
@@ -1006,6 +1007,176 @@ def _worksheet_xml(sheet_name: str, rows: list[dict]) -> str:
     )
 
 
+def _sheet_range(sheet_name: str, column: str, start_row: int, end_row: int) -> str:
+    quoted = str(sheet_name).replace("'", "''")
+    return f"'{quoted}'!${column}${start_row}:${column}${end_row}"
+
+
+def _invoice_formula_ranges(payload: InvoicePayload) -> tuple[str, str, str]:
+    if payload.cost_summary_data_end_row < payload.cost_summary_data_start_row:
+        return "", "", ""
+    final_cost = (
+        _sheet_range(
+            payload.cost_summary_sheet_name,
+            payload.final_cost_column,
+            payload.cost_summary_data_start_row,
+            payload.cost_summary_data_end_row,
+        )
+        if payload.final_cost_column
+        else ""
+    )
+    final_weight = (
+        _sheet_range(
+            payload.cost_summary_sheet_name,
+            payload.final_weight_column,
+            payload.cost_summary_data_start_row,
+            payload.cost_summary_data_end_row,
+        )
+        if payload.final_weight_column
+        else ""
+    )
+    scan_note = (
+        _sheet_range(
+            payload.cost_summary_sheet_name,
+            payload.scan_note_column,
+            payload.cost_summary_data_start_row,
+            payload.cost_summary_data_end_row,
+        )
+        if payload.scan_note_column
+        else ""
+    )
+    return final_cost, final_weight, scan_note
+
+
+def _truncate_money_value(value: object) -> object:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        truncated = int(float(value) * 100) / 100
+        return round(truncated, 2)
+    return value
+
+
+def _invoice_display_line_cells(line: object) -> tuple[dict[int, object], bool]:
+    text = str(line)
+    if not text:
+        return {0: ""}, False
+    lowered = text.lower()
+    if not lowered.startswith(("http://", "https://")) and ":" in text:
+        label, value = text.split(":", 1)
+        return {0: f"{label.strip()}:", 1: value.strip()}, False
+    return {0: text}, True
+
+
+def _invoice_sheet_xml(payload: InvoicePayload) -> str:
+    from box_optimizer.invoice import INVOICE_WARNING_TEXT, PAY_TO_INCOMPLETE_WARNING_TEXT
+
+    final_cost_range, _, scan_note_range = _invoice_formula_ranges(payload)
+    shipping_fee_formula = f"ROUNDDOWN(SUM({final_cost_range}),2)" if final_cost_range else '""'
+    if final_cost_range:
+        warning_conditions = [f'SUMPRODUCT(--(LEN(TRIM({final_cost_range}&""))=0))>0']
+        if scan_note_range:
+            warning_conditions.append(f'COUNTIF({scan_note_range},"<>")>0')
+        warning_formula = f'IF(OR({",".join(warning_conditions)}),"{INVOICE_WARNING_TEXT}","")'
+    else:
+        warning_formula = f'"{INVOICE_WARNING_TEXT}"'
+
+    address_lines = list(payload.address_lines[:2])
+    while len(address_lines) < 2:
+        address_lines.append("")
+
+    rows: dict[int, dict[int, object]] = {
+        1: {0: "VFI Asia"},
+        2: {0: "3513 Kensett Way, Raleigh, NC 27612 USA"},
+        4: {1: "COMMERCIAL INVOICE"},
+        6: {0: "Invoice No:", 1: payload.invoice_number},
+        7: {0: "Campaign:", 1: payload.campaign_name},
+        8: {0: "invoice to:", 1: payload.bill_to},
+        9: {1: address_lines[0]},
+        10: {1: address_lines[1]},
+        11: {0: "Date:", 1: f"{payload.invoice_date:%m/%d/%Y}"},
+        12: {0: "email", 1: payload.email},
+        14: {0: "ship order:", 1: "shipping fee:", 2: ExcelFormula(shipping_fee_formula), 3: "USD"},
+        15: {0: payload.ship_order_count, 1: "inbound fee:", 2: _truncate_money_value(payload.inbound_fee), 3: "USD"},
+        16: {1: "Total Due:", 2: ExcelFormula("ROUNDDOWN(SUM(C14,C15),2)"), 3: "USD"},
+        17: {0: ExcelFormula(warning_formula)},
+        18: {0: "Payments can be made to Any of the below options:"},
+    }
+    for offset, address_line in enumerate(payload.address_lines[2:], start=1):
+        rows.setdefault(10 + offset, {})[2] = address_line
+    pay_to_start = 19
+    display_line_merge_rows = []
+    for offset, (label, value) in enumerate(payload.pay_to_lines):
+        row_index = pay_to_start + offset
+        if payload.pay_to_display_lines:
+            cells, merge_full_line = _invoice_display_line_cells(label)
+            rows.setdefault(row_index, {}).update(cells)
+            if merge_full_line:
+                display_line_merge_rows.append(row_index)
+        else:
+            rows.setdefault(row_index, {})[0] = label
+            rows[row_index][1] = value
+    if payload.pay_to_incomplete:
+        row_index = pay_to_start + len(payload.pay_to_lines)
+        rows.setdefault(row_index, {})[0] = PAY_TO_INCOMPLETE_WARNING_TEXT
+
+    row_xml = []
+    for row_index in range(1, max(rows) + 1):
+        cells = []
+        for column_index in range(7):
+            if column_index not in rows.get(row_index, {}):
+                continue
+            value = rows[row_index][column_index]
+            style = None
+            if row_index in {4, 16, 17, 18}:
+                style = 2
+            if row_index in {14, 15, 16} and column_index == 2:
+                style = 19
+            if row_index == 1:
+                style = 32
+            if row_index == 2:
+                style = 33
+            if row_index == 15 and column_index == 0:
+                style = 8
+            if row_index == 17:
+                style = 26
+            cells.append(_cell_xml(row_index, column_index, value, style=style))
+        row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+
+    cols_xml = "".join(
+        f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+        for index, width in enumerate([18, 22, 18, 12, 16, 16, 16], start=1)
+    )
+    merge_ranges = [
+        "A1:D1",
+        "A2:D2",
+        "B4:D4",
+        "B8:D8",
+        "B9:D9",
+        "B10:D10",
+        "B12:D12",
+        "A17:G17",
+        "A18:G18",
+        *[f"A{row_index}:D{row_index}" for row_index in display_line_merge_rows],
+    ]
+    merge_xml = (
+        f'<mergeCells count="{len(merge_ranges)}">'
+        + "".join(f'<mergeCell ref="{ref}"/>' for ref in merge_ranges)
+        + "</mergeCells>"
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<cols>{cols_xml}</cols>"
+        f'<sheetData>{"".join(row_xml)}</sheetData>'
+        f"{merge_xml}"
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+        '<pageSetup orientation="portrait" fitToWidth="1" fitToHeight="0"/>'
+        "</worksheet>"
+    )
+
+
 def _workbook_xml(sheet_names: list[str]) -> str:
     sheets = "".join(
         f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"'
@@ -1017,6 +1188,7 @@ def _workbook_xml(sheet_names: list[str]) -> str:
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
         f"<sheets>{sheets}</sheets>"
+        '<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
         "</workbook>"
     )
 
@@ -1114,7 +1286,7 @@ def _styles_xml() -> str:
         '<border><left style="thick"><color auto="1"/></left><right style="thick"><color auto="1"/></right><top style="thick"><color auto="1"/></top><bottom style="thick"><color auto="1"/></bottom><diagonal/></border>'
         '</borders>'
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="32">'
+        '<cellXfs count="34">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
         '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
@@ -1147,6 +1319,8 @@ def _styles_xml() -> str:
         '<xf numFmtId="0" fontId="2" fillId="3" borderId="2" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="2" xfId="0" applyBorder="1"/>'
         '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+        '<xf numFmtId="0" fontId="10" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+        '<xf numFmtId="0" fontId="9" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"
@@ -1157,8 +1331,9 @@ def _build_sheet_payloads(
     rows: list[dict] | None,
     sheets: dict[str, list[dict]] | None,
     **named_rows: list[dict],
-) -> list[tuple[str, list[dict]]]:
+) -> list[tuple[str, object]]:
     country_scan_sheets = named_rows.pop("country_scan_sheets", None) or {}
+    invoice_payload = named_rows.pop("invoice_payload", None)
     output_mode = _normalized_workbook_output_mode(named_rows.pop("workbook_output_mode", "full"))
     payloads = {name: [] for name in REQUIRED_SHEETS}
     if rows is not None:
@@ -1218,6 +1393,14 @@ def _build_sheet_payloads(
         if name not in required_and_optional and not name.startswith("Cost Summary -") and sheet_rows:
             ordered.append((name, sheet_rows))
 
+    if isinstance(invoice_payload, InvoicePayload) and normalize_invoice_variant(invoice_payload.variant):
+        labels_index = next(
+            (index for index, (name, _rows) in enumerate(ordered) if _is_labels_sheet_name(name)),
+            None,
+        )
+        insert_index = len(ordered) if labels_index is None else labels_index
+        ordered.insert(insert_index, ("Invoice", invoice_payload))
+
     if output_mode == "fast_production":
         operational_sheet_names = {
             "Summary",
@@ -1229,6 +1412,7 @@ def _build_sheet_payloads(
             "Optimized to Pack",
             "Box Size Summary",
             "Errors and Warnings",
+            "Invoice",
             *country_scan_sheets.keys(),
         }
         ordered = [
@@ -1286,7 +1470,7 @@ def workbook_sheet_stats(
     labels_rows = [
         label
         for name, sheet_rows in filtered_payloads
-        if _is_labels_sheet_name(name)
+        if _is_labels_sheet_name(name) and isinstance(sheet_rows, list)
         for label in sheet_rows
     ]
     country_scan_sheets = named_rows.get("country_scan_sheets") or {}
@@ -1332,7 +1516,7 @@ def write_workbook(
     label_drawing_entries = []
     next_media_index = 1
     for sheet_index, (sheet_name, sheet_rows) in enumerate(sheet_payloads, start=1):
-        if not _is_labels_sheet_name(sheet_name):
+        if not _is_labels_sheet_name(sheet_name) or not isinstance(sheet_rows, list):
             continue
         qr_images = _label_qr_images(sheet_rows)
         if not qr_images:
@@ -1364,7 +1548,9 @@ def write_workbook(
         for index, (sheet_name, sheet_rows) in enumerate(sheet_payloads, start=1):
             sheet_xml = (
                 _labels_sheet_xml(sheet_rows, include_drawing=index in drawing_id_by_sheet_index)
-                if _is_labels_sheet_name(sheet_name)
+                if _is_labels_sheet_name(sheet_name) and isinstance(sheet_rows, list)
+                else _invoice_sheet_xml(sheet_rows)
+                if sheet_name == "Invoice" and isinstance(sheet_rows, InvoicePayload)
                 else _worksheet_xml(sheet_name, sheet_rows)
             )
             archive.writestr(
