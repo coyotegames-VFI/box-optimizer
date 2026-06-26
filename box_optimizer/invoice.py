@@ -67,6 +67,8 @@ class InvoicePayload:
     pay_to_lines: tuple[tuple[str, str], ...] = ()
     pay_to_display_lines: bool = False
     pay_to_incomplete: bool = False
+    include_canada_ocean_tax: bool = False
+    include_mx_import_tax: bool = False
 
 
 def invoice_enabled(config: Mapping | None) -> bool:

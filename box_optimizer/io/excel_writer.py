@@ -13,6 +13,7 @@ from box_optimizer.invoice import InvoicePayload, normalize_invoice_variant
 REQUIRED_SHEETS = [
     "Summary",
     "Cost Summary",
+    "Stock Count",
     "Actual Dimensions",
     "Labels",
     "VFI Intake Form",
@@ -253,23 +254,17 @@ def _cell_style_for_sheet_value(
         metric = str(row[1] if len(row) > 1 else "")
         if metric == "Total Chargeable Cost":
             return 9
-    if sheet_name == "Summary" and len(row) > 4:
-        sku_block_value = str(row[4] or "")
-        if sku_block_value in {"SKU Intake Summary", "SKU"} and column_index >= 4:
-            return 2
-        if header == "Remaining":
-            try:
-                if float(row[column_index] or 0) < 0:
-                    return 20
-            except (TypeError, ValueError):
-                pass
+    if sheet_name == "Stock Count" and header == "Remaining":
+        try:
+            if float(row[column_index] or 0) < 0:
+                return 20
+        except (TypeError, ValueError):
+            pass
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee (USD)", "Express (USD)"}:
         return 19
     if sheet_name.startswith("Cost Summary") and header == "Final cost":
         return 19
     if sheet_name.startswith("Cost Summary") and header == "Final weight kg":
-        return 31
-    if header == "Volumetric weight kg":
         return 31
     if sheet_name == "Actual Dimensions" and header in {
         "Actual hub shipping fee",
@@ -939,11 +934,11 @@ def _column_widths(sheet_name: str, headers: list[str], rows: list[list[object]]
         if sheet_name.startswith("Cost Summary") and header == "Scan note":
             widths.append(16)
             continue
-        if headers[2:4] == ["Actual weight g", "Volumetric weight kg"] and index == 2:
+        if headers[3:7] == ["Actual weight g", "Actual DIM L", "Actual DIM W", "Actual DIM H"] and index == 3:
             widths.append(13)
             continue
-        if headers[2:4] == ["Actual weight g", "Volumetric weight kg"] and index == 3:
-            widths.append(16)
+        if headers[3:7] == ["Actual weight g", "Actual DIM L", "Actual DIM W", "Actual DIM H"] and 4 <= index <= 6:
+            widths.append(13)
             continue
         longest = len(str(header))
         for row in rows:
@@ -1085,6 +1080,21 @@ def _invoice_sheet_xml(payload: InvoicePayload) -> str:
     while len(address_lines) < 2:
         address_lines.append("")
 
+    charge_rows: list[tuple[str, object]] = [
+        ("shipping fee:", ExcelFormula(shipping_fee_formula)),
+        ("inbound fee:", _truncate_money_value(payload.inbound_fee)),
+    ]
+    if payload.include_canada_ocean_tax:
+        charge_rows.append(("Canada Ocean and Tax", ""))
+    if payload.include_mx_import_tax:
+        charge_rows.append(("MX import tax", ""))
+    first_charge_row = 14
+    total_row = first_charge_row + len(charge_rows)
+    warning_row = total_row + 1
+    payment_header_row = warning_row + 1
+    pay_to_start = payment_header_row + 1
+    total_formula = f"ROUNDDOWN(SUM({','.join(f'C{row}' for row in range(first_charge_row, total_row))}),2)"
+
     rows: dict[int, dict[int, object]] = {
         1: {0: "VFI Asia"},
         2: {0: "3513 Kensett Way, Raleigh, NC 27612 USA"},
@@ -1096,15 +1106,23 @@ def _invoice_sheet_xml(payload: InvoicePayload) -> str:
         10: {1: address_lines[1]},
         11: {0: "Date:", 1: f"{payload.invoice_date:%m/%d/%Y}"},
         12: {0: "email", 1: payload.email},
-        14: {0: "ship order:", 1: "shipping fee:", 2: ExcelFormula(shipping_fee_formula), 3: "USD"},
-        15: {0: payload.ship_order_count, 1: "inbound fee:", 2: _truncate_money_value(payload.inbound_fee), 3: "USD"},
-        16: {1: "Total Due:", 2: ExcelFormula("ROUNDDOWN(SUM(C14,C15),2)"), 3: "USD"},
-        17: {0: ExcelFormula(warning_formula)},
-        18: {0: "Payments can be made to Any of the below options:"},
+        total_row: {1: "Total Due:", 2: ExcelFormula(total_formula), 3: "USD"},
+        warning_row: {0: ExcelFormula(warning_formula)},
+        payment_header_row: {0: "Payments can be made to Any of the below options:"},
     }
+    for offset, (label, value) in enumerate(charge_rows):
+        row_index = first_charge_row + offset
+        rows[row_index] = {
+            1: label,
+            2: value,
+            3: "USD",
+        }
+        if row_index == first_charge_row:
+            rows[row_index][0] = "ship order:"
+        elif row_index == first_charge_row + 1:
+            rows[row_index][0] = payload.ship_order_count
     for offset, address_line in enumerate(payload.address_lines[2:], start=1):
         rows.setdefault(10 + offset, {})[2] = address_line
-    pay_to_start = 19
     display_line_merge_rows = []
     for offset, (label, value) in enumerate(payload.pay_to_lines):
         row_index = pay_to_start + offset
@@ -1128,17 +1146,17 @@ def _invoice_sheet_xml(payload: InvoicePayload) -> str:
                 continue
             value = rows[row_index][column_index]
             style = None
-            if row_index in {4, 16, 17, 18}:
+            if row_index in {4, total_row, warning_row, payment_header_row}:
                 style = 2
-            if row_index in {14, 15, 16} and column_index == 2:
+            if first_charge_row <= row_index <= total_row and column_index == 2:
                 style = 19
             if row_index == 1:
                 style = 32
             if row_index == 2:
                 style = 33
-            if row_index == 15 and column_index == 0:
+            if row_index == first_charge_row + 1 and column_index == 0:
                 style = 8
-            if row_index == 17:
+            if row_index == warning_row:
                 style = 26
             cells.append(_cell_xml(row_index, column_index, value, style=style))
         row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
@@ -1155,8 +1173,8 @@ def _invoice_sheet_xml(payload: InvoicePayload) -> str:
         "B9:D9",
         "B10:D10",
         "B12:D12",
-        "A17:G17",
-        "A18:G18",
+        f"A{warning_row}:G{warning_row}",
+        f"A{payment_header_row}:G{payment_header_row}",
         *[f"A{row_index}:D{row_index}" for row_index in display_line_merge_rows],
     ]
     merge_xml = (
@@ -1344,6 +1362,7 @@ def _build_sheet_payloads(
     aliases = {
         "summary_rows": "Summary",
         "cost_summary_rows": "Cost Summary",
+        "stock_count_rows": "Stock Count",
         "actual_dimensions_rows": "Actual Dimensions",
         "actual_lookup_rows": "_ActualLookupTable",
         "actual_rate_rows": "_ActualRateTable",
@@ -1386,7 +1405,7 @@ def _build_sheet_payloads(
         insert_index = len(ordered) if labels_index is None else labels_index + 1
         for offset, (name, sheet_rows) in enumerate(country_scan_sheets.items()):
             if sheet_rows:
-                ordered.insert(insert_index + offset, (name, sheet_rows))
+                ordered.insert(insert_index + offset, (name, _country_scan_rows_with_pallet_id(sheet_rows)))
                 required_and_optional.add(name)
 
     for name, sheet_rows in payloads.items():
@@ -1394,17 +1413,18 @@ def _build_sheet_payloads(
             ordered.append((name, sheet_rows))
 
     if isinstance(invoice_payload, InvoicePayload) and normalize_invoice_variant(invoice_payload.variant):
-        labels_index = next(
-            (index for index, (name, _rows) in enumerate(ordered) if _is_labels_sheet_name(name)),
+        actual_dimensions_index = next(
+            (index for index, (name, _rows) in enumerate(ordered) if name == "Actual Dimensions"),
             None,
         )
-        insert_index = len(ordered) if labels_index is None else labels_index
+        insert_index = len(ordered) if actual_dimensions_index is None else actual_dimensions_index
         ordered.insert(insert_index, ("Invoice", invoice_payload))
 
     if output_mode == "fast_production":
         operational_sheet_names = {
             "Summary",
             "Cost Summary",
+            "Stock Count",
             "Actual Dimensions",
             "_ActualLookupTable",
             "_ActualRateTable",
@@ -1422,6 +1442,16 @@ def _build_sheet_payloads(
         ]
 
     return ordered
+
+
+def _country_scan_rows_with_pallet_id(rows: list[dict]) -> list[dict]:
+    output = []
+    for row in rows:
+        if "Pallet ID" in row:
+            output.append(row)
+        else:
+            output.append({"Pallet ID": "", **row})
+    return output
 
 
 def _is_labels_sheet_name(name: str) -> bool:

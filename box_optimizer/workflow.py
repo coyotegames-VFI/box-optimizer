@@ -3639,34 +3639,6 @@ def _clean_summary_rows(
     else:
         rows.append({"Section": "Rules Applied Summary", "Metric": "Rules", "Value": 0, "Detail": "No special packing rules matched"})
     rows.extend(country_package_count_rows or [])
-    if sku_intake_summary_rows:
-        sku_block_rows = [
-            {
-                "SKU": "SKU Intake Summary",
-                "Received Quantity": "",
-                "Required Quantity": "",
-                "Remaining": "",
-            },
-            {
-                "SKU": "SKU",
-                "Received Quantity": "Received Quantity",
-                "Required Quantity": "Required Quantity",
-                "Remaining": "Remaining",
-            },
-            *[
-                {
-                    "SKU": row.get("SKU", ""),
-                    "Received Quantity": row.get("Received Quantity", ""),
-                    "Required Quantity": row.get("Required Quantity", ""),
-                    "Remaining": row.get("Remaining", ""),
-                }
-                for row in sku_intake_summary_rows
-            ],
-        ]
-        while len(rows) < len(sku_block_rows):
-            rows.append({"Section": "", "Metric": "", "Value": "", "Detail": ""})
-        for index, sku_row in enumerate(sku_block_rows):
-            rows[index].update(sku_row)
     return rows
 
 
@@ -4674,7 +4646,7 @@ def _actual_dimensions_barcode_parts(barcode: object) -> ActualDimensionsBarcode
     text = str(barcode or "").strip()
     if not text:
         return ActualDimensionsBarcodeParts("", "", False)
-    one_of_match = re.match(r"^(\S+)\s+(\d+)\s+of\s+\d+\s+(.+)$", text, flags=re.IGNORECASE)
+    one_of_match = re.match(r"^(\S+)\s+p?(\d+)\s+of\s+\d+\s+(.+)$", text, flags=re.IGNORECASE)
     if one_of_match:
         group_key = f"{one_of_match.group(1)} {one_of_match.group(3).strip()}"
         is_charge_row = one_of_match.group(2) == "1"
@@ -4823,21 +4795,25 @@ def _actual_dimensions_rows(
         last_dash = f'FIND("@",SUBSTITUTE($A{index},"-","@",LEN($A{index})-LEN(SUBSTITUTE($A{index},"-",""))))'
         trailing_suffix = f'RIGHT($A{index},LEN($A{index})-{last_dash})'
         dash_group_key = f'IFERROR(IF(VALUE({trailing_suffix})>1,LEFT($A{index},{last_dash}-1),$A{index}),$A{index})'
-        fourth_space = f'FIND("@",SUBSTITUTE($A{index}," ","@",4))'
-        one_of_group_key = f'LEFT($A{index},FIND(" ",$A{index})-1)&" "&MID($A{index},{fourth_space}+1,999)'
+        package_total_end = f'FIND(" ",$A{index},FIND(" of ",$A{index})+4)'
+        one_of_group_key = f'LEFT($A{index},FIND(" ",$A{index})-1)&" "&MID($A{index},{package_total_end}+1,999)'
         group_key = f'IFERROR(IF(ISNUMBER(SEARCH(" of ",$A{index})),{one_of_group_key},{dash_group_key}),{dash_group_key})'
         expected_last_dash = f'FIND("@",SUBSTITUTE($L{index},"-","@",LEN($L{index})-LEN(SUBSTITUTE($L{index},"-",""))))'
         expected_trailing_suffix = f'RIGHT($L{index},LEN($L{index})-{expected_last_dash})'
         expected_dash_group_key = (
             f'IFERROR(IF(VALUE({expected_trailing_suffix})>1,LEFT($L{index},{expected_last_dash}-1),$L{index}),$L{index})'
         )
-        expected_fourth_space = f'FIND("@",SUBSTITUTE($L{index}," ","@",4))'
-        expected_one_of_group_key = f'LEFT($L{index},FIND(" ",$L{index})-1)&" "&MID($L{index},{expected_fourth_space}+1,999)'
+        expected_package_total_end = f'FIND(" ",$L{index},FIND(" of ",$L{index})+4)'
+        expected_one_of_group_key = f'LEFT($L{index},FIND(" ",$L{index})-1)&" "&MID($L{index},{expected_package_total_end}+1,999)'
         expected_group_key = (
             f'IFERROR(IF(ISNUMBER(SEARCH(" of ",$L{index})),{expected_one_of_group_key},{expected_dash_group_key}),'
             f'{expected_dash_group_key})'
         )
-        one_of_charge_row = f'IFERROR(VALUE(MID($A{index},FIND(" ",$A{index})+1,FIND(" of ",$A{index})-FIND(" ",$A{index})-1))=1,FALSE)'
+        one_of_package_number = (
+            f'TRIM(SUBSTITUTE(SUBSTITUTE(MID($A{index},FIND(" ",$A{index})+1,'
+            f'FIND(" of ",$A{index})-FIND(" ",$A{index})-1),"p",""),"P",""))'
+        )
+        one_of_charge_row = f'IFERROR(VALUE({one_of_package_number})=1,FALSE)'
         dash_charge_row = f'$A{index}=$P{index}'
         is_charge_row = f'IF(ISNUMBER(SEARCH(" of ",$A{index})),{one_of_charge_row},{dash_charge_row})'
         lookup_match = f'MATCH($P{index},{lookup}!$A:$A,0)'
@@ -5018,7 +4994,9 @@ def _country_scan_sheet_name(country: object, used: set[str]) -> str:
 
 
 COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS = "Actual weight g"
-COUNTRY_SCAN_VOLUMETRIC_WEIGHT_KG = "Volumetric weight kg"
+COUNTRY_SCAN_ACTUAL_DIM_LENGTH = "Actual DIM L"
+COUNTRY_SCAN_ACTUAL_DIM_WIDTH = "Actual DIM W"
+COUNTRY_SCAN_ACTUAL_DIM_HEIGHT = "Actual DIM H"
 COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER = "_Country Scan Future Cost Blank"
 COUNTRY_SCAN_METADATA_PLACEHOLDER_PREFIX = "_Country Scan Metadata Blank "
 COUNTRY_SCAN_RAW_METADATA_KEY = "_Country Scan Metadata"
@@ -5028,7 +5006,9 @@ COUNTRY_SCAN_CORE_COLUMNS = {
     "Campaign",
     "VFI #",
     COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS,
-    COUNTRY_SCAN_VOLUMETRIC_WEIGHT_KG,
+    COUNTRY_SCAN_ACTUAL_DIM_LENGTH,
+    COUNTRY_SCAN_ACTUAL_DIM_WIDTH,
+    COUNTRY_SCAN_ACTUAL_DIM_HEIGHT,
     COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER,
     COUNTRY_SCAN_ITEMS_IN_BOX,
     "Items in this box / SKU contents",
@@ -5251,22 +5231,29 @@ def _country_scan_sheets(
         metadata_keys = metadata_keys_by_sheet.get(sheet_name, [])
         sheets[sheet_name] = []
         for row_index, entry in enumerate(entries, start=2):
-            scan_match = f'MATCH($B{row_index},{actual_dimensions}!$A:$A,0)'
+            scan_match = f'MATCH($C{row_index},{actual_dimensions}!$A:$A,0)'
             actual_scan_value = f'INDEX({actual_dimensions}!$A:$A,{scan_match})'
             scan_row = {
+                "Pallet ID": "",
                 "Campaign": campaign_name,
                 "VFI #": entry["vfi"],
                 COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS: ExcelFormula(
                     f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$B:$B,{scan_match})),"")'
                 ),
-                COUNTRY_SCAN_VOLUMETRIC_WEIGHT_KG: ExcelFormula(
-                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$F:$F,{scan_match})),"")'
+                COUNTRY_SCAN_ACTUAL_DIM_LENGTH: ExcelFormula(
+                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$C:$C,{scan_match})),"")'
+                ),
+                COUNTRY_SCAN_ACTUAL_DIM_WIDTH: ExcelFormula(
+                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$D:$D,{scan_match})),"")'
+                ),
+                COUNTRY_SCAN_ACTUAL_DIM_HEIGHT: ExcelFormula(
+                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$E:$E,{scan_match})),"")'
                 ),
             }
             for key in metadata_keys:
                 scan_row[key] = entry["metadata"].get(key, "")
             padding_index = 1
-            while len(scan_row) < 13:
+            while len(scan_row) < 14:
                 scan_row[f"{COUNTRY_SCAN_METADATA_PLACEHOLDER_PREFIX}{padding_index}"] = ""
                 padding_index += 1
             scan_row[COUNTRY_SCAN_FUTURE_COST_PLACEHOLDER] = ""
@@ -5290,6 +5277,23 @@ def _label_row_items_text(row: dict) -> str:
         if text and text not in items:
             items.append(text)
     return " | ".join(items)
+
+
+def _ship_as_is_label_sku_display(row: dict, sku_pick_order: dict[str, int] | None = None) -> str:
+    if not row.get("Prepacked No Touch"):
+        return ""
+    parts = [part.strip() for part in str(row.get("Label SKUs in Box") or row.get("SKUs in Box") or "").split("|")]
+    parts = [part for part in parts if part]
+    if len(parts) != 1:
+        return ""
+    parsed = _parse_sku_quantity(parts[0])
+    sku = parsed[0] if parsed else parts[0]
+    sku = sku.strip()
+    if not sku:
+        return ""
+    pick_index = (sku_pick_order or {}).get(sku)
+    pick_number = (pick_index + 1) if pick_index is not None else 1
+    return f"({pick_number}) {sku}"
 
 
 def _label_number_for_box(row: dict, campaign_label_prefix: str = "") -> str:
@@ -5323,6 +5327,7 @@ def _label_generator_rows(
     box_rows: list[dict],
     pledge_config_by_combo: dict[str, int] | None = None,
     campaign_label_prefix: str = "",
+    sku_pick_order: dict[str, int] | None = None,
 ) -> list[dict]:
     pledge_config_by_combo = pledge_config_by_combo or {}
     rows = []
@@ -5332,6 +5337,9 @@ def _label_generator_rows(
             box_qty = int(float(row.get("Box Qty") or 0))
         except (TypeError, ValueError):
             box_qty = 0
+        ship_as_is_display = _ship_as_is_label_sku_display(row, sku_pick_order)
+        label_sku_breakdown = row.get("Label SKUs in Box") or row.get("SKUs in Box", "")
+        label_box_type = ship_as_is_display or row.get("Label Box Type") or row.get("Box Type", "")
         output = {
             "Pledge Configuration": pledge_config_by_combo.get(str(row.get("SKU Breakdown", "")), ""),
             "Order ID": row.get("Order ID", ""),
@@ -5339,12 +5347,12 @@ def _label_generator_rows(
             "_Box Qty": row.get("Box Qty", ""),
             "Total Units": row.get("Label Unit Count", row.get("Unit Count", "")),
             "Label numbers": _label_number_for_box(row, campaign_label_prefix),
-            "Box Plan": row.get("Label Box Type") or row.get("Box Type", ""),
+            "Box Plan": label_box_type,
             "Per-Box Chargeable Weight": row.get("Chargeable Weight kg", ""),
             "Country Number": row.get("Country Number", ""),
             "Country Package Code": row.get("Country Package Code", ""),
             "Country Sequence": row.get("Country Sequence", ""),
-            "SKU Breakdown": row.get("Label SKUs in Box") or row.get("SKUs in Box", ""),
+            "SKU Breakdown": label_sku_breakdown,
             "Backer ID": _first_present(row, ["Backer ID", "BackerKit ID", "Id", "Reward Id", "Name Order ID", "Order #", "Order Number", "Order ID"]),
             "Shipping name": _first_present(row, ["Shipping name", "Address Name", "Backer Name", "Customer Name", "Name"]),
             "phone": _first_present(row, ["phone", "Phone", "Address Phone Number"]),
@@ -5608,7 +5616,7 @@ def _display_vfi_label_value(row: dict, base_number: int, campaign_label_prefix:
     box_number = _positive_int_value(row.get("Box Number"))
     prefix = str(campaign_label_prefix or "").strip()
     if box_qty > 1 and box_number:
-        return f"{base_number} {box_number} of {box_qty} {prefix}".strip()
+        return f"{base_number}  p{box_number} of {box_qty} {prefix}".strip()
     return _display_vfi_base(base_number, prefix)
 
 
@@ -5813,12 +5821,16 @@ def _sku_intake_summary_rows(
     vfi_intake_form_rows: list[dict],
 ) -> list[dict]:
     received_by_sku: dict[str, int] = {}
+    product_name_by_sku: dict[str, str] = {}
     for row in vfi_intake_form_rows:
         sku = _sku_from_intake_row(row)
         sku_key = _sku_key_for_report(sku)
         if not sku_key or sku_key == "SKU":
             continue
         received_by_sku.setdefault(sku_key, _parse_report_quantity(row.get("Received", "")))
+        product_name = first_present(row, ["Product Name", "Product", "Product description", "Product Description", "Name"])
+        if product_name and sku_key not in product_name_by_sku:
+            product_name_by_sku[sku_key] = product_name
 
     required_by_sku: Counter[str] = Counter()
     raw_by_sku: dict[str, str] = {}
@@ -5839,6 +5851,8 @@ def _sku_intake_summary_rows(
         seen.add(sku_key)
         ordered_keys.append(sku_key)
         raw_by_sku.setdefault(sku_key, item.raw_sku or item.canonical_sku)
+        if item.product_name and sku_key not in product_name_by_sku:
+            product_name_by_sku[sku_key] = item.product_name
     for row in vfi_intake_form_rows:
         sku = _sku_from_intake_row(row)
         sku_key = _sku_key_for_report(sku)
@@ -5856,16 +5870,14 @@ def _sku_intake_summary_rows(
         raw_by_sku.setdefault(sku_key, line.raw_sku or line.canonical_sku)
 
     rows = []
-    for sku_key in ordered_keys:
+    for pick_index, sku_key in enumerate(ordered_keys, start=1):
         received = received_by_sku.get(sku_key, 0)
         required = int(required_by_sku.get(sku_key, 0))
+        raw_sku = raw_by_sku.get(sku_key, sku_key)
         rows.append(
             {
-                "Section": "",
-                "Metric": "",
-                "Value": "",
-                "Detail": "",
-                "SKU": raw_by_sku.get(sku_key, sku_key),
+                "SKU": f"({pick_index}) {raw_sku}",
+                "Product Name": product_name_by_sku.get(sku_key, ""),
                 "Received Quantity": received,
                 "Required Quantity": required,
                 "Remaining": received - required,
@@ -5913,6 +5925,19 @@ def _invoice_bill_to_fallback(cfg: dict) -> str:
     return ""
 
 
+def _invoice_country_charge_flags(cost_summary_rows: list[dict]) -> tuple[bool, bool]:
+    has_canada = False
+    has_mexico = False
+    for row in cost_summary_rows:
+        country = str(row.get("Country", "") or "").strip()
+        country_key = re.sub(r"[^a-z]", "", country.casefold())
+        if country_key == "canada":
+            has_canada = True
+        if country_key in {"mexico", "mx"}:
+            has_mexico = True
+    return has_canada, has_mexico
+
+
 def _invoice_payload(
     cfg: dict,
     *,
@@ -5930,6 +5955,7 @@ def _invoice_payload(
     headers = _headers_for_sheet(cost_sheet_name, cost_summary_rows)
     columns = cost_summary_invoice_columns(headers)
     pay_lines, pay_incomplete = pay_to_lines(variant, config=cfg)
+    has_canada_charge, has_mx_charge = _invoice_country_charge_flags(cost_summary_rows)
     address_lines = (
         first_present(intake_summary_metadata, ["Address Line 1"]),
         first_present(intake_summary_metadata, ["Address Line 2"]),
@@ -5966,6 +5992,8 @@ def _invoice_payload(
             pay_to_lines=pay_lines,
             pay_to_display_lines=pay_to_uses_display_lines(variant, config=cfg),
             pay_to_incomplete=pay_incomplete,
+            include_canada_ocean_tax=has_canada_charge,
+            include_mx_import_tax=has_mx_charge,
         ),
         "",
     )
@@ -7351,6 +7379,7 @@ def optimize_workbook(
         _box_rows_in_vfi_sequence(operational_box_rows, vfi_by_order),
         pledge_config_by_combo,
         _campaign_vfi_prefix(cfg),
+        sku_pick_order=sku_display_order,
     )
     vfi_intake_sources = _vfi_intake_source_rows(sku_master_path)
     vfi_intake_form_rows = _vfi_intake_form_rows_from_sources(vfi_intake_sources)
@@ -7430,6 +7459,7 @@ def optimize_workbook(
     sheet_stats = workbook_sheet_stats(
         summary_rows=[{}],
         cost_summary_rows=cost_summary_rows,
+        stock_count_rows=sku_intake_summary_rows,
         actual_dimensions_rows=actual_dimensions_rows,
         actual_lookup_rows=actual_lookup_rows,
         actual_rate_rows=actual_rate_rows,
@@ -7481,6 +7511,7 @@ def optimize_workbook(
             errors_and_warnings_rows=errors_and_warnings_rows,
         ),
         cost_summary_rows=cost_summary_rows,
+        stock_count_rows=sku_intake_summary_rows,
         actual_dimensions_rows=actual_dimensions_rows,
         actual_lookup_rows=actual_lookup_rows,
         actual_rate_rows=actual_rate_rows,

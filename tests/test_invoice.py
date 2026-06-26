@@ -171,6 +171,27 @@ def test_invoice_payload_parses_inbound_fee_when_available_and_leaves_blank_othe
     assert without_fee.inbound_fee == ""
 
 
+def test_invoice_payload_detects_canada_and_mx_manual_charge_flags_from_country():
+    canada = _payload({"include_invoice": True}, cost_rows=[{"Country": "Canada", "Final cost": ""}])
+    mexico = _payload({"include_invoice": True}, cost_rows=[{"Country": "Mexico", "Final cost": ""}])
+    mx = _payload({"include_invoice": True}, cost_rows=[{"Country": "MX", "Final cost": ""}])
+    both = _payload(
+        {"include_invoice": True},
+        cost_rows=[{"Country": "Canada", "Final cost": ""}, {"Country": "MX", "Final cost": ""}],
+    )
+    neither = _payload({"include_invoice": True}, cost_rows=[{"Country": "United States", "Final cost": ""}])
+
+    assert canada.include_canada_ocean_tax is True
+    assert canada.include_mx_import_tax is False
+    assert mexico.include_canada_ocean_tax is False
+    assert mexico.include_mx_import_tax is True
+    assert mx.include_mx_import_tax is True
+    assert both.include_canada_ocean_tax is True
+    assert both.include_mx_import_tax is True
+    assert neither.include_canada_ocean_tax is False
+    assert neither.include_mx_import_tax is False
+
+
 def test_invalid_invoice_variant_skips_invoice_and_returns_warning():
     payload, warning = _invoice_payload(
         _config({"include_invoice": True, "invoice_variant": "EU"}),

@@ -364,15 +364,16 @@ def _parse_config(config_json: str | dict[str, Any] | None) -> dict:
 def _campaign_download_filename(config: dict) -> str:
     campaign = config.get("campaign") if isinstance(config.get("campaign"), dict) else {}
     raw_name = str(
-        campaign.get("code")
-        or campaign.get("short_name")
+        campaign.get("name")
         or campaign.get("project_name")
-        or campaign.get("name")
+        or campaign.get("short_name")
+        or campaign.get("code")
         or ""
     ).strip()
     safe_name = re.sub(r'[\\/:*?"<>|]+', "", raw_name)
     safe_name = re.sub(r"\s+", " ", safe_name).strip()
-    return f"{safe_name} Shipping Plan.xlsx" if safe_name else "optimized_shipping_plan.xlsx"
+    generated_date = datetime.now().date().isoformat()
+    return f"{safe_name} - {generated_date}.xlsx" if safe_name else "optimized_shipping_plan.xlsx"
 
 
 def _form_lines(value: str | None) -> list[str]:

@@ -181,9 +181,10 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[:9] == [
+    assert sheet_names[:10] == [
         "Summary",
         "Cost Summary",
+        "Stock Count",
         "Actual Dimensions",
         "Labels",
         "VFI Intake Form",
@@ -192,7 +193,7 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
         "Order Volume Weights",
         "Box Size Summary",
     ]
-    assert sheet_names[9:] == ["Unmatched SKUs"]
+    assert sheet_names[10:] == ["Unmatched SKUs"]
 
 
 def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
@@ -222,6 +223,7 @@ def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
     assert sheet_names == [
         "Summary",
         "Cost Summary",
+        "Stock Count",
         "Actual Dimensions",
         "Labels",
         "US",
@@ -321,7 +323,7 @@ def test_write_workbook_include_invoice_us_creates_single_invoice_sheet(tmp_path
     assert _row_cell_refs(invoice_xml, 5) == []
 
 
-def test_write_workbook_places_invoice_before_labels(tmp_path):
+def test_write_workbook_places_invoice_after_stock_count(tmp_path):
     path = tmp_path / "report.xlsx"
 
     write_workbook(
@@ -332,10 +334,10 @@ def test_write_workbook_places_invoice_before_labels(tmp_path):
     )
 
     sheet_names = _workbook_sheet_names(path)
-    assert sheet_names[:5] == ["Summary", "Cost Summary", "Actual Dimensions", "Invoice", "Labels"]
+    assert sheet_names[:6] == ["Summary", "Cost Summary", "Stock Count", "Invoice", "Actual Dimensions", "Labels"]
 
 
-def test_write_workbook_places_invoice_before_first_split_labels_sheet(tmp_path):
+def test_write_workbook_places_invoice_before_actual_dimensions_with_split_labels(tmp_path):
     path = tmp_path / "report.xlsx"
 
     write_workbook(
@@ -346,11 +348,11 @@ def test_write_workbook_places_invoice_before_first_split_labels_sheet(tmp_path)
     )
 
     sheet_names = _workbook_sheet_names(path)
-    assert sheet_names.index("Invoice") == sheet_names.index("Labels") - 1
+    assert sheet_names.index("Invoice") == sheet_names.index("Actual Dimensions") - 1
     assert sheet_names.index("Labels") < sheet_names.index("Labels 2")
 
 
-def test_write_workbook_invoice_before_labels_preserves_other_sheet_order(tmp_path):
+def test_write_workbook_invoice_after_stock_count_preserves_other_sheet_order(tmp_path):
     without_invoice = tmp_path / "without_invoice.xlsx"
     with_invoice = tmp_path / "with_invoice.xlsx"
 
@@ -365,10 +367,10 @@ def test_write_workbook_invoice_before_labels_preserves_other_sheet_order(tmp_pa
 
     with_invoice_names = _workbook_sheet_names(with_invoice)
     assert [name for name in with_invoice_names if name != "Invoice"] == _workbook_sheet_names(without_invoice)
-    assert with_invoice_names.index("Invoice") == with_invoice_names.index("Labels") - 1
+    assert with_invoice_names.index("Invoice") == with_invoice_names.index("Actual Dimensions") - 1
 
 
-def test_write_workbook_worker_output_places_invoice_before_labels(tmp_path):
+def test_write_workbook_worker_output_places_invoice_after_stock_count(tmp_path):
     path = tmp_path / "report.xlsx"
 
     write_workbook(
@@ -380,7 +382,7 @@ def test_write_workbook_worker_output_places_invoice_before_labels(tmp_path):
     )
 
     sheet_names = _workbook_sheet_names(path)
-    assert sheet_names.index("Invoice") == sheet_names.index("Labels") - 1
+    assert sheet_names.index("Invoice") == sheet_names.index("Actual Dimensions") - 1
 
 
 def test_write_workbook_include_invoice_cn_creates_single_invoice_sheet(tmp_path):
@@ -543,6 +545,57 @@ def test_invoice_sheet_uses_final_cost_formula_without_quoted_cost_fallback(tmp_
     assert "Cost Summary" not in _cell_formula(invoice_xml, "C16")
     assert "Quoted" not in invoice_xml
     assert "shipping cost" not in invoice_xml
+
+
+def test_invoice_sheet_adds_canada_and_mx_manual_charge_rows(tmp_path):
+    path = tmp_path / "invoice_manual_charges.xlsx"
+
+    write_workbook(
+        str(path),
+        invoice_payload=_invoice_payload(
+            "US",
+            include_canada_ocean_tax=True,
+            include_mx_import_tax=True,
+        ),
+    )
+
+    invoice_xml = _worksheet_xml(path, "Invoice")
+
+    assert _inline_cell_text(invoice_xml, "B14") == "shipping fee:"
+    assert _inline_cell_text(invoice_xml, "B15") == "inbound fee:"
+    assert _inline_cell_text(invoice_xml, "B16") == "Canada Ocean and Tax"
+    assert _inline_cell_text(invoice_xml, "B17") == "MX import tax"
+    assert _inline_cell_text(invoice_xml, "C16") == ""
+    assert _inline_cell_text(invoice_xml, "C17") == ""
+    assert _inline_cell_text(invoice_xml, "D16") == "USD"
+    assert _inline_cell_text(invoice_xml, "D17") == "USD"
+    assert _inline_cell_text(invoice_xml, "B18") == "Total Due:"
+    assert _cell_formula(invoice_xml, "C18") == "ROUNDDOWN(SUM(C14,C15,C16,C17),2)"
+    assert "Cost Summary" not in _cell_formula(invoice_xml, "C18")
+
+
+def test_invoice_sheet_adds_single_country_manual_charge_rows(tmp_path):
+    canada_path = tmp_path / "invoice_canada.xlsx"
+    mx_path = tmp_path / "invoice_mx.xlsx"
+    neither_path = tmp_path / "invoice_neither.xlsx"
+
+    write_workbook(str(canada_path), invoice_payload=_invoice_payload("US", include_canada_ocean_tax=True))
+    write_workbook(str(mx_path), invoice_payload=_invoice_payload("US", include_mx_import_tax=True))
+    write_workbook(str(neither_path), invoice_payload=_invoice_payload("US"))
+
+    canada_xml = _worksheet_xml(canada_path, "Invoice")
+    mx_xml = _worksheet_xml(mx_path, "Invoice")
+    neither_xml = _worksheet_xml(neither_path, "Invoice")
+
+    assert _inline_cell_text(canada_xml, "B16") == "Canada Ocean and Tax"
+    assert "MX import tax" not in canada_xml
+    assert _cell_formula(canada_xml, "C17") == "ROUNDDOWN(SUM(C14,C15,C16),2)"
+    assert _inline_cell_text(mx_xml, "B16") == "MX import tax"
+    assert "Canada Ocean and Tax" not in mx_xml
+    assert _cell_formula(mx_xml, "C17") == "ROUNDDOWN(SUM(C14,C15,C16),2)"
+    assert "Canada Ocean and Tax" not in neither_xml
+    assert "MX import tax" not in neither_xml
+    assert _cell_formula(neither_xml, "C16") == "ROUNDDOWN(SUM(C14,C15),2)"
 
 
 def test_invoice_sheet_amount_cells_use_two_decimal_currency_format(tmp_path):
@@ -1052,7 +1105,7 @@ def test_write_workbook_adds_actual_dimensions_after_cost_summary_with_formulas_
     )
 
     sheet_names = _workbook_sheet_names(path)
-    assert sheet_names[1:3] == ["Cost Summary", "Actual Dimensions"]
+    assert sheet_names[1:4] == ["Cost Summary", "Stock Count", "Actual Dimensions"]
     assert "_ActualLookupTable" in sheet_names
     assert "_ActualRateTable" in sheet_names
 
@@ -1167,18 +1220,15 @@ def test_vfi_intake_form_hides_database_upload_columns_without_deleting_data(tmp
     assert "value-27" in xml
 
 
-def test_summary_sku_intake_shortage_remaining_is_red(tmp_path):
+def test_stock_count_shortage_remaining_is_red(tmp_path):
     path = tmp_path / "report.xlsx"
 
     write_workbook(
         str(path),
-        summary_rows=[
+        stock_count_rows=[
             {
-                "Section": "",
-                "Metric": "",
-                "Value": "",
-                "Detail": "",
                 "SKU": "ORDERONLY",
+                "Product Name": "",
                 "Received Quantity": 0,
                 "Required Quantity": 4,
                 "Remaining": -4,
@@ -1186,10 +1236,10 @@ def test_summary_sku_intake_shortage_remaining_is_red(tmp_path):
         ],
     )
 
-    root = _worksheet_root(path, 1)
+    root = _worksheet_root(path, _workbook_sheet_names(path).index("Stock Count") + 1)
     styles = _styles_root(path)
 
-    assert root.find(".//main:c[@r='H2']", NS).attrib["s"] == "20"
+    assert root.find(".//main:c[@r='E2']", NS).attrib["s"] == "20"
     cell_formats = styles.findall("main:cellXfs/main:xf", NS)
     assert cell_formats[20].attrib["fontId"] == "8"
     fonts = styles.findall("main:fonts/main:font", NS)
@@ -1209,7 +1259,7 @@ def test_labels_sheet_follows_campaign_suffixed_cost_summary(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[1:4] == ["Cost Summary - Sordane", "Actual Dimensions", "Labels"]
+    assert sheet_names[1:5] == ["Cost Summary - Sordane", "Stock Count", "Actual Dimensions", "Labels"]
     assert sheet_names.count("Labels") == 1
     assert sheet_names.count("Cost Summary - Sordane") == 1
 
@@ -1229,9 +1279,12 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[1:6] == ["Cost Summary - Sordane", "Actual Dimensions", "Labels", "Hong Kong", "Singapore"]
+    assert sheet_names[1:7] == ["Cost Summary - Sordane", "Stock Count", "Actual Dimensions", "Labels", "Hong Kong", "Singapore"]
     hong_kong_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Hong Kong")
-    assert hong_kong_rows == [{"Campaign": "Sordane", "VFI #": "OPR 39"}]
+    assert hong_kong_rows == [{"Pallet ID": "", "Campaign": "Sordane", "VFI #": "OPR 39"}]
+    hong_kong_xml = _worksheet_xml(path, "Hong Kong")
+    assert _inline_cell_text(hong_kong_xml, "A1") == "Pallet ID"
+    assert _inline_cell_text(hong_kong_xml, "A2") == ""
 
 
 def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
@@ -1248,6 +1301,7 @@ def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
     assert _workbook_sheet_names(path) == [
         "Summary",
         "Cost Summary",
+        "Stock Count",
         "Actual Dimensions",
         "Labels",
         "VFI Intake Form",

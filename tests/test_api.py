@@ -364,19 +364,20 @@ def test_optimize_base64_returns_json_workbook(monkeypatch):
 def test_optimize_base64_uses_campaign_specific_download_filename(monkeypatch):
     monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
     client = TestClient(app)
+    today = api_module.datetime.now().date().isoformat()
 
     response = client.post(
         "/optimize_base64",
         json=_base64_csv_payload(
             {
                 "packing_mode": "fast",
-                "campaign": {"name": "Dark Horizon", "code": 'OPR: Wave/2?'},
+                "campaign": {"name": 'Dark Horizon: The / Long? Name', "code": 'OPR: Wave/2?'},
             }
         ),
     )
 
     assert response.status_code == 200
-    assert response.json()["filename"] == "OPR Wave2 Shipping Plan.xlsx"
+    assert response.json()["filename"] == f"Dark Horizon The Long Name - {today}.xlsx"
 
 
 def _minimal_xlsx_bytes(sheet_names: list[str]) -> bytes:
@@ -505,6 +506,7 @@ def test_optimize_accepts_x_api_key_header(monkeypatch):
 def test_optimize_file_response_uses_campaign_specific_download_filename(monkeypatch):
     monkeypatch.delenv("BOX_OPTIMIZER_API_KEY", raising=False)
     client = TestClient(app)
+    today = api_module.datetime.now().date().isoformat()
 
     response = client.post(
         "/optimize",
@@ -516,7 +518,7 @@ def test_optimize_file_response_uses_campaign_specific_download_filename(monkeyp
     )
 
     assert response.status_code == 200
-    assert "Sordane%20Shipping%20Plan.xlsx" in response.headers["content-disposition"]
+    assert f"Sordane%20-%20{today}.xlsx" in response.headers["content-disposition"]
 
 
 def test_optimize_accepts_authorization_bearer_header(monkeypatch):
@@ -1080,6 +1082,7 @@ def test_upload_workflow_creates_job_status_and_download(monkeypatch, tmp_path):
     monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
     monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
     client = TestClient(app)
+    today = api_module.datetime.now().date().isoformat()
 
     response = client.post(
         "/upload",
@@ -1110,7 +1113,7 @@ def test_upload_workflow_creates_job_status_and_download(monkeypatch, tmp_path):
     assert download_response.headers["content-type"].startswith(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-    assert "Dark%20Horizon%20Shipping%20Plan.xlsx" in download_response.headers["content-disposition"]
+    assert f"Dark%20Horizon%20-%20{today}.xlsx" in download_response.headers["content-disposition"]
     assert download_response.content[:2] == b"PK"
 
 
@@ -1600,7 +1603,7 @@ def test_employee_upload_token_gets_worker_workbook_when_admin_upload_token_is_s
     sheet_names = _sheet_names_from_xlsx_bytes(download.content)
 
     assert download.status_code == 200
-    assert sheet_names[:4] == ["Summary", "Cost Summary", "Actual Dimensions", "Labels"]
+    assert sheet_names[:5] == ["Summary", "Cost Summary", "Stock Count", "Actual Dimensions", "Labels"]
     assert "United States" in sheet_names
     assert "VFI Intake Form" in sheet_names
     assert "Optimized to Pack" in sheet_names
