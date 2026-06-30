@@ -686,6 +686,8 @@ def test_upload_page_uses_employee_friendly_labels(monkeypatch, tmp_path):
     assert "SWIFT" not in response.text
     assert "IBAN" not in response.text
     assert 'name="ship_as_is_skus"' in response.text
+    assert 'name="ship_as_is_exception_skus"' in response.text
+    assert "Ship as Is Exceptions" in response.text
     assert 'name="separate_playmat_charge_skus"' in response.text
     assert "separate_playmat_charge_amount" not in response.text
     assert 'name="no_padding_skus"' in response.text
@@ -1390,6 +1392,7 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
             "campaign_notes": "Internal note",
             "packing_mode_choice": "local_power_balanced_300",
             "ship_as_is_skus": "SHIP-001",
+            "ship_as_is_exception_skus": "promo-card, thank-you-note",
             "ship_as_is_box_type": "All In",
             "separate_playmat_charge_skus": "PLAYMAT-CHARGE",
             "no_padding_skus": "DICE-001",
@@ -1414,6 +1417,7 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
         "box_type": "SHIP-001 shipping carton",
         "label_box_type": "All In",
     }
+    assert config["ship_as_is_exception_skus"] == ["PROMO-CARD", "THANK-YOU-NOTE"]
     assert config["separate_playmat_charge_skus"] == ["PLAYMAT-CHARGE"]
     assert config["sku_rules"]["PLAYMAT-CHARGE"] == {
         "prepacked": True,
@@ -1434,6 +1438,45 @@ def test_upload_workflow_generates_structured_rules_server_side(monkeypatch, tmp
         "compressed_height_ratio": 0.55,
         "compressed_volume_ratio": 0.7,
     }
+
+
+def test_upload_workflow_parses_newline_ship_as_is_exception_skus(monkeypatch, tmp_path):
+    monkeypatch.delenv("BOX_OPTIMIZER_UPLOAD_TOKEN", raising=False)
+    monkeypatch.setenv("BOX_OPTIMIZER_JOBS_DIR", str(tmp_path / "jobs"))
+    captured = {}
+
+    def fake_optimize_workbook(*, sku_master_path, orders_path, output_path, config):
+        captured["config"] = config
+        with open(output_path, "wb") as output:
+            output.write(b"PK fake workbook")
+        return {
+            "orders_processed": 1,
+            "boxes_created": 1,
+            "box_types": 1,
+            "unmatched_skus": 0,
+            "warnings": [],
+            "warning_count": 0,
+            "multi_box_order_count": 0,
+            "rules_applied_count": 0,
+        }
+
+    monkeypatch.setattr("box_optimizer.api.optimize_workbook", fake_optimize_workbook)
+    client = TestClient(app)
+
+    response = client.post(
+        "/upload",
+        files={
+            "sku_master_file": ("sku.csv", b"SKU\nSHIP-001\n", "text/csv"),
+            "orders_file": ("orders.csv", b"Order ID,SKU,Quantity\n1,SHIP-001,1\n", "text/csv"),
+        },
+        data={
+            "packing_mode_choice": "railway_fast",
+            "ship_as_is_exception_skus": "promo-card\nthank-you-note\npromo-card",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["config"]["ship_as_is_exception_skus"] == ["PROMO-CARD", "THANK-YOU-NOTE"]
 
 
 def test_upload_workflow_manual_config_overrides_structured_fields(monkeypatch, tmp_path):

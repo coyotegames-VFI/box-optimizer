@@ -210,6 +210,7 @@ class SKUCampaignRule:
     label_box_type: str | None = None
     warning_note: str = ""
     separate_playmat_charge: bool = False
+    ship_as_is_exception: bool = False
 
 
 _US_STATE_ABBREVIATIONS = {
@@ -758,6 +759,16 @@ def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
             label_box_type=rule.get("label_box_type"),
             warning_note=str(rule.get("warning_note", "") or ""),
             separate_playmat_charge=_bool_from_config(rule.get("separate_playmat_charge"), False),
+            ship_as_is_exception=_bool_from_config(rule.get("ship_as_is_exception"), False),
+        )
+    for key in config.get("ship_as_is_exception_skus") or []:
+        text_key = normalize_sku(key)
+        if not text_key:
+            continue
+        existing = parsed.get(text_key)
+        parsed[text_key] = replace(existing, ship_as_is_exception=True) if existing else SKUCampaignRule(
+            key=text_key,
+            ship_as_is_exception=True,
         )
     for key in config.get("separate_playmat_charge_skus") or []:
         text_key = str(key or "").strip()
@@ -792,6 +803,7 @@ def _parse_sku_rules(config: dict) -> dict[str, SKUCampaignRule]:
                 if part
             ),
             separate_playmat_charge=True,
+            ship_as_is_exception=existing.ship_as_is_exception if existing else False,
         )
     return parsed
 
@@ -1324,9 +1336,58 @@ _OPERATIONAL_HUB_COUNTRY_NAMES = {
     "United States",
 }
 
+MASTER_COUNTRY_GROUP_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("United States", ("United States",)),
+    ("Australia-NZ", ("Australia", "New Zealand")),
+    ("Middle East Hub", ("Bahrain", "Kuwait", "Oman", "Saudi Arabia", "United Arab Emirates")),
+    ("Brazil", ("Brazil",)),
+    ("Canada", ("Canada",)),
+    ("China-HK", ("China", "Hong Kong")),
+    ("India", ("India",)),
+    ("Indonesia", ("Indonesia",)),
+    ("Israel", ("Israel",)),
+    ("Japan", ("Japan",)),
+    ("South Korea", ("South Korea",)),
+    ("Malaysia", ("Malaysia",)),
+    ("Mexico", ("Mexico",)),
+    ("Philippines", ("Philippines",)),
+    ("Singapore", ("Singapore",)),
+    ("South Africa", ("South Africa",)),
+    ("Taiwan", ("Taiwan",)),
+    ("Thailand", ("Thailand",)),
+    ("Vietnam", ("Vietnam",)),
+)
+NON_HUB_COUNTRIES_TAB_NAME = "Non-Hub Countries"
+MASTER_COUNTRY_GROUP_COUNTRY_TO_TAB = {
+    country.casefold(): tab_name
+    for tab_name, countries in MASTER_COUNTRY_GROUP_ORDER
+    for country in countries
+}
+MASTER_COUNTRY_GROUP_RANK = {
+    country.casefold(): (group_rank, country_rank)
+    for group_rank, (_tab_name, countries) in enumerate(MASTER_COUNTRY_GROUP_ORDER)
+    for country_rank, country in enumerate(countries)
+}
+
 
 def _hub_country_name(country: object) -> str:
     return _normalize_country(str(country or ""))
+
+
+def _master_country_name(country: object) -> str:
+    return _normalize_country(str(country or ""))
+
+
+def _master_country_tab_name(country: object) -> str:
+    return MASTER_COUNTRY_GROUP_COUNTRY_TO_TAB.get(_master_country_name(country).casefold(), "")
+
+
+def _master_country_sort_parts(country: object) -> tuple[int, int, str]:
+    normalized = _master_country_name(country)
+    rank = MASTER_COUNTRY_GROUP_RANK.get(normalized.casefold())
+    if rank is not None:
+        return (*rank, "")
+    return (len(MASTER_COUNTRY_GROUP_ORDER), 0, normalized.casefold())
 
 
 def _has_hub_pricing_for_country(
@@ -1542,6 +1603,51 @@ def _prepacked_final_result(items: list[PackedItem]) -> OptimizedCartonResult:
     )
 
 
+def _prepacked_final_with_exception_result(
+    items: list[PackedItem],
+    ship_sku: str,
+) -> OptimizedCartonResult:
+    expanded = _expand_items(items)
+    ship_items = [item for item in expanded if item.canonical_sku == ship_sku]
+    if len(ship_items) != 1:
+        return OptimizedCartonResult(
+            success=False,
+            length_cm=None,
+            width_cm=None,
+            height_cm=None,
+            chargeable_weight_kg=None,
+            volume_cm3=None,
+            placements=[],
+            unplaced_items=items,
+        )
+    carton_item = ship_items[0]
+    dimensions = carton_item.padded_dimensions
+    total_weight_kg = sum(item.weight_kg for item in expanded)
+    placements = [
+        Placement(
+            canonical_sku=item.canonical_sku,
+            quantity=1,
+            dimensions=item.padded_dimensions,
+            origin=None,
+            weight_kg=item.weight_kg,
+        )
+        for item in expanded
+    ]
+    return OptimizedCartonResult(
+        success=True,
+        length_cm=dimensions.length,
+        width_cm=dimensions.width,
+        height_cm=dimensions.height,
+        chargeable_weight_kg=max(
+            packed_actual_weight_kg(total_weight_kg),
+            dimensional_weight_kg(dimensions),
+        ),
+        volume_cm3=volume(dimensions),
+        placements=placements,
+        unplaced_items=[],
+    )
+
+
 def _prepacked_final_cartons(items: list[PackedItem], rule: SKUCampaignRule) -> list[SplitCarton]:
     cartons = []
     for box_number, item in enumerate(_expand_items(items), start=1):
@@ -1567,6 +1673,16 @@ def _carton_is_prepacked_final(
         return False
     placement_rules = [sku_rules.get(placement.canonical_sku) for placement in carton.result.placements]
     if all(_final_shipping_carton_rule(rule) for rule in placement_rules):
+        return True
+    final_placements = [
+        placement
+        for placement, rule in zip(carton.result.placements, placement_rules)
+        if placement.quantity == 1 and _final_shipping_carton_rule(rule)
+    ]
+    if len(final_placements) == 1 and all(
+        _final_shipping_carton_rule(rule) or _ship_as_is_exception_rule(rule)
+        for rule in placement_rules
+    ):
         return True
     return len(placement_rules) == 1 and bool(placement_rules[0] and placement_rules[0].prepacked)
 
@@ -1612,6 +1728,22 @@ def _split_rule_group_records(
         for value in order_rule.get("trigger_skus", []):
             trigger_keys.add(normalize_sku(value))
             trigger_keys.add(_rule_key(value))
+
+    exception_ship_line = _ship_as_is_exception_group(lines, sku_rules)
+    if exception_ship_line is not None:
+        ship_rule = sku_rules.get(exception_ship_line.canonical_sku)
+        exception_rules = [
+            sku_rules[line.canonical_sku].key
+            for line in lines
+            if line is not exception_ship_line and line.canonical_sku in sku_rules
+        ]
+        return [
+            RuleSplitGroup(
+                lines=lines,
+                reason="ship-as-is exceptions",
+                rule_keys=tuple(dict.fromkeys(([ship_rule.key] if ship_rule else []) + exception_rules)),
+            )
+        ]
 
     groups: list[RuleSplitGroup] = []
     remainder = []
@@ -2219,6 +2351,32 @@ def _final_shipping_carton_rule(rule: SKUCampaignRule | None) -> bool:
     return bool(rule and rule.prepacked and (rule.ships_alone or not rule.can_mix_with_other_items))
 
 
+def _ship_as_is_exception_rule(rule: SKUCampaignRule | None) -> bool:
+    return bool(rule and rule.ship_as_is_exception)
+
+
+def _ship_as_is_exception_group(
+    group: list[OrderLine],
+    sku_rules: dict[str, SKUCampaignRule],
+) -> OrderLine | None:
+    if len(group) < 2:
+        return None
+    ship_lines = [
+        line
+        for line in group
+        if line.quantity == 1 and _final_shipping_carton_rule(sku_rules.get(line.canonical_sku))
+    ]
+    if len(ship_lines) != 1:
+        return None
+    ship_line = ship_lines[0]
+    for line in group:
+        if line is ship_line:
+            continue
+        if not _ship_as_is_exception_rule(sku_rules.get(line.canonical_sku)):
+            return None
+    return ship_line
+
+
 def _dimensions_cache_tuple(dimensions: Dimensions | None) -> tuple[float, float, float] | None:
     if dimensions is None:
         return None
@@ -2249,6 +2407,7 @@ def _rule_cache_signature(rule: SKUCampaignRule | None) -> dict:
         "label_box_type": rule.label_box_type,
         "warning_note": rule.warning_note,
         "separate_playmat_charge": rule.separate_playmat_charge,
+        "ship_as_is_exception": rule.ship_as_is_exception,
     }
 
 
@@ -2399,6 +2558,37 @@ def _pack_group(
 ) -> tuple[SplitResult, list[WorkflowWarning]]:
     cfg = cfg or DEFAULT_CONFIG
     warnings = []
+    exception_ship_line = _ship_as_is_exception_group(group, sku_rules)
+    if exception_ship_line is not None:
+        ship_rule = sku_rules[exception_ship_line.canonical_sku]
+        result = _prepacked_final_with_exception_result(items, exception_ship_line.canonical_sku)
+        return (
+            SplitResult(
+                result.success,
+                1 if result.success else 0,
+                [
+                    SplitCarton(
+                        box_number=1,
+                        result=result,
+                        box_type=ship_rule.box_type or "PREPACKED-FINAL-CARTON",
+                        rule_applied=", ".join(
+                            dict.fromkeys(
+                                [ship_rule.key]
+                                + [
+                                    sku_rules[line.canonical_sku].key
+                                    for line in group
+                                    if line is not exception_ship_line and line.canonical_sku in sku_rules
+                                ]
+                            )
+                        ),
+                        warning=ship_rule.warning_note,
+                        dimensions_are_final=True,
+                    )
+                ] if result.success else [],
+                [] if result.success else items,
+            ),
+            warnings,
+        )
     group_rule = sku_rules.get(group[0].canonical_sku) if len(group) == 1 else None
     if group_rule and _final_shipping_carton_rule(group_rule) and not group_rule.forced_box_cm:
         cartons = _prepacked_final_cartons(items, group_rule)
@@ -3086,6 +3276,19 @@ def _label_box_type_for_carton(
     return unique_labels[0] if len(unique_labels) == 1 else carton_box_type
 
 
+def _ship_as_is_label_sku_for_carton(
+    carton: SplitCarton,
+    sku_rules: dict[str, SKUCampaignRule],
+) -> str:
+    final_skus = [
+        placement.canonical_sku
+        for placement in carton.result.placements
+        if placement.quantity == 1 and _final_shipping_carton_rule(sku_rules.get(placement.canonical_sku))
+    ]
+    unique_skus = list(dict.fromkeys(final_skus))
+    return unique_skus[0] if len(unique_skus) == 1 else ""
+
+
 def _score_assigned_split_result(
     *,
     order_id: str,
@@ -3454,6 +3657,8 @@ def _rule_summary(sku_rules: dict[str, SKUCampaignRule]) -> list[str]:
             )
         if rule.separate_playmat_charge:
             flags.append("separate playmat charge")
+        if rule.ship_as_is_exception:
+            flags.append("ship-as-is exception")
         if flags:
             summaries.append(f"{rule.key}: {', '.join(flags)}")
     return summaries
@@ -4792,30 +4997,40 @@ def _actual_dimensions_rows(
     for index in range(2, row_count + 2):
         expected_barcode = expected_scan_barcodes[index - 2] if index - 2 < len(expected_scan_barcodes) else ""
         required = f'OR($A{index}="",$B{index}="",$C{index}="",$D{index}="",$E{index}="")'
-        last_dash = f'FIND("@",SUBSTITUTE($A{index},"-","@",LEN($A{index})-LEN(SUBSTITUTE($A{index},"-",""))))'
-        trailing_suffix = f'RIGHT($A{index},LEN($A{index})-{last_dash})'
-        dash_group_key = f'IFERROR(IF(VALUE({trailing_suffix})>1,LEFT($A{index},{last_dash}-1),$A{index}),$A{index})'
-        package_total_end = f'FIND(" ",$A{index},FIND(" of ",$A{index})+4)'
-        one_of_group_key = f'LEFT($A{index},FIND(" ",$A{index})-1)&" "&MID($A{index},{package_total_end}+1,999)'
-        group_key = f'IFERROR(IF(ISNUMBER(SEARCH(" of ",$A{index})),{one_of_group_key},{dash_group_key}),{dash_group_key})'
-        expected_last_dash = f'FIND("@",SUBSTITUTE($L{index},"-","@",LEN($L{index})-LEN(SUBSTITUTE($L{index},"-",""))))'
-        expected_trailing_suffix = f'RIGHT($L{index},LEN($L{index})-{expected_last_dash})'
-        expected_dash_group_key = (
-            f'IFERROR(IF(VALUE({expected_trailing_suffix})>1,LEFT($L{index},{expected_last_dash}-1),$L{index}),$L{index})'
+        scan_text = f'TRIM($A{index})'
+        expected_scan_text = f'TRIM($L{index})'
+        last_dash = f'FIND("@",SUBSTITUTE({scan_text},"-","@",LEN({scan_text})-LEN(SUBSTITUTE({scan_text},"-",""))))'
+        trailing_suffix = f'RIGHT({scan_text},LEN({scan_text})-{last_dash})'
+        dash_group_key = f'IFERROR(IF(VALUE({trailing_suffix})>1,LEFT({scan_text},{last_dash}-1),{scan_text}),{scan_text})'
+        package_total_end = f'FIND(" ",{scan_text},FIND(" of ",{scan_text})+4)'
+        one_of_group_key = f'LEFT({scan_text},FIND(" ",{scan_text})-1)&" "&MID({scan_text},{package_total_end}+1,999)'
+        group_key = f'IFERROR(IF(ISNUMBER(SEARCH(" of ",{scan_text})),{one_of_group_key},{dash_group_key}),{dash_group_key})'
+        expected_last_dash = (
+            f'FIND("@",SUBSTITUTE({expected_scan_text},"-","@",'
+            f'LEN({expected_scan_text})-LEN(SUBSTITUTE({expected_scan_text},"-",""))))'
         )
-        expected_package_total_end = f'FIND(" ",$L{index},FIND(" of ",$L{index})+4)'
-        expected_one_of_group_key = f'LEFT($L{index},FIND(" ",$L{index})-1)&" "&MID($L{index},{expected_package_total_end}+1,999)'
+        expected_trailing_suffix = f'RIGHT({expected_scan_text},LEN({expected_scan_text})-{expected_last_dash})'
+        expected_dash_group_key = (
+            f'IFERROR(IF(VALUE({expected_trailing_suffix})>1,LEFT({expected_scan_text},{expected_last_dash}-1),'
+            f'{expected_scan_text}),{expected_scan_text})'
+        )
+        expected_package_total_end = f'FIND(" ",{expected_scan_text},FIND(" of ",{expected_scan_text})+4)'
+        expected_one_of_group_key = (
+            f'LEFT({expected_scan_text},FIND(" ",{expected_scan_text})-1)&" "&'
+            f'MID({expected_scan_text},{expected_package_total_end}+1,999)'
+        )
         expected_group_key = (
-            f'IFERROR(IF(ISNUMBER(SEARCH(" of ",$L{index})),{expected_one_of_group_key},{expected_dash_group_key}),'
+            f'IFERROR(IF(ISNUMBER(SEARCH(" of ",{expected_scan_text})),'
+            f'{expected_one_of_group_key},{expected_dash_group_key}),'
             f'{expected_dash_group_key})'
         )
         one_of_package_number = (
-            f'TRIM(SUBSTITUTE(SUBSTITUTE(MID($A{index},FIND(" ",$A{index})+1,'
-            f'FIND(" of ",$A{index})-FIND(" ",$A{index})-1),"p",""),"P",""))'
+            f'TRIM(SUBSTITUTE(SUBSTITUTE(MID({scan_text},FIND(" ",{scan_text})+1,'
+            f'FIND(" of ",{scan_text})-FIND(" ",{scan_text})-1),"p",""),"P",""))'
         )
         one_of_charge_row = f'IFERROR(VALUE({one_of_package_number})=1,FALSE)'
         dash_charge_row = f'$A{index}=$P{index}'
-        is_charge_row = f'IF(ISNUMBER(SEARCH(" of ",$A{index})),{one_of_charge_row},{dash_charge_row})'
+        is_charge_row = f'IF(ISNUMBER(SEARCH(" of ",{scan_text})),{one_of_charge_row},{dash_charge_row})'
         lookup_match = f'MATCH($P{index},{lookup}!$A:$A,0)'
         lookup_value = f'INDEX({lookup}!$A:$A,{lookup_match})'
         country_value = f'INDEX({lookup}!$B:$B,{lookup_match})'
@@ -5014,10 +5229,10 @@ COUNTRY_SCAN_CORE_COLUMNS = {
     "Items in this box / SKU contents",
 }
 
-COUNTRY_SCAN_GROUPED_HUB_TABS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Australia-NZ", ("Australia", "New Zealand")),
-    ("China-HK", ("China", "Hong Kong")),
-    ("Middle East Hub", ("Bahrain", "Kuwait", "Oman", "Saudi Arabia", "United Arab Emirates")),
+COUNTRY_SCAN_GROUPED_HUB_TABS: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
+    (tab_name, countries)
+    for tab_name, countries in MASTER_COUNTRY_GROUP_ORDER
+    if len(countries) > 1
 )
 COUNTRY_SCAN_GROUPED_HUB_COUNTRY_TO_TAB = {
     country.casefold(): tab_name
@@ -5155,50 +5370,33 @@ def _country_scan_sheets(
 ) -> dict[str, list[dict]]:
     entries_by_sheet: dict[str, list[dict]] = {}
     metadata_keys_by_sheet: dict[str, list[str]] = {}
-    name_by_country: dict[str, str] = {}
-    used_names = set()
     main_rows = [row for row in label_rows if not row.get("Label Continuation")]
     main_row_rank = {id(row): index for index, row in enumerate(main_rows)}
-    def grouped_hub_tab_name(country: object) -> str:
-        return COUNTRY_SCAN_GROUPED_HUB_COUNTRY_TO_TAB.get(_hub_country_name(country).casefold(), "")
 
-    def is_hub_row(row: dict) -> bool:
+    def master_tab_name(row: dict) -> str:
         country = _first_present(row, ["Country", "Country Name"])
-        return bool(grouped_hub_tab_name(country)) or _is_vfi_hub_country(
-            country,
-            rate_sheet,
-            row.get("State/Province", ""),
-        )
+        return _master_country_tab_name(country)
 
-    non_hub_rows = [row for row in main_rows if not is_hub_row(row)]
+    non_hub_rows = [row for row in main_rows if not master_tab_name(row)]
     non_hub_rank = {id(row): index for index, row in enumerate(non_hub_rows)}
     ordered_rows = sorted(
         main_rows,
         key=lambda row: (
-            0 if is_hub_row(row) else 1,
-            ""
-            if is_hub_row(row)
-            else _country_sequence_display(_first_present(row, ["Country", "Country Name"])).casefold(),
+            *_master_country_sort_parts(_first_present(row, ["Country", "Country Name"])),
             non_hub_rank.get(id(row), 0),
+            main_row_rank.get(id(row), 0),
         ),
     )
     for row in ordered_rows:
         if row.get("Label Continuation"):
             continue
         country = _country_sequence_display(_first_present(row, ["Country", "Country Name"]))
-        grouped_tab_name = grouped_hub_tab_name(country)
-        if grouped_tab_name:
-            sheet_name = grouped_tab_name
+        tab_name = _master_country_tab_name(country)
+        if tab_name:
+            sheet_name = tab_name
             entries_by_sheet.setdefault(sheet_name, [])
-        elif _is_vfi_hub_country(country, rate_sheet, row.get("State/Province", "")):
-            sheet_country = _hub_country_name(country)
-            key = sheet_country.casefold()
-            if key not in name_by_country:
-                name_by_country[key] = _country_scan_sheet_name(sheet_country, used_names)
-                entries_by_sheet[name_by_country[key]] = []
-            sheet_name = name_by_country[key]
         else:
-            sheet_name = "Non-Hub Countries"
+            sheet_name = NON_HUB_COUNTRIES_TAB_NAME
             entries_by_sheet.setdefault(sheet_name, [])
         scan_value = str(
             row.get("Barcode/QR Value")
@@ -5219,14 +5417,14 @@ def _country_scan_sheets(
                 "metadata": metadata,
                 "items_in_box": row.get("Total Units", ""),
                 "items": _label_row_items_text(row),
-                "country_rank": COUNTRY_SCAN_GROUPED_HUB_RANK.get(_hub_country_name(country).casefold(), 0),
+                "country_rank": _master_country_sort_parts(country),
                 "row_rank": main_row_rank.get(id(row), 0),
             }
         )
     sheets: dict[str, list[dict]] = {}
     actual_dimensions = _excel_quote_sheet_name("Actual Dimensions")
     for sheet_name, entries in entries_by_sheet.items():
-        if sheet_name in {tab_name for tab_name, _countries in COUNTRY_SCAN_GROUPED_HUB_TABS}:
+        if sheet_name != NON_HUB_COUNTRIES_TAB_NAME:
             entries = sorted(entries, key=lambda entry: (entry["country_rank"], entry["row_rank"]))
         metadata_keys = metadata_keys_by_sheet.get(sheet_name, [])
         sheets[sheet_name] = []
@@ -5282,6 +5480,11 @@ def _label_row_items_text(row: dict) -> str:
 def _ship_as_is_label_sku_display(row: dict, sku_pick_order: dict[str, int] | None = None) -> str:
     if not row.get("Prepacked No Touch"):
         return ""
+    label_sku = str(row.get("Ship As Is Label SKU") or "").strip()
+    if label_sku:
+        pick_index = (sku_pick_order or {}).get(label_sku)
+        pick_number = (pick_index + 1) if pick_index is not None else 1
+        return f"({pick_number}) {label_sku}"
     parts = [part.strip() for part in str(row.get("Label SKUs in Box") or row.get("SKUs in Box") or "").split("|")]
     parts = [part for part in parts if part]
     if len(parts) != 1:
@@ -5575,10 +5778,8 @@ def _label_print_sort_key(
     rate_sheet: "CustomerRateSheet | None" = None,
 ) -> tuple[object, ...]:
     country = _country_sequence_display(row.get("Country") or row.get("Country Code") or "")
-    is_hub = _is_vfi_hub_country(country, rate_sheet, row.get("State/Province", ""))
     return (
-        0 if is_hub else 1,
-        _hub_country_name(country).casefold() if is_hub else country.casefold(),
+        *_master_country_sort_parts(country),
         _label_print_pledge_sort_key(row.get("Pledge Configuration", "")),
         original_index,
     )
@@ -7223,6 +7424,7 @@ def optimize_workbook(
                 "Box Qty": split_result.box_qty,
                 "Box Type": carton_box_type,
                 "Label Box Type": _label_box_type_for_carton(carton, carton_box_type, sku_rules),
+                "Ship As Is Label SKU": _ship_as_is_label_sku_for_carton(carton, sku_rules),
                 "Vendor Box ID": vendor_box_id,
                 "Backup Vendor Box": "N/A" if carton.box_type else _backup_vendor_box_text(assignment),
                 "Box Selection Decision": selection_decision,

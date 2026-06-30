@@ -702,10 +702,10 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
 
     assert "XLOOKUP" not in actual_xml
     assert "LET(" not in actual_xml
-    assert 'ISNUMBER(SEARCH(" of ",$A2))' in actual_xml
-    assert 'LEFT($A2,FIND(" ",$A2)-1)&amp;" "&amp;MID($A2,FIND(" ",$A2,FIND(" of ",$A2)+4)+1,999)' in actual_xml
-    assert 'TRIM(SUBSTITUTE(SUBSTITUTE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1),"p",""),"P",""))' in actual_xml
-    assert 'VALUE(RIGHT($A2,LEN($A2)-FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))))&gt;1' in actual_xml
+    assert 'ISNUMBER(SEARCH(" of ",TRIM($A2)))' in actual_xml
+    assert 'LEFT(TRIM($A2),FIND(" ",TRIM($A2))-1)&amp;" "&amp;MID(TRIM($A2),FIND(" ",TRIM($A2),FIND(" of ",TRIM($A2))+4)+1,999)' in actual_xml
+    assert 'TRIM(SUBSTITUTE(SUBSTITUTE(MID(TRIM($A2),FIND(" ",TRIM($A2))+1,FIND(" of ",TRIM($A2))-FIND(" ",TRIM($A2))-1),"p",""),"P",""))' in actual_xml
+    assert 'VALUE(RIGHT(TRIM($A2),LEN(TRIM($A2))-FIND("@",SUBSTITUTE(TRIM($A2),"-","@",LEN(TRIM($A2))-LEN(SUBSTITUTE(TRIM($A2),"-",""))))))&gt;1' in actual_xml
     assert "MATCH($P2,'_ActualLookupTable'!$A:$A,0)" in actual_xml
     assert "INDEX('_ActualLookupTable'!$H:$H" in actual_xml
     assert 'CEILING($C2,0.5)*CEILING($D2,0.5)*CEILING($E2,0.5)/5000' in actual_xml
@@ -717,8 +717,8 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
     assert "CEILING($Y2-0.000000001,0.5)" in actual_xml
     assert '$Q2&lt;&gt;"Yes"' in actual_xml
     assert "SUMPRODUCT(--(TRIM($A$2:$A$2)=TRIM($L2)))" in actual_xml
-    assert 'IF($L2="","",IFERROR(IF(ISNUMBER(SEARCH(" of ",$L2)),LEFT($L2,FIND(" ",$L2)-1)&amp;" "&amp;MID($L2,FIND(" ",$L2,FIND(" of ",$L2)+4)+1,999)' in actual_xml
-    assert 'VALUE(RIGHT($L2,LEN($L2)-FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))))&gt;1' in actual_xml
+    assert 'IF($L2="","",IFERROR(IF(ISNUMBER(SEARCH(" of ",TRIM($L2))),LEFT(TRIM($L2),FIND(" ",TRIM($L2))-1)&amp;" "&amp;MID(TRIM($L2),FIND(" ",TRIM($L2),FIND(" of ",TRIM($L2))+4)+1,999)' in actual_xml
+    assert 'VALUE(RIGHT(TRIM($L2),LEN(TRIM($L2))-FIND("@",SUBSTITUTE(TRIM($L2),"-","@",LEN(TRIM($L2))-LEN(SUBSTITUTE(TRIM($L2),"-",""))))))&gt;1' in actual_xml
     assert "Not Scanned" in actual_xml
     assert "No barcode match" in actual_xml
     assert "No hub rate" in actual_xml
@@ -765,16 +765,19 @@ def test_actual_dimensions_multi_carton_formulas_group_by_base_barcode_and_gate_
     assert '"Less than expected"' in row["Weight warning"].formula
     assert "SUMPRODUCT(--(TRIM($A$2:$A$2)=TRIM($L2)))" in row["Scan status"].formula
     assert '"Not Scanned"' in row["Scan status"].formula
-    assert 'TRIM(SUBSTITUTE(SUBSTITUTE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1),"p",""),"P",""))' in lookup_formula
-    assert lookup_formula == 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(TRIM(SUBSTITUTE(SUBSTITUTE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1),"p",""),"P","")))=1,FALSE),$A2=$P2),$P2,""))'
-    assert 'LEFT($A2,FIND(" ",$A2)-1)&" "&MID($A2,FIND(" ",$A2,FIND(" of ",$A2)+4)+1,999)' in group_key_formula
-    assert 'VALUE(RIGHT($A2,LEN($A2)-FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))))>1' in group_key_formula
-    assert 'LEFT($A2,FIND("@",SUBSTITUTE($A2,"-","@",LEN($A2)-LEN(SUBSTITUTE($A2,"-",""))))-1)' in group_key_formula
+    assert (
+        'TRIM(SUBSTITUTE(SUBSTITUTE(MID(TRIM($A2),FIND(" ",TRIM($A2))+1,'
+        'FIND(" of ",TRIM($A2))-FIND(" ",TRIM($A2))-1),"p",""),"P",""))'
+    ) in lookup_formula
+    assert lookup_formula == 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",TRIM($A2))),IFERROR(VALUE(TRIM(SUBSTITUTE(SUBSTITUTE(MID(TRIM($A2),FIND(" ",TRIM($A2))+1,FIND(" of ",TRIM($A2))-FIND(" ",TRIM($A2))-1),"p",""),"P","")))=1,FALSE),$A2=$P2),$P2,""))'
+    assert 'LEFT(TRIM($A2),FIND(" ",TRIM($A2))-1)&" "&MID(TRIM($A2),FIND(" ",TRIM($A2),FIND(" of ",TRIM($A2))+4)+1,999)' in group_key_formula
+    assert 'VALUE(RIGHT(TRIM($A2),LEN(TRIM($A2))-FIND("@",SUBSTITUTE(TRIM($A2),"-","@",LEN(TRIM($A2))-LEN(SUBSTITUTE(TRIM($A2),"-",""))))))>1' in group_key_formula
+    assert 'LEFT(TRIM($A2),FIND("@",SUBSTITUTE(TRIM($A2),"-","@",LEN(TRIM($A2))-LEN(SUBSTITUTE(TRIM($A2),"-",""))))-1)' in group_key_formula
     assert 'IF($L2="","",' in expected_group_key_formula
-    assert 'LEFT($L2,FIND(" ",$L2)-1)&" "&MID($L2,FIND(" ",$L2,FIND(" of ",$L2)+4)+1,999)' in expected_group_key_formula
-    assert 'VALUE(RIGHT($L2,LEN($L2)-FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))))>1' in expected_group_key_formula
-    assert 'LEFT($L2,FIND("@",SUBSTITUTE($L2,"-","@",LEN($L2)-LEN(SUBSTITUTE($L2,"-",""))))-1)' in expected_group_key_formula
-    assert charge_flag_formula == 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",$A2)),IFERROR(VALUE(TRIM(SUBSTITUTE(SUBSTITUTE(MID($A2,FIND(" ",$A2)+1,FIND(" of ",$A2)-FIND(" ",$A2)-1),"p",""),"P","")))=1,FALSE),$A2=$P2),"Yes","No"))'
+    assert 'LEFT(TRIM($L2),FIND(" ",TRIM($L2))-1)&" "&MID(TRIM($L2),FIND(" ",TRIM($L2),FIND(" of ",TRIM($L2))+4)+1,999)' in expected_group_key_formula
+    assert 'VALUE(RIGHT(TRIM($L2),LEN(TRIM($L2))-FIND("@",SUBSTITUTE(TRIM($L2),"-","@",LEN(TRIM($L2))-LEN(SUBSTITUTE(TRIM($L2),"-",""))))))>1' in expected_group_key_formula
+    assert 'LEFT(TRIM($L2),FIND("@",SUBSTITUTE(TRIM($L2),"-","@",LEN(TRIM($L2))-LEN(SUBSTITUTE(TRIM($L2),"-",""))))-1)' in expected_group_key_formula
+    assert charge_flag_formula == 'IF($A2="","",IF(IF(ISNUMBER(SEARCH(" of ",TRIM($A2))),IFERROR(VALUE(TRIM(SUBSTITUTE(SUBSTITUTE(MID(TRIM($A2),FIND(" ",TRIM($A2))+1,FIND(" of ",TRIM($A2))-FIND(" ",TRIM($A2))-1),"p",""),"P","")))=1,FALSE),$A2=$P2),"Yes","No"))'
     assert "MATCH($P2,'_ActualLookupTable'!$A:$A,0)" in row["Country"].formula
     assert "SUMIF($P:$P,$P2,$X:$X)" in group_weight_formula
     assert "CEILING($Y2-0.000000001,0.5)" in matched_band_formula
@@ -928,6 +931,28 @@ def test_actual_dimensions_barcode_parts_separate_scanner_barcode_lookup_and_gro
     )
 
 
+def test_actual_dimensions_barcode_parts_normalize_expected_p_package_group_keys():
+    cases = [
+        ("20  p1 of 2 ITFFKS1", "20 ITFFKS1", "20 ITFFKS1", True),
+        ("20  p2 of 2 ITFFKS1", "", "20 ITFFKS1", False),
+        ("20  p3 of 3 ITFFKS1", "", "20 ITFFKS1", False),
+        ("20 p1 of 2 ITFFKS1", "20 ITFFKS1", "20 ITFFKS1", True),
+        ("20 p2 of 2 ITFFKS1", "", "20 ITFFKS1", False),
+        ("20 1 of 2 ITFFKS1", "20 ITFFKS1", "20 ITFFKS1", True),
+        ("20 2 of 2 ITFFKS1", "", "20 ITFFKS1", False),
+        ("20 ITFFKS1", "20 ITFFKS1", "20 ITFFKS1", True),
+        ("One Page Rules-1", "One Page Rules-1", "One Page Rules-1", True),
+        ("One Page Rules-1-2", "", "One Page Rules-1", False),
+    ]
+
+    for barcode, expected_cost_vfi, expected_group_key, expected_charge_row in cases:
+        assert workflow_module._actual_dimensions_barcode_parts(barcode) == workflow_module.ActualDimensionsBarcodeParts(
+            cost_summary_vfi=expected_cost_vfi,
+            group_vfi_key=expected_group_key,
+            is_charge_row=expected_charge_row,
+        )
+
+
 def test_actual_dimensions_rows_match_small_expected_scan_count_without_default_cap():
     expected = [f"PKG-{index}" for index in range(1, 21)]
 
@@ -1005,10 +1030,60 @@ def test_cost_summary_scan_note_uses_package_set_status_for_multi_package_group(
     assert 'COUNTIFS(\'Actual Dimensions\'!$AE:$AE,$B2' in formula
     assert '\'Actual Dimensions\'!$M:$M,"Not Scanned"' in formula
     assert ',"Item not scanned","")' in formula
-    assert 'ISNUMBER(SEARCH(" of ",$L2))' in actual_rows[0]["Expected scan group VFI key"].formula
-    assert 'ISNUMBER(SEARCH(" of ",$L3))' in actual_rows[1]["Expected scan group VFI key"].formula
+    assert 'ISNUMBER(SEARCH(" of ",TRIM($L2)))' in actual_rows[0]["Expected scan group VFI key"].formula
+    assert 'ISNUMBER(SEARCH(" of ",TRIM($L3)))' in actual_rows[1]["Expected scan group VFI key"].formula
     assert "TRIM($L2)" in actual_rows[0]["Scan status"].formula
     assert "TRIM($L3)" in actual_rows[1]["Scan status"].formula
+
+
+def test_workbook_actual_dimensions_expected_scan_group_key_normalizes_p_package_rows(tmp_path):
+    output_path = tmp_path / "actual_dimensions_expected_scan_group_key.xlsx"
+    actual_rows = workflow_module._actual_dimensions_rows(
+        expected_scan_barcodes=[
+            "15  p1 of 2 ITFFKS1",
+            "15  p2 of 2 ITFFKS1",
+            "15  p3 of 3 ITFFKS1",
+        ]
+    )
+    cost_rows = workflow_module._cost_summary_rows(
+        [{"VFI #": "15 ITFFKS1", "Country": "US"}],
+        {},
+        workflow_module.CustomerRateSheetSelection(
+            sheet=workflow_module.CustomerRateSheet(
+                hub=workflow_module._empty_rate_lane(),
+                express=workflow_module._empty_rate_lane(),
+            ),
+            path="",
+            filename="",
+            source="test",
+        ),
+        {},
+    )
+
+    excel_writer_module.write_workbook(str(output_path), cost_summary_rows=cost_rows, actual_dimensions_rows=actual_rows)
+
+    actual_xml = _sheet_xml(output_path, "Actual Dimensions")
+    cost_xml = _sheet_xml(output_path, "Cost Summary")
+
+    assert [_inline_cell_text(actual_xml, cell) for cell in ["L2", "L3", "L4"]] == [
+        "15  p1 of 2 ITFFKS1",
+        "15  p2 of 2 ITFFKS1",
+        "15  p3 of 3 ITFFKS1",
+    ]
+    assert 'LEFT(TRIM($L2),FIND(" ",TRIM($L2))-1)' in _cell_formula(actual_xml, "AE2")
+    assert 'LEFT(TRIM($L3),FIND(" ",TRIM($L3))-1)' in _cell_formula(actual_xml, "AE3")
+    assert 'LEFT(TRIM($L4),FIND(" ",TRIM($L4))-1)' in _cell_formula(actual_xml, "AE4")
+    assert 'MID(TRIM($L3),FIND(" ",TRIM($L3),FIND(" of ",TRIM($L3))+4)+1,999)' in actual_rows[1][
+        "Expected scan group VFI key"
+    ].formula
+    assert 'TRIM($L3)' in actual_rows[1]["Expected scan group VFI key"].formula
+    assert 'p2 of' not in actual_rows[1]["Expected scan group VFI key"].formula
+    assert _cell_formula(actual_xml, "M3") == (
+        'IF($L3="","",IF(SUMPRODUCT(--(TRIM($A$2:$A$4)=TRIM($L3)))>0,"","Not Scanned"))'
+    )
+    assert "COUNTIFS('Actual Dimensions'!$AE:$AE,$B2" in _cell_formula(cost_xml, "V2")
+    assert "MATCH($B2,'Actual Dimensions'!$O:$O,0)" in _cell_formula(cost_xml, "T2")
+    assert "MATCH($B2,'Actual Dimensions'!$O:$O,0)" in _cell_formula(cost_xml, "U2")
 
 
 def test_cost_summary_scan_note_keeps_blank_until_scans_are_present():
@@ -3551,7 +3626,8 @@ def test_country_scan_sheets_group_barcode_values_by_country_in_label_order():
     )
 
     assert [row["VFI #"] for row in sheets["China-HK"]] == ["VEST 1", "VEST 3"]
-    assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["VEST 4", "VEST 5", "VEST 2"]
+    assert [row["VFI #"] for row in sheets["Singapore"]] == ["VEST 2"]
+    assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["VEST 4", "VEST 5"]
     assert "Barcode Value" not in sheets["China-HK"][0]
     assert "Bad_Name" not in sheets
     assert "Bad_Name 2" not in sheets
@@ -3615,6 +3691,191 @@ def test_country_scan_sheets_group_selected_hub_countries_into_shared_tabs():
     assert sheets["Australia-NZ"][0]["Items in box"] == 3
     assert sheets["China-HK"][0]["Items in box"] == 5
     assert sheets["Middle East Hub"][0]["Items in box"] == 7
+
+
+def test_visible_vfi_numbers_labels_and_actual_expected_scans_follow_master_country_group_order():
+    label_rows = workflow_module._labels_rows(
+        workflow_module._label_generator_rows(
+            [
+                {"Order ID": "MX", "Box Number": 1, "Box Qty": 1, "Country": "Mexico", "SKU Breakdown": "CORE x1", "SKUs in Box": "CORE x1"},
+                {"Order ID": "US", "Box Number": 1, "Box Qty": 1, "Country": "United States", "SKU Breakdown": "CORE x1", "SKUs in Box": "CORE x1"},
+                {"Order ID": "CA", "Box Number": 1, "Box Qty": 1, "Country": "Canada", "SKU Breakdown": "CORE x1", "SKUs in Box": "CORE x1"},
+            ]
+        ),
+        {},
+    )
+
+    label_rows = workflow_module._labels_rows_in_print_order(label_rows)
+    label_rows, display_vfi_by_order, _display_label_by_package = workflow_module._assign_visible_vfi_numbers(
+        label_rows,
+        "VEST",
+    )
+
+    assert [row["Order ID"] for row in label_rows] == ["US", "CA", "MX"]
+    assert [row["VFI #"] for row in label_rows] == ["1 VEST", "2 VEST", "3 VEST"]
+    assert [row["Barcode/QR Value"] for row in label_rows] == ["1 VEST", "2 VEST", "3 VEST"]
+    assert display_vfi_by_order == {"US": "1 VEST", "CA": "2 VEST", "MX": "3 VEST"}
+    assert workflow_module._expected_scan_barcodes(label_rows) == ["1 VEST", "2 VEST", "3 VEST"]
+
+
+def test_label_rows_print_in_full_master_country_group_order():
+    countries = [
+        ("XX", "Germany"),
+        ("VN", "Vietnam"),
+        ("TH", "Thailand"),
+        ("TW", "Taiwan"),
+        ("ZA", "South Africa"),
+        ("SG", "Singapore"),
+        ("PH", "Philippines"),
+        ("MX", "Mexico"),
+        ("MY", "Malaysia"),
+        ("KR", "South Korea"),
+        ("JP", "Japan"),
+        ("IL", "Israel"),
+        ("ID", "Indonesia"),
+        ("IN", "India"),
+        ("HK", "Hong Kong"),
+        ("CN", "China"),
+        ("CA", "Canada"),
+        ("BR", "Brazil"),
+        ("AE", "United Arab Emirates"),
+        ("SA", "Saudi Arabia"),
+        ("OM", "Oman"),
+        ("KW", "Kuwait"),
+        ("BH", "Bahrain"),
+        ("NZ", "New Zealand"),
+        ("AU", "Australia"),
+        ("US", "United States"),
+    ]
+    label_rows = workflow_module._labels_rows(
+        workflow_module._label_generator_rows(
+            [
+                {"Order ID": order_id, "Box Number": 1, "Box Qty": 1, "Country": country, "SKU Breakdown": "CORE x1", "SKUs in Box": "CORE x1"}
+                for order_id, country in countries
+            ]
+        ),
+        {},
+    )
+
+    ordered = workflow_module._labels_rows_in_print_order(label_rows)
+
+    assert [row["Country"] for row in ordered] == [
+        "United States",
+        "Australia",
+        "New Zealand",
+        "Bahrain",
+        "Kuwait",
+        "Oman",
+        "Saudi Arabia",
+        "United Arab Emirates",
+        "Brazil",
+        "Canada",
+        "China",
+        "Hong Kong",
+        "India",
+        "Indonesia",
+        "Israel",
+        "Japan",
+        "South Korea",
+        "Malaysia",
+        "Mexico",
+        "Philippines",
+        "Singapore",
+        "South Africa",
+        "Taiwan",
+        "Thailand",
+        "Vietnam",
+        "Germany",
+    ]
+
+
+def test_country_scan_sheets_follow_master_sheet_and_group_row_order_without_empty_tabs():
+    sheets = workflow_module._country_scan_sheets(
+        [
+            {"Country": "Germany", "Barcode/QR Value": "XX-1"},
+            {"Country": "Mexico", "Barcode/QR Value": "MX-1"},
+            {"Country": "Canada", "Barcode/QR Value": "CA-1"},
+            {"Country": "United States", "Barcode/QR Value": "US-1"},
+            {"Country": "New Zealand", "Barcode/QR Value": "NZ-1"},
+            {"Country": "Australia", "Barcode/QR Value": "AU-1"},
+            {"Country": "Hong Kong", "Barcode/QR Value": "HK-1"},
+            {"Country": "China", "Barcode/QR Value": "CN-1"},
+            {"Country": "United Arab Emirates", "Barcode/QR Value": "AE-1"},
+            {"Country": "Saudi Arabia", "Barcode/QR Value": "SA-1"},
+            {"Country": "Oman", "Barcode/QR Value": "OM-1"},
+            {"Country": "Kuwait", "Barcode/QR Value": "KW-1"},
+            {"Country": "Bahrain", "Barcode/QR Value": "BH-1"},
+            {"Country": "Vietnam", "Barcode/QR Value": "VN-1"},
+            {"Country": "Thailand", "Barcode/QR Value": "TH-1"},
+            {"Country": "Taiwan", "Barcode/QR Value": "TW-1"},
+            {"Country": "South Africa", "Barcode/QR Value": "ZA-1"},
+            {"Country": "Singapore", "Barcode/QR Value": "SG-1"},
+            {"Country": "Philippines", "Barcode/QR Value": "PH-1"},
+            {"Country": "Malaysia", "Barcode/QR Value": "MY-1"},
+            {"Country": "South Korea", "Barcode/QR Value": "KR-1"},
+            {"Country": "Japan", "Barcode/QR Value": "JP-1"},
+            {"Country": "Israel", "Barcode/QR Value": "IL-1"},
+            {"Country": "Indonesia", "Barcode/QR Value": "ID-1"},
+            {"Country": "India", "Barcode/QR Value": "IN-1"},
+            {"Country": "Brazil", "Barcode/QR Value": "BR-1"},
+        ]
+    )
+
+    assert list(sheets) == [
+        "United States",
+        "Australia-NZ",
+        "Middle East Hub",
+        "Brazil",
+        "Canada",
+        "China-HK",
+        "India",
+        "Indonesia",
+        "Israel",
+        "Japan",
+        "South Korea",
+        "Malaysia",
+        "Mexico",
+        "Philippines",
+        "Singapore",
+        "South Africa",
+        "Taiwan",
+        "Thailand",
+        "Vietnam",
+        "Non-Hub Countries",
+    ]
+    assert [row["VFI #"] for row in sheets["Australia-NZ"]] == ["AU-1", "NZ-1"]
+    assert [row["VFI #"] for row in sheets["Middle East Hub"]] == ["BH-1", "KW-1", "OM-1", "SA-1", "AE-1"]
+    assert [row["VFI #"] for row in sheets["China-HK"]] == ["CN-1", "HK-1"]
+    assert [row["VFI #"] for row in sheets["Non-Hub Countries"]] == ["XX-1"]
+    assert list(sheets["United States"][0])[:7] == [
+        "Pallet ID",
+        "Campaign",
+        "VFI #",
+        "Actual weight g",
+        "Actual DIM L",
+        "Actual DIM W",
+        "Actual DIM H",
+    ]
+    assert "Australia" not in sheets
+    assert "New Zealand" not in sheets
+    assert "China" not in sheets
+    assert "Hong Kong" not in sheets
+    assert "Bahrain" not in sheets
+
+
+def test_country_scan_sheets_use_grouped_tab_when_only_one_group_country_is_present():
+    sheets = workflow_module._country_scan_sheets(
+        [
+            {"Country": "New Zealand", "Barcode/QR Value": "NZ-1"},
+            {"Country": "Hong Kong", "Barcode/QR Value": "HK-1"},
+            {"Country": "Oman", "Barcode/QR Value": "OM-1"},
+        ]
+    )
+
+    assert list(sheets) == ["Australia-NZ", "Middle East Hub", "China-HK"]
+    assert [row["VFI #"] for row in sheets["Australia-NZ"]] == ["NZ-1"]
+    assert [row["VFI #"] for row in sheets["Middle East Hub"]] == ["OM-1"]
+    assert [row["VFI #"] for row in sheets["China-HK"]] == ["HK-1"]
 
 
 def test_label_generator_populates_simplified_chinese_country_from_two_letter_code():
@@ -3954,17 +4215,17 @@ def test_labels_rows_print_order_groups_hub_countries_first_then_pledge_stably()
     ordered_rows = workflow_module._labels_rows_in_print_order(label_rows)
 
     assert [row["Country"] for row in ordered_rows] == [
+        "United States",
+        "United States",
         "Canada",
         "Canada",
         "China",
-        "United States",
-        "United States",
         "France",
         "Germany",
     ]
-    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 1, 2, 1, 2, "2", "10"]
-    assert [row["Order ID"] for row in ordered_rows] == ["C", "D", "E", "B", "A", "G", "F"]
-    assert [row["Label Value"] for row in ordered_rows] == ["LC 2", "LC 3", "LC 5", "LC 1", "LC 4", "LC 7", "LC 6"]
+    assert [row["Pledge Configuration"] for row in ordered_rows] == [1, 2, 1, 1, 2, "2", "10"]
+    assert [row["Order ID"] for row in ordered_rows] == ["B", "A", "C", "D", "E", "G", "F"]
+    assert [row["Label Value"] for row in ordered_rows] == ["LC 1", "LC 4", "LC 2", "LC 3", "LC 5", "LC 7", "LC 6"]
 
 
 def test_visible_vfi_numbers_are_assigned_after_country_first_print_order_and_drive_scan_values():
@@ -5021,6 +5282,159 @@ def test_ship_as_is_label_uses_pick_sku_for_item_and_box_display(tmp_path):
     assert third_carton_name not in labels_xml
     assert {row["Box Type"] for row in multi_box_rows} == {first_carton_name, third_carton_name}
     assert {row["Box Type"] for row in box_size_rows} == {first_carton_name, third_carton_name}
+
+
+def _write_ship_as_is_exception_inputs(tmp_path: Path, order_rows: list[dict]) -> tuple[Path, Path, Path]:
+    sku_master_path = tmp_path / "sku_master.csv"
+    orders_path = tmp_path / "orders.csv"
+    output_path = tmp_path / "optimized.xlsx"
+    _write_csv(
+        sku_master_path,
+        [
+            {"SKU": "SHIP-AS-IS-SKU", "Product Name": "Ship As Is", "Length": "60", "Width": "30", "Height": "20", "Weight kg": "2.0"},
+            {"SKU": "PROMO-CARD", "Product Name": "Promo Card", "Length": "70", "Width": "35", "Height": "10", "Weight kg": "0.3"},
+            {"SKU": "THANK-YOU-NOTE", "Product Name": "Thank You Note", "Length": "55", "Width": "25", "Height": "5", "Weight kg": "0.2"},
+            {"SKU": "LARGE-EXPANSION", "Product Name": "Large Expansion", "Length": "40", "Width": "30", "Height": "15", "Weight kg": "1.0"},
+        ],
+    )
+    _write_csv(orders_path, order_rows)
+    return sku_master_path, orders_path, output_path
+
+
+def _ship_as_is_exception_config(exception_skus: list[str]) -> dict:
+    return {
+        "packing_mode": "fast",
+        "preserve_region_sheets": False,
+        "ship_as_is_exception_skus": exception_skus,
+        "sku_rules": {
+            "SHIP-AS-IS-SKU": {
+                "prepacked": True,
+                "no_padding": True,
+                "ships_alone": True,
+                "can_mix_with_other_items": False,
+                "box_type": "SHIP-AS-IS-SKU shipping carton",
+            }
+        },
+    }
+
+
+def test_ship_as_is_sku_only_remains_single_no_touch_carton(tmp_path):
+    sku_master_path, orders_path, output_path = _write_ship_as_is_exception_inputs(
+        tmp_path,
+        [{"Order ID": "1", "SKU": "SHIP-AS-IS-SKU", "Quantity": "1"}],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config=_ship_as_is_exception_config(["PROMO-CARD"]),
+    )
+
+    detail_row = _sheet_rows(output_path, "Multi Box Detail")[0]
+    lookup_row = _sheet_rows(output_path, "_ActualLookupTable")[0]
+    assert detail_row["SKUs in Box"] == "SHIP-AS-IS-SKU x1"
+    assert detail_row["Box Type"] == "SHIP-AS-IS-SKU shipping carton"
+    assert float(lookup_row["Pick / add-on fee"]) == 1.75
+
+
+def test_ship_as_is_with_one_exception_uses_ship_carton_weight_and_labels(tmp_path):
+    sku_master_path, orders_path, output_path = _write_ship_as_is_exception_inputs(
+        tmp_path,
+        [
+            {"Order ID": "1", "SKU": "SHIP-AS-IS-SKU", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "PROMO-CARD", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config=_ship_as_is_exception_config(["PROMO-CARD"]),
+    )
+
+    detail_row = _sheet_rows(output_path, "Multi Box Detail")[0]
+    label_row = _sheet_rows(output_path, "Label generator")[0]
+    lookup_row = _sheet_rows(output_path, "_ActualLookupTable")[0]
+    stock_rows = {row["SKU"]: row for row in _sheet_rows(output_path, "Stock Count")}
+
+    assert int(float(detail_row["Box Qty"])) == 1
+    assert detail_row["Box Type"] == "SHIP-AS-IS-SKU shipping carton"
+    assert float(detail_row["Actual Weight kg"]) == 2.3
+    assert float(detail_row["Length cm"]) == 60
+    assert float(detail_row["Width cm"]) == 30
+    assert float(detail_row["Height cm"]) == 20
+    assert detail_row["SKUs in Box"] == "SHIP-AS-IS-SKU x1 | PROMO-CARD x1"
+    assert label_row["Box Plan"] == "(1) SHIP-AS-IS-SKU"
+    assert label_row["SKU Breakdown"] == "SHIP-AS-IS-SKU x1 | PROMO-CARD x1"
+    assert "(?)" not in label_row["Box Plan"]
+    assert "(?)" not in label_row["SKU Breakdown"]
+    assert float(lookup_row["Pick / add-on fee"]) == 2.25
+    assert int(stock_rows["(2) PROMO-CARD"]["Required Quantity"]) == 1
+
+
+def test_ship_as_is_with_two_exceptions_uses_ship_carton_and_normal_pick_fee(tmp_path):
+    sku_master_path, orders_path, output_path = _write_ship_as_is_exception_inputs(
+        tmp_path,
+        [
+            {"Order ID": "1", "SKU": "SHIP-AS-IS-SKU", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "PROMO-CARD", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "THANK-YOU-NOTE", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config=_ship_as_is_exception_config(["PROMO-CARD", "THANK-YOU-NOTE"]),
+    )
+
+    detail_row = _sheet_rows(output_path, "Multi Box Detail")[0]
+    label_row = _sheet_rows(output_path, "Label generator")[0]
+    lookup_row = _sheet_rows(output_path, "_ActualLookupTable")[0]
+    stock_rows = {row["SKU"]: row for row in _sheet_rows(output_path, "Stock Count")}
+
+    assert int(float(detail_row["Box Qty"])) == 1
+    assert detail_row["SKUs in Box"] == "SHIP-AS-IS-SKU x1 | PROMO-CARD x1 | THANK-YOU-NOTE x1"
+    assert float(detail_row["Actual Weight kg"]) == 2.5
+    assert float(detail_row["Length cm"]) == 60
+    assert float(detail_row["Width cm"]) == 30
+    assert float(detail_row["Height cm"]) == 20
+    assert float(lookup_row["Pick / add-on fee"]) == 2.5
+    assert label_row["Box Plan"] == "(1) SHIP-AS-IS-SKU"
+    assert label_row["SKU Breakdown"] == "SHIP-AS-IS-SKU x1 | PROMO-CARD x1 | THANK-YOU-NOTE x1"
+    assert int(stock_rows["(2) PROMO-CARD"]["Required Quantity"]) == 1
+    assert int(stock_rows["(3) THANK-YOU-NOTE"]["Required Quantity"]) == 1
+
+
+def test_ship_as_is_exception_rule_ignored_when_regular_sku_present(tmp_path):
+    sku_master_path, orders_path, output_path = _write_ship_as_is_exception_inputs(
+        tmp_path,
+        [
+            {"Order ID": "1", "SKU": "SHIP-AS-IS-SKU", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "PROMO-CARD", "Quantity": "1"},
+            {"Order ID": "1", "SKU": "LARGE-EXPANSION", "Quantity": "1"},
+        ],
+    )
+
+    optimize_workbook(
+        str(sku_master_path),
+        str(orders_path),
+        str(output_path),
+        config=_ship_as_is_exception_config(["PROMO-CARD"]),
+    )
+
+    detail_rows = _sheet_rows(output_path, "Multi Box Detail")
+    ship_row = next(row for row in detail_rows if row["Box Type"] == "SHIP-AS-IS-SKU shipping carton")
+    other_rows = [row for row in detail_rows if row is not ship_row]
+
+    assert len(detail_rows) >= 2
+    assert ship_row["SKUs in Box"] == "SHIP-AS-IS-SKU x1"
+    assert all("LARGE-EXPANSION" not in row["SKUs in Box"] for row in [ship_row])
+    assert any("PROMO-CARD x1" in row["SKUs in Box"] for row in other_rows)
+    assert any("LARGE-EXPANSION x1" in row["SKUs in Box"] for row in other_rows)
 
 
 def test_blank_ship_as_is_friendly_label_keeps_carton_name_on_printable_labels():

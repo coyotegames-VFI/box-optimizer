@@ -380,6 +380,17 @@ def _form_lines(value: str | None) -> list[str]:
     return [line.strip() for line in (value or "").splitlines() if line.strip()]
 
 
+def _form_skus(value: str | None) -> list[str]:
+    normalized = []
+    seen = set()
+    for part in re.split(r"[\r\n,]+", value or ""):
+        sku = normalize_sku(part)
+        if sku and sku not in seen:
+            normalized.append(sku)
+            seen.add(sku)
+    return normalized
+
+
 def _form_float(value: str | float | int | None, default: float) -> float:
     if value in (None, ""):
         return default
@@ -435,6 +446,7 @@ def _structured_upload_config(
     campaign_notes: str | None = None,
     packing_mode_choice: str | None = None,
     ship_as_is_skus: str | None = None,
+    ship_as_is_exception_skus: str | None = None,
     ship_as_is_box_type: str | None = None,
     separate_playmat_charge_skus: str | None = None,
     no_padding_skus: str | None = None,
@@ -470,6 +482,9 @@ def _structured_upload_config(
         if ship_as_is_label:
             rule["label_box_type"] = ship_as_is_label
         sku_rules[sku] = rule
+    exception_skus = _form_skus(ship_as_is_exception_skus)
+    if exception_skus:
+        config["ship_as_is_exception_skus"] = exception_skus
     playmat_skus = _form_lines(separate_playmat_charge_skus)
     if playmat_skus:
         config["separate_playmat_charge_skus"] = playmat_skus
@@ -787,6 +802,9 @@ def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> 
     <textarea id="ship_as_is_skus" name="ship_as_is_skus" placeholder="SKU-001&#10;SKU-002"></textarea>
     <label for="ship_as_is_box_type">Friendly box type label for ship-as-is items</label>
     <input id="ship_as_is_box_type" name="ship_as_is_box_type" type="text" placeholder="Example: Final factory shipping carton">
+    <label for="ship_as_is_exception_skus">Ship as Is Exceptions</label>
+    <p class="help">Small pre-approved SKUs that may be inserted into a single ship-as-is carton when all other order items are listed here.</p>
+    <textarea id="ship_as_is_exception_skus" name="ship_as_is_exception_skus" placeholder="PROMO-CARD, THANK-YOU-NOTE"></textarea>
 
     <label for="separate_playmat_charge_skus">Separate Playmat Charge SKUs</label>
     <p class="help">Use for playmat SKUs that ship as their own no-touch parcel and receive the fixed $6 package weight charge per unit.</p>
@@ -827,6 +845,18 @@ def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> 
           .split(/\r?\n/)
           .map(function (line) { return line.trim(); })
           .filter(Boolean);
+      }
+
+      function skuValues(id) {
+        var seen = {};
+        return (document.getElementById(id).value || "")
+          .split(/[\r\n,]+/)
+          .map(function (line) { return line.trim().toUpperCase(); })
+          .filter(function (sku) {
+            if (!sku || seen[sku]) return false;
+            seen[sku] = true;
+            return true;
+          });
       }
 
       function numberValue(id, fallback) {
@@ -910,6 +940,13 @@ def _campaign_intake_html(default_packing_mode_choice: str = "railway_fast") -> 
             if (shipBoxType) rule.label_box_type = shipBoxType;
             applyRule(config, sku, rule);
           });
+
+          var shipAsIsExceptionSkus = skuValues("ship_as_is_exception_skus");
+          if (shipAsIsExceptionSkus.length) {
+            config.ship_as_is_exception_skus = shipAsIsExceptionSkus;
+          } else {
+            delete config.ship_as_is_exception_skus;
+          }
 
           var separatePlaymatSkus = lines("separate_playmat_charge_skus");
           if (separatePlaymatSkus.length) {
@@ -1325,6 +1362,7 @@ def upload_workbooks(
     campaign_notes: str | None = Form(default=None),
     packing_mode_choice: str | None = Form(default="railway_fast"),
     ship_as_is_skus: str | None = Form(default=None),
+    ship_as_is_exception_skus: str | None = Form(default=None),
     ship_as_is_box_type: str | None = Form(default=None),
     separate_playmat_charge_skus: str | None = Form(default=None),
     no_padding_skus: str | None = Form(default=None),
@@ -1350,6 +1388,7 @@ def upload_workbooks(
         campaign_notes=campaign_notes,
         packing_mode_choice=packing_mode_choice,
         ship_as_is_skus=ship_as_is_skus,
+        ship_as_is_exception_skus=ship_as_is_exception_skus,
         ship_as_is_box_type=ship_as_is_box_type,
         separate_playmat_charge_skus=separate_playmat_charge_skus,
         no_padding_skus=no_padding_skus,
