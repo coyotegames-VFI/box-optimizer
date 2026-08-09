@@ -3,8 +3,11 @@ import json
 import logging
 import zipfile
 from collections import Counter
+from decimal import Decimal
 from xml.etree import ElementTree
 from pathlib import Path
+
+import pytest
 
 from box_optimizer import optimize_workbook
 from box_optimizer.io import excel_writer as excel_writer_module
@@ -44,6 +47,47 @@ def _order_line(order_id: str, sku: str, quantity: int = 1) -> OrderLine:
     return OrderLine(order_id=order_id, raw_sku=sku, canonical_sku=sku, quantity=quantity)
 
 
+def test_manufacturer_cost_each_uses_pallet_value_density_roundup_and_minimum():
+    expected_density = (
+        Decimal("1500")
+        / (Decimal("42") * Decimal("2.54") * Decimal("42") * Decimal("2.54") * Decimal("72") * Decimal("2.54"))
+    )
+    assert workflow_module.MANUFACTURER_VALUE_PER_CM3 == expected_density
+    assert workflow_module.manufacturer_cost_each(1, 1, 1) == Decimal("0.01")
+
+    length_for_one_point_one_cents = Decimal("0.01001") / expected_density
+    assert workflow_module.manufacturer_cost_each(length_for_one_point_one_cents, 1, 1) == Decimal("0.02")
+
+
+@pytest.mark.parametrize("dimensions", [(None, 1, 1), (0, 1, 1), (-1, 1, 1), ("invalid", 1, 1)])
+def test_manufacturer_cost_each_requires_positive_dimensions(dimensions):
+    assert workflow_module.manufacturer_cost_each(*dimensions) is None
+
+
+def test_manufacturer_value_rows_use_original_sku_dimensions_and_package_quantities():
+    sku_items = [_sku_item("BOOSTER-SKU", Dimensions(2, 2, 2))]
+    unit_cost = workflow_module.manufacturer_cost_each(2, 2, 2)
+
+    intake_rows = workflow_module._intake_form_review_rows(
+        [{"SKU": "BOOSTER-SKU", "quantity": "100"}], sku_items
+    )
+    assert intake_rows[0]["Manufacturer Cost Each"] == float(unit_cost)
+    assert intake_rows[0]["Manufacturer Cost Basis"] == workflow_module.MANUFACTURER_COST_BASIS_TEXT
+
+    stock_rows = workflow_module._sku_intake_summary_rows(
+        sku_items, [_order_line("1", "BOOSTER-SKU", 100)], [{"SKU": "BOOSTER-SKU", "Received": "100"}]
+    )
+    assert stock_rows[0]["Manufacturer Cost Each"] == float(unit_cost)
+    assert stock_rows[0]["Required Manufacturer Value"] == float(unit_cost * 100)
+
+    package_rows = workflow_module._all_packages_scan_rows(
+        [{"Country": "Japan", "Barcode/QR Value": "PKG-1", "Label SKUs in Box": "BOOSTER-SKU x100"}],
+        sku_items=sku_items,
+    )
+    assert package_rows[0]["Declared value"] == float(unit_cost * 100)
+    assert package_rows[0]["Package item values"] == f"BOOSTER-SKU x100 @ ${unit_cost:.2f} = ${unit_cost * 100:.2f}"
+
+
 def test_vfi_intake_received_column_maps_quantity_aliases_for_reporting():
     rows = workflow_module._vfi_intake_form_rows_with_received(
         [
@@ -55,6 +99,46 @@ def test_vfi_intake_received_column_maps_quantity_aliases_for_reporting():
     )
 
     assert [row["Received"] for row in rows] == ["100", "25", "12", "7"]
+
+
+def test_intake_form_review_rows_preserve_intake_order_and_missing_product_names():
+    sku_items = [
+        SKUItem(
+            raw_sku="SECOND",
+            canonical_sku="SECOND",
+            product_name="Second item",
+            length_cm=10,
+            width_cm=8,
+            height_cm=4,
+            weight_kg=1.25,
+        ),
+        SKUItem(
+            raw_sku="FIRST",
+            canonical_sku="FIRST",
+            product_name="FIRST",
+            length_cm=6,
+            width_cm=5,
+            height_cm=2,
+            weight_kg=0.5,
+        ),
+    ]
+    rows = workflow_module._intake_form_review_rows(
+        [
+            {"SKU": "SECOND", "Product Name": "Second item", "Quantity": "12", "Category": "Games"},
+            {"SKU": "FIRST", "Quantity": "4"},
+        ],
+        sku_items,
+    )
+
+    assert [row["SKU"] for row in rows] == ["SECOND", "FIRST"]
+    assert rows[0]["Product Name"] == "Second item"
+    assert rows[1]["Product Name"] == ""
+    assert rows[0]["Length"] == 10
+    assert rows[0]["Width"] == 8
+    assert rows[0]["Height"] == 4
+    assert rows[0]["Weight"] == 1.25
+    assert rows[0]["Received Quantity"] == "12"
+    assert rows[0]["Category"] == "Games"
 
 
 def test_sku_intake_summary_rows_include_intake_and_order_skus_with_remaining_quantities():
@@ -84,10 +168,62 @@ def test_sku_intake_summary_rows_include_intake_and_order_skus_with_remaining_qu
     assert by_sku["(1) CORE"]["Remaining"] == 5
     assert by_sku["(2) INTAKEONLY"]["Required Quantity"] == 0
     assert by_sku["(2) INTAKEONLY"]["Remaining"] == 6
+    assert by_sku["(1) CORE"]["Intake Match Status"] == "OK"
+    assert by_sku["(2) INTAKEONLY"]["Intake Match Status"] == "Zero needed"
     assert by_sku["(3) ORDERONLY"]["Product Name"] == ""
     assert by_sku["(3) ORDERONLY"]["Received Quantity"] == 0
     assert by_sku["(3) ORDERONLY"]["Required Quantity"] == 4
     assert by_sku["(3) ORDERONLY"]["Remaining"] == -4
+    assert by_sku["(3) ORDERONLY"]["Intake Match Status"] == "Missing from intake"
+
+
+def test_sku_intake_summary_rows_follow_intake_order_and_keep_high_quantities_as_original_skus():
+    sku_items = [
+        _sku_item("FIRST", Dimensions(10, 10, 2)),
+        _sku_item("SECOND", Dimensions(5, 5, 1)),
+    ]
+    intake_rows = workflow_module._vfi_intake_form_rows_with_received(
+        [
+            {"SKU": "SECOND", "quantity": "6"},
+            {"SKU": "FIRST", "quantity": "100"},
+        ]
+    )
+
+    rows = workflow_module._sku_intake_summary_rows(
+        sku_items,
+        [_order_line("1", "FIRST", 100), _order_line("2", "ORDERONLY", 1)],
+        intake_rows,
+    )
+
+    assert [row["SKU"] for row in rows] == ["(1) SECOND", "(2) FIRST", "(3) ORDERONLY"]
+    assert rows[0]["Required Quantity"] == 0
+    assert rows[0]["Intake Match Status"] == "Zero needed"
+    assert rows[1]["Required Quantity"] == 100
+    assert rows[1]["Intake Match Status"] == "OK"
+    assert rows[2]["Intake Match Status"] == "Missing from intake"
+    assert rows[2]["Product Name"] == ""
+    assert all(" x10" not in row["SKU"] and " x100" not in row["SKU"] for row in rows)
+
+
+def test_clean_summary_rows_marks_intake_reconciliation_ok_without_missing_skus():
+    rows = workflow_module._clean_summary_rows(
+        {"orders_processed": 0, "boxes_created": 0, "box_types": 0, "unmatched_skus": 0},
+        [],
+        [],
+        {},
+        sku_intake_summary_rows=[
+            {"SKU": "(1) FIRST", "Required Quantity": 0, "Intake Match Status": "Zero needed"},
+            {"SKU": "(2) SECOND", "Required Quantity": 2, "Intake Match Status": "OK"},
+        ],
+    )
+
+    reconciliation = {row["Metric"]: row["Value"] for row in rows if row.get("Section") == "Intake Reconciliation"}
+    assert reconciliation["Intake SKU count"] == 2
+    assert reconciliation["Stock Count SKU count"] == 2
+    assert reconciliation["Required SKU count"] == 1
+    assert reconciliation["Missing from intake count"] == 0
+    assert reconciliation["Zero-needed intake SKU count"] == 1
+    assert reconciliation["Intake reconciliation status"] == "OK"
 
 
 def test_single_order_configurations_sort_by_country_after_repeated_configurations():
@@ -1173,6 +1309,15 @@ def test_output_workbook_includes_received_intake_column_and_sku_intake_summary(
 
     summary_rows = _sheet_rows(output_path, "Summary")
     assert all("Received Quantity" not in row for row in summary_rows)
+    reconciliation = {row["Metric"]: row["Value"] for row in summary_rows if row.get("Section") == "Intake Reconciliation"}
+    assert reconciliation == {
+        "Intake SKU count": "2",
+        "Stock Count SKU count": "3",
+        "Required SKU count": "2",
+        "Missing from intake count": "1",
+        "Zero-needed intake SKU count": "1",
+        "Intake reconciliation status": "Review needed",
+    }
     stock_rows = _sheet_rows(output_path, "Stock Count")
     stock_xml = _sheet_xml(output_path, "Stock Count")
     assert _inline_cell_text(stock_xml, "A1") == "SKU"
@@ -1180,20 +1325,30 @@ def test_output_workbook_includes_received_intake_column_and_sku_intake_summary(
     assert _inline_cell_text(stock_xml, "C1") == "Received Quantity"
     assert _inline_cell_text(stock_xml, "D1") == "Required Quantity"
     assert _inline_cell_text(stock_xml, "E1") == "Remaining"
+    assert _inline_cell_text(stock_xml, "F1") == "Manufacturer Cost Each"
+    assert _inline_cell_text(stock_xml, "G1") == "Required Manufacturer Value"
+    assert _inline_cell_text(stock_xml, "H1") == "Intake Match Status"
     summary_by_sku = {row["SKU"]: row for row in stock_rows if row.get("SKU") in {"(1) CORE", "(2) EXTRA", "(3) ORDERONLY"}}
 
     assert summary_by_sku["(1) CORE"]["Product Name"] == "Core Game"
     assert int(summary_by_sku["(1) CORE"]["Received Quantity"]) == 10
     assert int(summary_by_sku["(1) CORE"]["Required Quantity"]) == 5
     assert int(summary_by_sku["(1) CORE"]["Remaining"]) == 5
+    assert float(summary_by_sku["(1) CORE"]["Required Manufacturer Value"]) == 0.5
+    assert summary_by_sku["(1) CORE"]["Intake Match Status"] == "OK"
     assert summary_by_sku["(2) EXTRA"]["Product Name"] == "Extra Item"
     assert int(summary_by_sku["(2) EXTRA"]["Received Quantity"]) == 6
     assert int(summary_by_sku["(2) EXTRA"]["Required Quantity"]) == 0
     assert int(summary_by_sku["(2) EXTRA"]["Remaining"]) == 6
+    assert float(summary_by_sku["(2) EXTRA"]["Required Manufacturer Value"]) == 0.0
+    assert summary_by_sku["(2) EXTRA"]["Intake Match Status"] == "Zero needed"
     assert summary_by_sku["(3) ORDERONLY"]["Product Name"] == ""
     assert int(summary_by_sku["(3) ORDERONLY"]["Received Quantity"]) == 0
     assert int(summary_by_sku["(3) ORDERONLY"]["Required Quantity"]) == 4
     assert int(summary_by_sku["(3) ORDERONLY"]["Remaining"]) == -4
+    assert summary_by_sku["(3) ORDERONLY"]["Manufacturer Cost Each"] == ""
+    assert summary_by_sku["(3) ORDERONLY"]["Required Manufacturer Value"] == ""
+    assert summary_by_sku["(3) ORDERONLY"]["Intake Match Status"] == "Missing from intake"
 
 
 def test_optimize_workbook_returns_config_warnings_for_unsupported_overrides(tmp_path):
@@ -3790,8 +3945,7 @@ def test_label_rows_print_in_full_master_country_group_order():
 
 
 def test_country_scan_sheets_follow_master_sheet_and_group_row_order_without_empty_tabs():
-    sheets = workflow_module._country_scan_sheets(
-        [
+    label_rows = [
             {"Country": "Germany", "Barcode/QR Value": "XX-1"},
             {"Country": "Mexico", "Barcode/QR Value": "MX-1"},
             {"Country": "Canada", "Barcode/QR Value": "CA-1"},
@@ -3819,7 +3973,8 @@ def test_country_scan_sheets_follow_master_sheet_and_group_row_order_without_emp
             {"Country": "India", "Barcode/QR Value": "IN-1"},
             {"Country": "Brazil", "Barcode/QR Value": "BR-1"},
         ]
-    )
+    sheets = workflow_module._country_scan_sheets(label_rows)
+    all_packages_rows = workflow_module._all_packages_scan_rows(label_rows, campaign_name="Long Campaign")
 
     assert list(sheets) == [
         "United States",
@@ -3861,6 +4016,21 @@ def test_country_scan_sheets_follow_master_sheet_and_group_row_order_without_emp
     assert "China" not in sheets
     assert "Hong Kong" not in sheets
     assert "Bahrain" not in sheets
+    assert [row["Country Group"] for row in all_packages_rows] == list(
+        country_group
+        for country_group, country_rows in sheets.items()
+        for _row in country_rows
+    )
+    assert [row["Country"] for row in all_packages_rows] == [
+        "United States", "Australia", "New Zealand", "Bahrain", "Kuwait", "Oman", "Saudi Arabia",
+        "United Arab Emirates", "Brazil", "Canada", "China", "Hong Kong", "India", "Indonesia",
+        "Israel", "Japan", "South Korea", "Malaysia", "Mexico", "Philippines", "Singapore",
+        "South Africa", "Taiwan", "Thailand", "Vietnam", "Germany",
+    ]
+    assert [row["VFI # / package barcode"] for row in all_packages_rows] == [
+        row["VFI #"] for country_rows in sheets.values() for row in country_rows
+    ]
+    assert all(row["Campaign"] == "Long Campaign" for row in all_packages_rows)
 
 
 def test_country_scan_sheets_use_grouped_tab_when_only_one_group_country_is_present():
@@ -4539,7 +4709,17 @@ def test_workbook_cost_summary_removes_country_number_and_scan_tabs_use_label_vf
     workbook = read_workbook(str(output_path))
     sheet_names = _workbook_sheet_names(output_path)
     labels_index = sheet_names.index("Labels")
-    assert sheet_names[labels_index + 1 : labels_index + 3] == ["China-HK", "Singapore"]
+    assert sheet_names[labels_index + 1 : labels_index + 4] == ["All Packages Scan", "China-HK", "Singapore"]
+
+    all_packages_scan = _sheet_rows(output_path, "All Packages Scan")
+    assert [row["VFI # / package barcode"] for row in all_packages_scan] == ["1 TEST", "2 TEST", "3 TEST"]
+    assert [row["Country Group"] for row in all_packages_scan] == ["China-HK", "China-HK", "Singapore"]
+    assert [row["Country"] for row in all_packages_scan] == ["Hong Kong", "Hong Kong", "Singapore"]
+    all_packages_xml = _sheet_xml(output_path, "All Packages Scan")
+    assert _cell_formula(all_packages_xml, "F2") == (
+        'IFERROR(IF(INDEX(\'Actual Dimensions\'!$A:$A,MATCH($E2,\'Actual Dimensions\'!$A:$A,0))="",'
+        '"",INDEX(\'Actual Dimensions\'!$B:$B,MATCH($E2,\'Actual Dimensions\'!$A:$A,0))),"")'
+    )
 
     cost_rows = _sheet_rows(output_path, "Cost Summary")
     assert "Country Number" not in cost_rows[0]
@@ -4806,9 +4986,11 @@ def test_country_scan_multi_package_rows_lookup_actual_dimensions_by_package_bar
             expected_scan_barcodes=["15  p1 of 2 ITFFKS1", "15  p2 of 2 ITFFKS1"]
         ),
         country_scan_sheets=sheets,
+        all_packages_scan_rows=workflow_module._all_packages_scan_rows(label_rows, campaign_name="TEST Campaign"),
     )
 
     hong_kong_xml = _sheet_xml(output_path, "China-HK")
+    all_packages_xml = _sheet_xml(output_path, "All Packages Scan")
 
     assert _inline_cell_text(hong_kong_xml, "A2") == ""
     assert _inline_cell_text(hong_kong_xml, "A3") == ""
@@ -4833,6 +5015,13 @@ def test_country_scan_multi_package_rows_lookup_actual_dimensions_by_package_bar
     assert _cell_formula(hong_kong_xml, "E2") == (
         'IFERROR(IF(INDEX(\'Actual Dimensions\'!$A:$A,MATCH($C2,\'Actual Dimensions\'!$A:$A,0))="",'
         '"",INDEX(\'Actual Dimensions\'!$C:$C,MATCH($C2,\'Actual Dimensions\'!$A:$A,0))),"")'
+    )
+    assert [_inline_cell_text(all_packages_xml, cell) for cell in ["E2", "E3"]] == [
+        "15  p1 of 2 ITFFKS1", "15  p2 of 2 ITFFKS1",
+    ]
+    assert _cell_formula(all_packages_xml, "F2") == (
+        'IFERROR(IF(INDEX(\'Actual Dimensions\'!$A:$A,MATCH($E2,\'Actual Dimensions\'!$A:$A,0))="",'
+        '"",INDEX(\'Actual Dimensions\'!$B:$B,MATCH($E2,\'Actual Dimensions\'!$A:$A,0))),"")'
     )
     assert _cell_formula(hong_kong_xml, "F2") == (
         'IFERROR(IF(INDEX(\'Actual Dimensions\'!$A:$A,MATCH($C2,\'Actual Dimensions\'!$A:$A,0))="",'
@@ -7039,7 +7228,7 @@ def test_fast_production_workbook_keeps_operational_sheets_and_internal_calculat
 
     sheet_names = _workbook_sheet_names(output_path)
     assert sheet_names[:5] == ["Summary", "Cost Summary", "Stock Count", "Actual Dimensions", "Labels"]
-    for required_sheet in ["United States", "Canada", "VFI Intake Form", "Optimized to Pack", "Box Size Summary"]:
+    for required_sheet in ["All Packages Scan", "United States", "Canada", "VFI Intake Form", "Optimized to Pack", "Box Size Summary", "Intake Form Review"]:
         assert required_sheet in sheet_names
     for skipped_sheet in [
         "Label generator",

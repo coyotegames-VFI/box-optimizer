@@ -8,6 +8,7 @@ import re
 import time
 import zipfile
 from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from xml.etree import ElementTree
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -122,6 +123,40 @@ DEFAULT_CONFIG = {
 }
 
 SEPARATE_PLAYMAT_CHARGE_AMOUNT = 6.0
+
+# Base manufacturer value model.  Dimensions are original SKU dimensions in cm;
+# padding, carton dimensions, and country adjustments are deliberately excluded.
+MANUFACTURER_VALUE_PALLET_LENGTH_IN = 42
+MANUFACTURER_VALUE_PALLET_WIDTH_IN = 42
+MANUFACTURER_VALUE_PALLET_HEIGHT_IN = 72
+MANUFACTURER_VALUE_PALLET_COST_USD = 1500
+MANUFACTURER_VALUE_MIN_EACH_USD = 0.01
+_INCH_TO_CM = Decimal("2.54")
+MANUFACTURER_VALUE_PER_CM3 = (
+    Decimal(str(MANUFACTURER_VALUE_PALLET_COST_USD))
+    / (
+        Decimal(str(MANUFACTURER_VALUE_PALLET_LENGTH_IN))
+        * _INCH_TO_CM
+        * Decimal(str(MANUFACTURER_VALUE_PALLET_WIDTH_IN))
+        * _INCH_TO_CM
+        * Decimal(str(MANUFACTURER_VALUE_PALLET_HEIGHT_IN))
+        * _INCH_TO_CM
+    )
+)
+MANUFACTURER_COST_BASIS_TEXT = "L×W×H×$0.0007206/cm³, min $0.01, roundup"
+
+
+def manufacturer_cost_each(length_cm: object, width_cm: object, height_cm: object) -> Decimal | None:
+    """Return the base manufacturer cost for one valid, original-dimension SKU."""
+    try:
+        dimensions = tuple(Decimal(str(value)) for value in (length_cm, width_cm, height_cm))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if any(not value.is_finite() or value <= 0 for value in dimensions):
+        return None
+    raw_cost = dimensions[0] * dimensions[1] * dimensions[2] * MANUFACTURER_VALUE_PER_CM3
+    rounded_up = raw_cost.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    return max(Decimal(str(MANUFACTURER_VALUE_MIN_EACH_USD)), rounded_up)
 
 
 logger = logging.getLogger("box_optimizer")
@@ -3824,6 +3859,32 @@ def _clean_summary_rows(
         if not entry["Detail"]:
             entry["Detail"] = f"{box.get('Length cm', '')}x{box.get('Width cm', '')}x{box.get('Height cm', '')} cm"
     rows.extend(sorted(boxes_by_base.values(), key=lambda row: _summary_box_sort_key(row["Metric"])))
+    stock_count_rows = sku_intake_summary_rows or []
+    missing_from_intake_count = sum(
+        row.get("Intake Match Status") == "Missing from intake" for row in stock_count_rows
+    )
+    zero_needed_intake_sku_count = sum(
+        row.get("Intake Match Status") == "Zero needed" for row in stock_count_rows
+    )
+    required_sku_count = sum(
+        _parse_report_quantity(row.get("Required Quantity", 0)) > 0 for row in stock_count_rows
+    )
+    intake_sku_count = len(stock_count_rows) - missing_from_intake_count
+    rows.extend(
+        [
+            {"Section": "Intake Reconciliation", "Metric": "Intake SKU count", "Value": intake_sku_count, "Detail": ""},
+            {"Section": "Intake Reconciliation", "Metric": "Stock Count SKU count", "Value": len(stock_count_rows), "Detail": ""},
+            {"Section": "Intake Reconciliation", "Metric": "Required SKU count", "Value": required_sku_count, "Detail": ""},
+            {"Section": "Intake Reconciliation", "Metric": "Missing from intake count", "Value": missing_from_intake_count, "Detail": ""},
+            {"Section": "Intake Reconciliation", "Metric": "Zero-needed intake SKU count", "Value": zero_needed_intake_sku_count, "Detail": ""},
+            {
+                "Section": "Intake Reconciliation",
+                "Metric": "Intake reconciliation status",
+                "Value": "Review needed" if missing_from_intake_count else "OK",
+                "Detail": "",
+            },
+        ]
+    )
     if unmatched_rows:
         for unmatched in unmatched_rows[:20]:
             rows.append(
@@ -5363,11 +5424,8 @@ def _country_scan_metadata(row: dict) -> dict:
     return _country_scan_raw_intake_metadata(row)
 
 
-def _country_scan_sheets(
-    label_rows: list[dict],
-    rate_sheet: "CustomerRateSheet | None" = None,
-    campaign_name: str = "",
-) -> dict[str, list[dict]]:
+def _country_scan_entries(label_rows: list[dict]) -> tuple[dict[str, list[dict]], dict[str, list[str]]]:
+    """Prepare the ordered package rows shared by country and combined scan sheets."""
     entries_by_sheet: dict[str, list[dict]] = {}
     metadata_keys_by_sheet: dict[str, list[str]] = {}
     main_rows = [row for row in label_rows if not row.get("Label Continuation")]
@@ -5417,36 +5475,55 @@ def _country_scan_sheets(
                 "metadata": metadata,
                 "items_in_box": row.get("Total Units", ""),
                 "items": _label_row_items_text(row),
+                # Label SKUs are package contents, unlike carton dimensions or
+                # display-only labels.  Keep this source private to the scan row.
+                "sku_breakdown": row.get("Label SKUs in Box") or row.get("SKUs in Box") or row.get("SKU Breakdown", ""),
                 "country_rank": _master_country_sort_parts(country),
                 "row_rank": main_row_rank.get(id(row), 0),
             }
         )
-    sheets: dict[str, list[dict]] = {}
-    actual_dimensions = _excel_quote_sheet_name("Actual Dimensions")
     for sheet_name, entries in entries_by_sheet.items():
         if sheet_name != NON_HUB_COUNTRIES_TAB_NAME:
-            entries = sorted(entries, key=lambda entry: (entry["country_rank"], entry["row_rank"]))
+            entries.sort(key=lambda entry: (entry["country_rank"], entry["row_rank"]))
+    return entries_by_sheet, metadata_keys_by_sheet
+
+
+def _country_scan_actual_dimension_formulas(row_index: int, barcode_column: str) -> dict[str, ExcelFormula]:
+    actual_dimensions = _excel_quote_sheet_name("Actual Dimensions")
+    scan_match = f'MATCH(${barcode_column}{row_index},{actual_dimensions}!$A:$A,0)'
+    actual_scan_value = f'INDEX({actual_dimensions}!$A:$A,{scan_match})'
+    return {
+        COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS: ExcelFormula(
+            f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$B:$B,{scan_match})),"")'
+        ),
+        COUNTRY_SCAN_ACTUAL_DIM_LENGTH: ExcelFormula(
+            f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$C:$C,{scan_match})),"")'
+        ),
+        COUNTRY_SCAN_ACTUAL_DIM_WIDTH: ExcelFormula(
+            f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$D:$D,{scan_match})),"")'
+        ),
+        COUNTRY_SCAN_ACTUAL_DIM_HEIGHT: ExcelFormula(
+            f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$E:$E,{scan_match})),"")'
+        ),
+    }
+
+
+def _country_scan_sheets(
+    label_rows: list[dict],
+    rate_sheet: "CustomerRateSheet | None" = None,
+    campaign_name: str = "",
+) -> dict[str, list[dict]]:
+    entries_by_sheet, metadata_keys_by_sheet = _country_scan_entries(label_rows)
+    sheets: dict[str, list[dict]] = {}
+    for sheet_name, entries in entries_by_sheet.items():
         metadata_keys = metadata_keys_by_sheet.get(sheet_name, [])
         sheets[sheet_name] = []
         for row_index, entry in enumerate(entries, start=2):
-            scan_match = f'MATCH($C{row_index},{actual_dimensions}!$A:$A,0)'
-            actual_scan_value = f'INDEX({actual_dimensions}!$A:$A,{scan_match})'
             scan_row = {
                 "Pallet ID": "",
                 "Campaign": campaign_name,
                 "VFI #": entry["vfi"],
-                COUNTRY_SCAN_ACTUAL_WEIGHT_GRAMS: ExcelFormula(
-                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$B:$B,{scan_match})),"")'
-                ),
-                COUNTRY_SCAN_ACTUAL_DIM_LENGTH: ExcelFormula(
-                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$C:$C,{scan_match})),"")'
-                ),
-                COUNTRY_SCAN_ACTUAL_DIM_WIDTH: ExcelFormula(
-                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$D:$D,{scan_match})),"")'
-                ),
-                COUNTRY_SCAN_ACTUAL_DIM_HEIGHT: ExcelFormula(
-                    f'IFERROR(IF({actual_scan_value}="","",INDEX({actual_dimensions}!$E:$E,{scan_match})),"")'
-                ),
+                **_country_scan_actual_dimension_formulas(row_index, "C"),
             }
             for key in metadata_keys:
                 scan_row[key] = entry["metadata"].get(key, "")
@@ -5459,6 +5536,75 @@ def _country_scan_sheets(
             scan_row["Items in this box / SKU contents"] = entry["items"]
             sheets[sheet_name].append(scan_row)
     return sheets
+
+
+def _manufacturer_costs_by_sku(sku_items: list[SKUItem]) -> dict[str, tuple[str, Decimal | None]]:
+    """Map original SKU identities to base costs calculated before padding."""
+    costs = {}
+    for item in sku_items:
+        sku = str(item.raw_sku or item.canonical_sku or "").strip()
+        key = _sku_key_for_report(item.canonical_sku or item.raw_sku)
+        if key and key not in costs:
+            costs[key] = (sku, manufacturer_cost_each(item.length_cm, item.width_cm, item.height_cm))
+    return costs
+
+
+def _package_manufacturer_value(sku_breakdown: object, sku_costs: dict[str, tuple[str, Decimal | None]]) -> tuple[Decimal | None, str]:
+    """Return a package's base value from original SKU counts, never bundle dimensions."""
+    quantities = _sku_quantities_from_breakdown(sku_breakdown)
+    expanded_quantities: Counter[str] = Counter()
+    for sku, quantity in quantities.items():
+        bundle_members = _bundle_member_counts(sku, quantity)
+        if bundle_members:
+            expanded_quantities.update(bundle_members)
+        else:
+            # Worker labels may include a display-only pick-number prefix.
+            clean_sku = re.sub(r"^\(\d+\)\s*", "", sku).strip()
+            expanded_quantities[clean_sku] += quantity
+
+    contributions = []
+    total = Decimal("0.00")
+    has_missing_cost = False
+    for sku, quantity in expanded_quantities.items():
+        entry = sku_costs.get(_sku_key_for_report(sku))
+        if not entry or entry[1] is None:
+            contributions.append(f"{sku} x{quantity} @ unavailable")
+            has_missing_cost = True
+            continue
+        original_sku, unit_cost = entry
+        contribution = unit_cost * quantity
+        total += contribution
+        contributions.append(
+            f"{original_sku} x{quantity} @ ${unit_cost:.2f} = ${contribution:.2f}"
+        )
+    return (None if has_missing_cost else total, " | ".join(contributions))
+
+
+def _all_packages_scan_rows(
+    label_rows: list[dict],
+    campaign_name: str = "",
+    sku_items: list[SKUItem] | None = None,
+) -> list[dict]:
+    """Build the worker-facing combined scan/export sheet from country scan entries."""
+    entries_by_sheet, _metadata_keys_by_sheet = _country_scan_entries(label_rows)
+    sku_costs = _manufacturer_costs_by_sku(sku_items or [])
+    rows = []
+    for country_group, entries in entries_by_sheet.items():
+        for row_index, entry in enumerate(entries, start=len(rows) + 2):
+            declared_value, package_item_values = _package_manufacturer_value(entry["sku_breakdown"], sku_costs)
+            rows.append(
+                {
+                    "Pallet ID": "",
+                    "Country Group": country_group,
+                    "Country": entry["country"],
+                    "Campaign": campaign_name,
+                    "VFI # / package barcode": entry["vfi"],
+                    **_country_scan_actual_dimension_formulas(row_index, "E"),
+                    "Declared value": float(declared_value) if declared_value is not None else "",
+                    "Package item values": package_item_values,
+                }
+            )
+    return rows
 
 
 def _label_row_items_text(row: dict) -> str:
@@ -6016,11 +6162,109 @@ def _sku_from_intake_row(row: dict) -> str:
     return ""
 
 
+_INTAKE_REVIEW_SKU_HEADERS = {
+    "sku",
+    "itemsku",
+    "productsku",
+    "productid",
+    "item",
+    "itemnumber",
+}
+_INTAKE_REVIEW_PRODUCT_NAME_HEADERS = {
+    "productname",
+    "product",
+    "productdescription",
+    "name",
+    "itemname",
+    "description",
+}
+_INTAKE_REVIEW_LENGTH_HEADERS = {"length", "lengthcm", "lengthmm", "lengthin", "l", "lcm", "lmm", "lin"}
+_INTAKE_REVIEW_WIDTH_HEADERS = {"width", "widthcm", "widthmm", "widthin", "w", "wcm", "wmm", "win"}
+_INTAKE_REVIEW_HEIGHT_HEADERS = {
+    "height", "heightcm", "heightmm", "heightin", "h", "hcm", "hmm", "hin", "depth", "depthcm", "depthmm", "depthin",
+}
+_INTAKE_REVIEW_WEIGHT_HEADERS = {"weight", "weightkg", "weightg", "weightlb", "weightlbs", "weightoz", "kg", "g", "lb", "lbs", "oz"}
+_INTAKE_REVIEW_SENSITIVE_HEADER_HINTS = {
+    "address",
+    "backer",
+    "customer",
+    "email",
+    "phone",
+    "postal",
+    "shipping",
+}
+
+
+def _intake_review_header_key(value: object) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").casefold())
+
+
+def _intake_review_source_value(row: dict, header_keys: set[str]) -> object:
+    for header, value in row.items():
+        if _intake_review_header_key(header) in header_keys:
+            return value
+    return ""
+
+
+def _is_safe_intake_review_source_header(header: object) -> bool:
+    header_key = _intake_review_header_key(header)
+    return bool(header_key) and not any(hint in header_key for hint in _INTAKE_REVIEW_SENSITIVE_HEADER_HINTS)
+
+
+def _intake_form_review_rows(
+    intake_rows: list[dict],
+    sku_items: list[SKUItem],
+) -> list[dict]:
+    """Build a worker-facing, normalized view while retaining intake row order."""
+    sku_items_by_key: dict[str, SKUItem] = {}
+    for item in sku_items:
+        sku_key = _sku_key_for_report(item.canonical_sku or item.raw_sku)
+        if sku_key:
+            sku_items_by_key.setdefault(sku_key, item)
+
+    review_rows = []
+    for source_row in intake_rows:
+        sku = str(_intake_review_source_value(source_row, _INTAKE_REVIEW_SKU_HEADERS) or "").strip()
+        if not sku:
+            continue
+        item = sku_items_by_key.get(_sku_key_for_report(sku))
+        product_name = _intake_review_source_value(source_row, _INTAKE_REVIEW_PRODUCT_NAME_HEADERS)
+        manufacturer_cost = (
+            manufacturer_cost_each(item.length_cm, item.width_cm, item.height_cm) if item else None
+        )
+        review_row = {
+            "SKU": sku,
+            # Use the source value so a missing product name remains blank rather than
+            # inheriting the reader's raw-SKU fallback.
+            "Product Name": product_name,
+            "Length": item.length_cm if item else _intake_review_source_value(source_row, _INTAKE_REVIEW_LENGTH_HEADERS),
+            "Width": item.width_cm if item else _intake_review_source_value(source_row, _INTAKE_REVIEW_WIDTH_HEADERS),
+            "Height": item.height_cm if item else _intake_review_source_value(source_row, _INTAKE_REVIEW_HEIGHT_HEADERS),
+            "Weight": item.weight_kg if item else _intake_review_source_value(source_row, _INTAKE_REVIEW_WEIGHT_HEADERS),
+            "Received Quantity": _received_quantity_value(source_row),
+            "Manufacturer Cost Each": float(manufacturer_cost) if manufacturer_cost is not None else "",
+            "Manufacturer Cost Basis": MANUFACTURER_COST_BASIS_TEXT if manufacturer_cost is not None else "",
+        }
+        for header, value in source_row.items():
+            header_key = _intake_review_header_key(header)
+            if (
+                header_key in _INTAKE_REVIEW_SKU_HEADERS
+                or header_key in _INTAKE_REVIEW_PRODUCT_NAME_HEADERS
+                or _is_received_quantity_header(header)
+                or not _is_safe_intake_review_source_header(header)
+            ):
+                continue
+            review_row.setdefault(str(header), value)
+        review_rows.append(review_row)
+    return review_rows
+
+
 def _sku_intake_summary_rows(
     sku_items: list[SKUItem],
     order_lines: list[OrderLine],
     vfi_intake_form_rows: list[dict],
 ) -> list[dict]:
+    manufacturer_cost_by_sku = _manufacturer_costs_by_sku(sku_items)
     received_by_sku: dict[str, int] = {}
     product_name_by_sku: dict[str, str] = {}
     for row in vfi_intake_form_rows:
@@ -6035,6 +6279,18 @@ def _sku_intake_summary_rows(
 
     required_by_sku: Counter[str] = Counter()
     raw_by_sku: dict[str, str] = {}
+    intake_sku_keys: set[str] = set()
+    for row in vfi_intake_form_rows:
+        sku_key = _sku_key_for_report(_sku_from_intake_row(row))
+        if sku_key and sku_key != "SKU":
+            intake_sku_keys.add(sku_key)
+    for item in sku_items:
+        sku_key = _sku_key_for_report(item.canonical_sku or item.raw_sku)
+        if sku_key:
+            intake_sku_keys.add(sku_key)
+            raw_by_sku.setdefault(sku_key, item.raw_sku or item.canonical_sku)
+            if item.product_name and sku_key not in product_name_by_sku:
+                product_name_by_sku[sku_key] = item.product_name
     for line in order_lines:
         sku = line.canonical_sku or line.raw_sku
         sku_key = _sku_key_for_report(sku)
@@ -6043,17 +6299,11 @@ def _sku_intake_summary_rows(
         required_by_sku[sku_key] += int(line.quantity or 0)
         raw_by_sku.setdefault(sku_key, str(sku))
 
+    # The source intake form is the worker's source of truth, so its order must
+    # drive Stock Count.  Parsed SKU items are only a fallback for intake rows
+    # that could not be preserved verbatim.
     ordered_keys: list[str] = []
     seen = set()
-    for item in sku_items:
-        sku_key = _sku_key_for_report(item.canonical_sku or item.raw_sku)
-        if not sku_key or sku_key in seen:
-            continue
-        seen.add(sku_key)
-        ordered_keys.append(sku_key)
-        raw_by_sku.setdefault(sku_key, item.raw_sku or item.canonical_sku)
-        if item.product_name and sku_key not in product_name_by_sku:
-            product_name_by_sku[sku_key] = item.product_name
     for row in vfi_intake_form_rows:
         sku = _sku_from_intake_row(row)
         sku_key = _sku_key_for_report(sku)
@@ -6062,6 +6312,13 @@ def _sku_intake_summary_rows(
         seen.add(sku_key)
         ordered_keys.append(sku_key)
         raw_by_sku.setdefault(sku_key, sku)
+    for item in sku_items:
+        sku_key = _sku_key_for_report(item.canonical_sku or item.raw_sku)
+        if not sku_key or sku_key in seen:
+            continue
+        seen.add(sku_key)
+        ordered_keys.append(sku_key)
+        raw_by_sku.setdefault(sku_key, item.raw_sku or item.canonical_sku)
     for line in order_lines:
         sku_key = _sku_key_for_report(line.canonical_sku or line.raw_sku)
         if not sku_key or sku_key in seen:
@@ -6075,6 +6332,8 @@ def _sku_intake_summary_rows(
         received = received_by_sku.get(sku_key, 0)
         required = int(required_by_sku.get(sku_key, 0))
         raw_sku = raw_by_sku.get(sku_key, sku_key)
+        cost_entry = manufacturer_cost_by_sku.get(sku_key)
+        manufacturer_cost = cost_entry[1] if cost_entry else None
         rows.append(
             {
                 "SKU": f"({pick_index}) {raw_sku}",
@@ -6082,6 +6341,11 @@ def _sku_intake_summary_rows(
                 "Received Quantity": received,
                 "Required Quantity": required,
                 "Remaining": received - required,
+                "Manufacturer Cost Each": float(manufacturer_cost) if manufacturer_cost is not None else "",
+                "Required Manufacturer Value": float(manufacturer_cost * required) if manufacturer_cost is not None else "",
+                "Intake Match Status": "Missing from intake"
+                if sku_key not in intake_sku_keys
+                else "OK" if required > 0 else "Zero needed",
             }
         )
     return rows
@@ -7585,6 +7849,7 @@ def optimize_workbook(
     )
     vfi_intake_sources = _vfi_intake_source_rows(sku_master_path)
     vfi_intake_form_rows = _vfi_intake_form_rows_from_sources(vfi_intake_sources)
+    intake_form_review_rows = _intake_form_review_rows(vfi_intake_form_rows, intake.sku_items)
     sku_intake_summary_rows = _sku_intake_summary_rows(
         intake.sku_items,
         intake.order_lines,
@@ -7611,6 +7876,7 @@ def optimize_workbook(
     order_rows = _rows_in_final_label_order(order_rows, labels_rows)
     cost_order_summary_rows = _rows_in_final_label_order(cost_order_summary_rows, labels_rows)
     country_scan_sheets = _country_scan_sheets(labels_rows, rate_selection.sheet, _campaign_name(cfg))
+    all_packages_scan_rows = _all_packages_scan_rows(labels_rows, _campaign_name(cfg), intake.sku_items)
     if cfg["preserve_region_sheets"]:
         rows_by_region = defaultdict(list)
         for row in order_rows:
@@ -7666,10 +7932,12 @@ def optimize_workbook(
         actual_lookup_rows=actual_lookup_rows,
         actual_rate_rows=actual_rate_rows,
         vfi_intake_form_rows=vfi_intake_form_rows,
+        intake_form_review_rows=intake_form_review_rows,
         optimized_to_pack_rows=optimized_to_pack_rows,
         label_generator_rows=label_generator_rows,
         labels_rows=labels_rows,
         country_scan_sheets=country_scan_sheets,
+        all_packages_scan_rows=all_packages_scan_rows,
         workbook_output_mode=workbook_output_mode,
         order_volume_weights_rows=order_rows,
         box_size_summary_rows=box_size_rows,
@@ -7718,10 +7986,12 @@ def optimize_workbook(
         actual_lookup_rows=actual_lookup_rows,
         actual_rate_rows=actual_rate_rows,
         vfi_intake_form_rows=vfi_intake_form_rows,
+        intake_form_review_rows=intake_form_review_rows,
         optimized_to_pack_rows=optimized_to_pack_rows,
         label_generator_rows=label_generator_rows,
         labels_rows=labels_rows,
         country_scan_sheets=country_scan_sheets,
+        all_packages_scan_rows=all_packages_scan_rows,
         workbook_output_mode=workbook_output_mode,
         order_volume_weights_rows=order_rows,
         box_size_summary_rows=box_size_rows,

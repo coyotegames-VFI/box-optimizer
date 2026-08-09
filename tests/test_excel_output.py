@@ -181,7 +181,7 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
 
     sheet_names = _workbook_sheet_names(path)
 
-    assert sheet_names[:10] == [
+    assert sheet_names[:11] == [
         "Summary",
         "Cost Summary",
         "Stock Count",
@@ -192,8 +192,27 @@ def test_write_workbook_creates_required_tabs_first_in_exact_order(tmp_path):
         "Label generator",
         "Order Volume Weights",
         "Box Size Summary",
+        "Intake Form Review",
     ]
-    assert sheet_names[10:] == ["Unmatched SKUs"]
+    assert sheet_names[11:] == ["Unmatched SKUs"]
+
+
+def test_write_workbook_intake_form_review_has_worker_columns_and_preserves_row_order(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        intake_form_review_rows=[
+            {"SKU": "SECOND", "Product Name": "Second item", "Length": 10, "Width": 8, "Height": 4, "Weight": 1.25, "Received Quantity": 12},
+            {"SKU": "FIRST", "Product Name": "", "Length": 6, "Width": 5, "Height": 2, "Weight": 0.5, "Received Quantity": 4},
+        ],
+    )
+
+    review_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "Intake Form Review")
+
+    assert list(review_rows[0])[:7] == ["SKU", "Product Name", "Length (cm)", "Width (cm)", "Height (cm)", "Weight (kg)", "Received Quantity"]
+    assert [row["SKU"] for row in review_rows] == ["SECOND", "FIRST"]
+    assert review_rows[1]["Product Name"] == ""
 
 
 def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
@@ -230,6 +249,7 @@ def test_write_workbook_fast_production_skips_helper_and_detail_tabs(tmp_path):
         "VFI Intake Form",
         "Optimized to Pack",
         "Box Size Summary",
+        "Intake Form Review",
         "Errors and Warnings",
     ]
     assert "Label generator" not in sheet_names
@@ -1287,6 +1307,38 @@ def test_country_scan_tabs_are_inserted_after_labels(tmp_path):
     assert _inline_cell_text(hong_kong_xml, "A2") == ""
 
 
+def test_all_packages_scan_is_inserted_after_labels_before_country_tabs(tmp_path):
+    path = tmp_path / "report.xlsx"
+
+    write_workbook(
+        str(path),
+        labels_rows=[{"Label Number": "39", "Barcode/QR Value": "OPR 39"}],
+        all_packages_scan_rows=[
+            {
+                "Pallet ID": "",
+                "Country Group": "China-HK",
+                "Country": "Hong Kong",
+                "Campaign": "Sordane",
+                "VFI # / package barcode": "OPR 39",
+                "Actual weight g": ExcelFormula('IFERROR(MATCH($E2,\'Actual Dimensions\'!$A:$A,0),"")'),
+                "Actual DIM L": ExcelFormula('IFERROR(MATCH($E2,\'Actual Dimensions\'!$A:$A,0),"")'),
+                "Actual DIM W": ExcelFormula('IFERROR(MATCH($E2,\'Actual Dimensions\'!$A:$A,0),"")'),
+                "Actual DIM H": ExcelFormula('IFERROR(MATCH($E2,\'Actual Dimensions\'!$A:$A,0),"")'),
+            }
+        ],
+        country_scan_sheets={"China-HK": [{"Campaign": "Sordane", "VFI #": "OPR 39"}]},
+    )
+
+    sheet_names = _workbook_sheet_names(path)
+    labels_index = sheet_names.index("Labels")
+    assert sheet_names[labels_index + 1 : labels_index + 3] == ["All Packages Scan", "China-HK"]
+    all_packages_rows = next(sheet.rows for sheet in read_workbook(str(path)) if sheet.sheet_name == "All Packages Scan")
+    assert list(all_packages_rows[0]) == [
+        "Pallet ID", "Country Group", "Country", "Campaign", "VFI # / package barcode",
+        "Actual weight g", "Actual DIM L", "Actual DIM W", "Actual DIM H", "Declared value", "Package item values",
+    ]
+
+
 def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
     path = tmp_path / "report.xlsx"
 
@@ -1309,6 +1361,7 @@ def test_write_workbook_creates_optional_detail_tabs_when_rows_exist(tmp_path):
         "Label generator",
         "Order Volume Weights",
         "Box Size Summary",
+        "Intake Form Review",
         "Multi Box Detail",
         "Packing Detail",
         "Input Column Mapping",

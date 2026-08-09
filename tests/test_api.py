@@ -1651,6 +1651,8 @@ def test_employee_upload_token_gets_worker_workbook_when_admin_upload_token_is_s
     assert "VFI Intake Form" in sheet_names
     assert "Optimized to Pack" in sheet_names
     assert "Box Size Summary" in sheet_names
+    assert "Intake Form Review" in sheet_names
+    assert "All Packages Scan" in sheet_names
     assert "Label generator" not in sheet_names
     assert "Order Volume Weights" not in sheet_names
     assert "Debug Summary" not in sheet_names
@@ -1692,6 +1694,8 @@ def test_admin_upload_token_gets_full_workbook_when_admin_upload_token_is_set(mo
     assert "Label generator" in sheet_names
     assert "Order Volume Weights" in sheet_names
     assert "Region - NA" in sheet_names
+    assert "Intake Form Review" in sheet_names
+    assert "All Packages Scan" in sheet_names
     workbook_text = _xlsx_xml_text(download.content)
     assert "Output Mode" in workbook_text
     assert "Admin" in workbook_text

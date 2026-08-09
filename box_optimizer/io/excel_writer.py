@@ -21,6 +21,7 @@ REQUIRED_SHEETS = [
     "Label generator",
     "Order Volume Weights",
     "Box Size Summary",
+    "Intake Form Review",
 ]
 
 OPTIONAL_SHEETS = [
@@ -47,6 +48,32 @@ FAST_PRODUCTION_SKIPPED_SHEETS = {
 
 MAX_LABELS_PER_SHEET = 1000
 MAX_MANUAL_ROW_BREAKS_PER_SHEET = 1026
+
+INTAKE_FORM_REVIEW_COLUMNS = [
+    "SKU",
+    "Product Name",
+    "Length",
+    "Width",
+    "Height",
+    "Weight",
+    "Received Quantity",
+    "Manufacturer Cost Each",
+    "Manufacturer Cost Basis",
+]
+
+ALL_PACKAGES_SCAN_COLUMNS = [
+    "Pallet ID",
+    "Country Group",
+    "Country",
+    "Campaign",
+    "VFI # / package barcode",
+    "Actual weight g",
+    "Actual DIM L",
+    "Actual DIM W",
+    "Actual DIM H",
+    "Declared value",
+    "Package item values",
+]
 
 ORDER_VOLUME_WEIGHTS_COLUMNS = [
     "Region",
@@ -260,6 +287,8 @@ def _cell_style_for_sheet_value(
                 return 20
         except (TypeError, ValueError):
             pass
+    if header in {"Manufacturer Cost Each", "Required Manufacturer Value", "Declared value"}:
+        return 19
     if sheet_name.startswith("Cost Summary") and header in {"Hub Shipping Fee (USD)", "Express (USD)"}:
         return 19
     if sheet_name.startswith("Cost Summary") and header == "Final cost":
@@ -836,6 +865,14 @@ def _headers_for_sheet(sheet_name: str, rows: list[dict]) -> list[str]:
     headers = []
     seen = set()
 
+    if sheet_name == "Intake Form Review":
+        headers.extend(INTAKE_FORM_REVIEW_COLUMNS)
+        seen.update(INTAKE_FORM_REVIEW_COLUMNS)
+
+    if sheet_name == "All Packages Scan":
+        headers.extend(ALL_PACKAGES_SCAN_COLUMNS)
+        seen.update(ALL_PACKAGES_SCAN_COLUMNS)
+
     if sheet_name == "Actual Dimensions":
         headers.extend(ACTUAL_DIMENSIONS_COLUMNS)
         seen.update(ACTUAL_DIMENSIONS_COLUMNS)
@@ -903,6 +940,10 @@ def _rows_to_table(sheet_name: str, rows: list[dict]) -> tuple[list[str], list[l
             return ACTUAL_DIMENSIONS_COLUMNS, []
         if sheet_name == "Order Volume Weights":
             return ORDER_VOLUME_WEIGHTS_COLUMNS, []
+        if sheet_name == "Intake Form Review":
+            return INTAKE_FORM_REVIEW_COLUMNS, []
+        if sheet_name == "All Packages Scan":
+            return ALL_PACKAGES_SCAN_COLUMNS, []
         return ["Note"], [["No records"]]
 
     headers = _headers_for_sheet(sheet_name, rows)
@@ -1351,6 +1392,7 @@ def _build_sheet_payloads(
     **named_rows: list[dict],
 ) -> list[tuple[str, object]]:
     country_scan_sheets = named_rows.pop("country_scan_sheets", None) or {}
+    all_packages_scan_rows = named_rows.pop("all_packages_scan_rows", None)
     invoice_payload = named_rows.pop("invoice_payload", None)
     output_mode = _normalized_workbook_output_mode(named_rows.pop("workbook_output_mode", "full"))
     payloads = {name: [] for name in REQUIRED_SHEETS}
@@ -1367,6 +1409,7 @@ def _build_sheet_payloads(
         "actual_lookup_rows": "_ActualLookupTable",
         "actual_rate_rows": "_ActualRateTable",
         "vfi_intake_form_rows": "VFI Intake Form",
+        "intake_form_review_rows": "Intake Form Review",
         "optimized_to_pack_rows": "Optimized to Pack",
         "label_generator_rows": "Label generator",
         "labels_rows": "Labels",
@@ -1395,7 +1438,7 @@ def _build_sheet_payloads(
         if payloads.get(name):
             ordered.append((name, payloads[name]))
 
-    if country_scan_sheets:
+    if country_scan_sheets or all_packages_scan_rows is not None:
         labels_indexes = [
             index
             for index, (name, _rows) in enumerate(ordered)
@@ -1403,10 +1446,16 @@ def _build_sheet_payloads(
         ]
         labels_index = labels_indexes[-1] if labels_indexes else None
         insert_index = len(ordered) if labels_index is None else labels_index + 1
-        for offset, (name, sheet_rows) in enumerate(country_scan_sheets.items()):
+        offset = 0
+        if all_packages_scan_rows is not None:
+            ordered.insert(insert_index, ("All Packages Scan", _country_scan_rows_with_pallet_id(all_packages_scan_rows)))
+            required_and_optional.add("All Packages Scan")
+            offset = 1
+        for name, sheet_rows in country_scan_sheets.items():
             if sheet_rows:
                 ordered.insert(insert_index + offset, (name, _country_scan_rows_with_pallet_id(sheet_rows)))
                 required_and_optional.add(name)
+                offset += 1
 
     for name, sheet_rows in payloads.items():
         if name not in required_and_optional and not name.startswith("Cost Summary -") and sheet_rows:
@@ -1431,8 +1480,10 @@ def _build_sheet_payloads(
             "VFI Intake Form",
             "Optimized to Pack",
             "Box Size Summary",
+            "Intake Form Review",
             "Errors and Warnings",
             "Invoice",
+            "All Packages Scan",
             *country_scan_sheets.keys(),
         }
         ordered = [
