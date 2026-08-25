@@ -864,8 +864,8 @@ def test_optimize_workbook_adds_actual_dimensions_after_cost_summary_with_barcod
     rate_rows = _sheet_rows(output_path, "_ActualRateTable")
     assert lookup_rows[0]["Country"] == "United States"
     assert lookup_rows[0]["Total Units"] == "1"
-    assert lookup_rows[0]["Pick / add-on fee"] == "2.0"
-    assert lookup_rows[0]["Quoted shipping cost"] == "15.35"
+    assert lookup_rows[0]["Pick / add-on fee"] == "3.0"
+    assert lookup_rows[0]["Quoted shipping cost"] == "16.35"
     assert lookup_rows[0]["Estimated weight g"]
     assert rate_rows[0]["Zone"] == "Zone USA"
     assert rate_rows[0]["Weight Band kg"] == "0.5"
@@ -6348,11 +6348,11 @@ def test_cost_summary_uses_customer_rate_sheet_for_zone_and_shipping_fee(tmp_pat
         {**workflow_module.DEFAULT_CONFIG, "rate_sheet_path": str(rate_path)},
     )
 
-    assert rows[0]["Hub Shipping Fee"] == 15.35
+    assert rows[0]["Hub Shipping Fee"] == 16.35
     assert rows[0]["Express"] == 0
     assert rows[0]["Shipping Method"] == "Review Needed"
     assert "Shipping method mapping missing" in rows[0]["Shipping Rate Note"]
-    assert rows[1]["Hub Shipping Fee"] == 24.5
+    assert rows[1]["Hub Shipping Fee"] == 25.5
     assert rows[1]["Express"] == 0
     assert rows[2]["Hub Shipping Fee"] == 25.0
     assert rows[2]["Express"] == 0
@@ -6406,11 +6406,11 @@ def test_cost_summary_adds_fixed_separate_playmat_charge_to_active_hub_fee(tmp_p
         sku_rules=sku_rules,
     )
 
-    assert rows[0]["Hub Shipping Fee"] == 27.85
+    assert rows[0]["Hub Shipping Fee"] == 28.85
     assert rows[0]["Express"] == 0
     assert "Separate Playmat Charge: 2 units x $6.00 = $12.00" in rows[0]["Shipping Rate Note"]
     assert "Separate Playmat Charge" not in rows[0]
-    assert workflow_module._cost_summary_total_cost(rows) == 27.85
+    assert workflow_module._cost_summary_total_cost(rows) == 28.85
     summary_rows = workflow_module._clean_summary_rows(
         {
             "orders_processed": 1,
@@ -6425,7 +6425,7 @@ def test_cost_summary_adds_fixed_separate_playmat_charge_to_active_hub_fee(tmp_p
         sku_rules,
     )
     total_row = next(row for row in summary_rows if row["Metric"] == "Total Chargeable Cost")
-    assert total_row["Value"] == 27.85
+    assert total_row["Value"] == 28.85
 
 
 def test_cost_summary_adds_fixed_separate_playmat_charge_to_express_fallback(tmp_path, monkeypatch):
@@ -6625,7 +6625,7 @@ def test_active_uploaded_rate_sheet_is_selected_over_default_rate_sheet(tmp_path
     assert selection.source == "active upload"
     assert selection.filename == "railway-rates.xlsx"
     assert selection.checksum_short == sha256_file(active_path)[:12]
-    assert rows[0]["Hub Shipping Fee"] == 12
+    assert rows[0]["Hub Shipping Fee"] == 13
 
 
 def test_default_rate_sheet_is_used_when_no_active_upload_exists(tmp_path, monkeypatch):
@@ -6643,7 +6643,7 @@ def test_default_rate_sheet_is_used_when_no_active_upload_exists(tmp_path, monke
 
     assert selection.source == "default fallback"
     assert selection.filename == "default-rates.xlsx"
-    assert rows[0]["Hub Shipping Fee"] == 32
+    assert rows[0]["Hub Shipping Fee"] == 33
 
 
 def test_invalid_active_rate_sheet_falls_back_to_default_and_reports_warning(tmp_path, monkeypatch):
@@ -6665,7 +6665,7 @@ def test_invalid_active_rate_sheet_falls_back_to_default_and_reports_warning(tmp
     assert selection.source == "default fallback"
     assert selection.filename == "default-rates.xlsx"
     assert "Active rate sheet invalid" in selection.warning
-    assert rows[0]["Hub Shipping Fee"] == 42
+    assert rows[0]["Hub Shipping Fee"] == 43
 
 
 def test_summary_audit_rows_show_rate_sheet_source_and_checksum(tmp_path, monkeypatch):
@@ -6767,7 +6767,7 @@ def test_rate_sheet_sync_downloads_railway_sheet_when_checksum_differs(tmp_path,
     )
     metadata = json.loads(rate_sheet_metadata_path().read_text(encoding="utf-8"))
 
-    assert rows[0]["Hub Shipping Fee"] == 12
+    assert rows[0]["Hub Shipping Fee"] == 13
     assert active_rate_sheet_path().read_bytes() == remote_bytes
     assert metadata["source"] == "remote_sync"
     assert metadata["original_filename"] == "railway-rates.xlsx"
@@ -6812,7 +6812,7 @@ def test_rate_sheet_sync_uses_cached_active_when_railway_unreachable(tmp_path, m
 
     assert selection.source == "active upload"
     assert "failed" in selection.warning
-    assert rows[0]["Hub Shipping Fee"] == 12
+    assert rows[0]["Hub Shipping Fee"] == 13
 
 
 def test_rate_sheet_sync_failed_download_does_not_corrupt_cached_active(tmp_path, monkeypatch):
@@ -6853,7 +6853,7 @@ def test_rate_sheet_sync_remote_no_active_keeps_default_behavior(tmp_path, monke
 
     assert selection.source == "default fallback"
     assert "Railway has no active rate sheet" in selection.warning
-    assert rows[0]["Hub Shipping Fee"] == 32
+    assert rows[0]["Hub Shipping Fee"] == 33
 
 
 def test_summary_total_cost_sums_cost_summary_row_totals():
@@ -6882,6 +6882,12 @@ def test_summary_total_cost_sums_cost_summary_row_totals():
     assert workflow_module._customer_handling_fee(5) == 3.0
     assert workflow_module._customer_handling_fee(1, True) == 1.75
     assert workflow_module._customer_handling_fee(2, True) == 2.25
+    assert workflow_module._customer_handling_fee(1, destination_country="United States") == 3.0
+    assert workflow_module._customer_handling_fee(2, destination_country="US") == 3.25
+    assert workflow_module._customer_handling_fee(5, destination_country="United States") == 4.0
+    assert workflow_module._customer_handling_fee(1, destination_country="Canada") == 2.0
+    assert workflow_module._customer_handling_fee(2, destination_country="Canada") == 2.25
+    assert workflow_module._customer_handling_fee(5, destination_country="Canada") == 3.0
     assert cost_total == 30.5
     total_row = next(row for row in summary_rows if row["Metric"] == "Total Chargeable Cost")
     assert total_row["Value"] == 30.5
@@ -6911,6 +6917,25 @@ def test_cost_summary_applies_narrow_prepacked_handling_discount_inside_shipping
     assert "Prepacked No Touch" not in rows[0]
     assert "Picking/Packing Fee" not in rows[0]
     assert "Total Cost" not in rows[0]
+
+
+def test_final_cost_adds_us_packing_surcharge_without_changing_shipping_rate():
+    lane = workflow_module.CustomerRateLane(rates_by_zone={"Zone 1": {1.0: 10.0}}, zone_by_country={})
+
+    # The shipping-rate result remains $10.00.  Final cost is that unchanged
+    # rate plus the destination-specific packing charge.
+    assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 2, destination_country="United States") == 13.25
+    assert workflow_module._rate_lane_shipping_fee(1.0, "Zone 1", lane, 2, destination_country="Canada") == 12.25
+
+    rate_sheet = workflow_module.CustomerRateSheet(hub=lane, express=workflow_module._empty_rate_lane())
+    us_cost, _, _ = workflow_module._shipping_fee_choice(
+        {"Country": "US", "Chargeable Weight kg": 1.0, "Total Units": 5}, rate_sheet, "Zone 1"
+    )
+    non_us_cost, _, _ = workflow_module._shipping_fee_choice(
+        {"Country": "Canada", "Chargeable Weight kg": 1.0, "Total Units": 5}, rate_sheet, "Zone 1"
+    )
+    assert us_cost == 14.0
+    assert non_us_cost == 13.0
 
 
 def test_summary_box_types_collapse_cutdown_variants_to_base_vb_box():

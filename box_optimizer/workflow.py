@@ -4604,15 +4604,23 @@ def _express_zone_for_cost_summary_row(row: dict, rate_sheet: CustomerRateSheet 
     return rate_sheet.express.zone_by_country.get(_clean_rate_country(country), "")
 
 
-def _customer_handling_fee(total_units: object, prepacked_no_touch: object = False) -> float:
+def _customer_handling_fee(
+    total_units: object,
+    prepacked_no_touch: object = False,
+    destination_country: object = "",
+) -> float:
     try:
         units = int(float(total_units))
     except (TypeError, ValueError):
         units = 1
     units = max(units, 1)
     if units == 1 and str(prepacked_no_touch).strip().lower() in {"true", "yes", "1"}:
-        return 1.75
-    return 2.0 + max(units - 1, 0) * 0.25
+        handling_fee = 1.75
+    else:
+        handling_fee = 2.0 + max(units - 1, 0) * 0.25
+    if _normalize_country(str(destination_country or "")) == "United States":
+        handling_fee += 1.0
+    return handling_fee
 
 
 def _is_prepacked_no_touch_row(row: dict) -> bool:
@@ -4682,6 +4690,7 @@ def _rate_lane_shipping_fee(
     lane: CustomerRateLane | None,
     total_units: object = 1,
     prepacked_no_touch: object = False,
+    destination_country: object = "",
 ) -> float | None:
     if not lane:
         return None
@@ -4695,7 +4704,7 @@ def _rate_lane_shipping_fee(
     charge = _rated_charge_for_weight(weight, rates, lane.max_weight_kg)
     if charge is None:
         return None
-    return round(charge + _customer_handling_fee(total_units, prepacked_no_touch), 2)
+    return round(charge + _customer_handling_fee(total_units, prepacked_no_touch, destination_country), 2)
 
 
 def _shipping_fee_choice(
@@ -4715,11 +4724,15 @@ def _shipping_fee_choice(
     weight = row.get("Chargeable Weight kg", "")
     total_units = row.get("Total Units", "")
     prepacked_no_touch = _is_prepacked_no_touch_row(row)
-    hub_fee = _rate_lane_shipping_fee(weight, hub_zone, rate_sheet.hub, total_units, prepacked_no_touch)
+    hub_fee = _rate_lane_shipping_fee(
+        weight, hub_zone, rate_sheet.hub, total_units, prepacked_no_touch, row.get("Country", "")
+    )
     if hub_fee is not None:
         return round(hub_fee + playmat_charge, 2), 0, playmat_note
     express_zone = _express_zone_for_cost_summary_row(row, rate_sheet)
-    express_fee = _rate_lane_shipping_fee(weight, express_zone, rate_sheet.express, total_units, prepacked_no_touch)
+    express_fee = _rate_lane_shipping_fee(
+        weight, express_zone, rate_sheet.express, total_units, prepacked_no_touch, row.get("Country", "")
+    )
     if express_fee is not None:
         note = "Express fallback; hub unavailable."
         if playmat_note:
@@ -4948,7 +4961,7 @@ def _actual_lookup_rows(
             continue
         total_units = row.get("Total Units", "")
         prepacked_no_touch = _is_prepacked_no_touch_row(row)
-        handling_fee = _customer_handling_fee(total_units, prepacked_no_touch)
+        handling_fee = _customer_handling_fee(total_units, prepacked_no_touch, row.get("Country", ""))
         playmat_units = _separate_playmat_charge_unit_count(row, sku_rules)
         playmat_charge = round(playmat_units * SEPARATE_PLAYMAT_CHARGE_AMOUNT, 2)
         add_on_fee = round(handling_fee + playmat_charge, 2)
