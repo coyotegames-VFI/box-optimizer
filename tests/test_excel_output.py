@@ -1853,7 +1853,11 @@ def test_labels_sheet_embeds_qr_pngs_for_barcode_values(tmp_path):
     assert '<xdr:row>0</xdr:row>' in drawing_xml
     assert '<xdr:colOff>457200</xdr:colOff>' in drawing_xml
     assert '<xdr:rowOff>57150</xdr:rowOff>' in drawing_xml
-    assert '<xdr:ext cx="1524000" cy="1524000"/>' in drawing_xml
+    assert '<xdr:ext cx="1676400" cy="1676400"/>' in drawing_xml
+    label_rows = ElementTree.fromstring(labels_xml).findall("main:sheetData/main:row", NS)
+    to_row = next(row for row in label_rows if _inline_cell_text(labels_xml, f"A{row.attrib['r']}") == "To")
+    space_before_to_pt = sum(float(row.attrib["ht"]) for row in label_rows if int(row.attrib["r"]) < int(to_row.attrib["r"]))
+    assert (57150 + 1676400) / 12700 < space_before_to_pt
     assert 'Target="../media/label_qr_1.png"' in drawing_rels
     assert 'ContentType="image/png"' in content_types
     assert qr_png.startswith(b"\x89PNG\r\n\x1a\n")

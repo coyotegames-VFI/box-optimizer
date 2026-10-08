@@ -822,11 +822,12 @@ def _worksheet_rels_xml(drawing_id: int) -> str:
 def _drawing_xml(image_count: int, start_rows: list[int]) -> str:
     anchors = []
     for index, start_row in enumerate(start_rows, start=1):
+        # 132 pt is 10% larger than before and stays above the "To" text row.
         anchors.append(
             '<xdr:oneCellAnchor>'
             '<xdr:from><xdr:col>3</xdr:col><xdr:colOff>457200</xdr:colOff>'
             f'<xdr:row>{max(start_row - 1, 0)}</xdr:row><xdr:rowOff>57150</xdr:rowOff></xdr:from>'
-            '<xdr:ext cx="1524000" cy="1524000"/>'
+            '<xdr:ext cx="1676400" cy="1676400"/>'
             '<xdr:pic>'
             f'<xdr:nvPicPr><xdr:cNvPr id="{index}" name="QR Code {index}"/><xdr:cNvPicPr/></xdr:nvPicPr>'
             '<xdr:blipFill>'
